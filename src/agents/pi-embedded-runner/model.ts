@@ -63,9 +63,18 @@ export function resolveModel(
     const providers = cfg?.models?.providers ?? {};
     const inlineModels = buildInlineProviderModels(providers);
     const normalizedProvider = normalizeProviderId(provider);
-    const inlineMatch = inlineModels.find(
-      (entry) => normalizeProviderId(entry.provider) === normalizedProvider && entry.id === modelId,
-    );
+    // Match by bare model ID, or by "provider/modelId" in case the config
+    // was mutated with provider-prefixed IDs at runtime.
+    const inlineMatch =
+      inlineModels.find(
+        (entry) =>
+          normalizeProviderId(entry.provider) === normalizedProvider && entry.id === modelId,
+      ) ??
+      inlineModels.find(
+        (entry) =>
+          normalizeProviderId(entry.provider) === normalizedProvider &&
+          entry.id === `${provider}/${modelId}`,
+      );
     if (inlineMatch) {
       const normalized = normalizeModelCompat(inlineMatch as Model<Api>);
       return {

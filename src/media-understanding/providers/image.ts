@@ -13,7 +13,15 @@ export async function describeImageWithModel(
   await ensureOpenClawModelsJson(params.cfg, params.agentDir);
   const authStorage = discoverAuthStorage(params.agentDir);
   const modelRegistry = discoverModels(authStorage, params.agentDir);
-  const model = modelRegistry.find(params.provider, params.model) as Model<Api> | null;
+  let model = modelRegistry.find(params.provider, params.model) as Model<Api> | null;
+  // Fallback: if config model IDs were mutated with a provider prefix,
+  // the registry may have the model under "provider/modelId" instead of bare "modelId".
+  if (!model) {
+    model = modelRegistry.find(
+      params.provider,
+      `${params.provider}/${params.model}`,
+    ) as Model<Api> | null;
+  }
   if (!model) {
     throw new Error(`Unknown model: ${params.provider}/${params.model}`);
   }

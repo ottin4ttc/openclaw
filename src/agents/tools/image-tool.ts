@@ -4,11 +4,12 @@ import type { OpenClawConfig } from "../../config/config.js";
 import { resolveUserPath } from "../../utils.js";
 import { getDefaultLocalRoots, loadWebMedia } from "../../web/media.js";
 import { ensureAuthProfileStore, listProfilesForProvider } from "../auth-profiles.js";
-import { DEFAULT_MODEL, DEFAULT_PROVIDER } from "../defaults.js";
+import { DEFAULT_CONTEXT_TOKENS, DEFAULT_MODEL, DEFAULT_PROVIDER } from "../defaults.js";
 import { minimaxUnderstandImage } from "../minimax-vlm.js";
 import { getApiKeyForModel, requireApiKey, resolveEnvApiKey } from "../model-auth.js";
+import { normalizeModelCompat } from "../model-compat.js";
 import { runWithImageModelFallback } from "../model-fallback.js";
-import { resolveConfiguredModelRef } from "../model-selection.js";
+import { findNormalizedProviderValue, resolveConfiguredModelRef } from "../model-selection.js";
 import { ensureOpenClawModelsJson } from "../models-config.js";
 import { discoverAuthStorage, discoverModels } from "../pi-model-discovery.js";
 import {
@@ -247,7 +248,34 @@ async function runImagePrompt(params: {
     cfg: effectiveCfg,
     modelOverride: params.modelOverride,
     run: async (provider, modelId) => {
-      const model = modelRegistry.find(provider, modelId) as Model<Api> | null;
+      let model = modelRegistry.find(provider, modelId) as Model<Api> | null;
+      if (!model && effectiveCfg) {
+        // Custom/third-party providers (e.g. dmxapi, one-api) may not be in
+        // the model registry but are defined in models.providers config.
+        // Build a synthetic model entry so the image tool can still use them.
+        const providerCfg = findNormalizedProviderValue(effectiveCfg.models?.providers, provider);
+        if (providerCfg) {
+          const inlineModels = Array.isArray(providerCfg.models) ? providerCfg.models : [];
+          // Match by bare model ID or prefixed "provider/modelId" form since
+          // some runtime paths may mutate the config's model IDs.
+          const inlineMatch =
+            inlineModels.find((m) => m?.id === modelId) ??
+            inlineModels.find((m) => m?.id === `${provider}/${modelId}`);
+          model = normalizeModelCompat({
+            id: modelId,
+            name: inlineMatch?.name ?? modelId,
+            api: inlineMatch?.api ?? providerCfg.api ?? "openai-completions",
+            provider,
+            baseUrl: providerCfg.baseUrl,
+            reasoning: inlineMatch?.reasoning ?? false,
+            // User explicitly configured this as imageModel — trust it supports images
+            input: inlineMatch?.input ?? ["text", "image"],
+            cost: inlineMatch?.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: inlineMatch?.contextWindow ?? DEFAULT_CONTEXT_TOKENS,
+            maxTokens: inlineMatch?.maxTokens ?? 4096,
+          } as Model<Api>);
+        }
+      }
       if (!model) {
         throw new Error(`Unknown model: ${provider}/${modelId}`);
       }
