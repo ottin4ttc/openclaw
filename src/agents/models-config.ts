@@ -173,6 +173,28 @@ export async function ensureOpenClawModelsJson(
     providers: mergedProviders,
     agentDir,
   });
+
+  // Guard: strip accidental provider-key prefix from model IDs.
+  // Some code paths may mutate the shared config object and prepend
+  // the provider key to model IDs (e.g. "dmxapi/gpt-5.2-pro" instead
+  // of "gpt-5.2-pro"). The ModelRegistry expects bare IDs.
+  if (normalizedProviders) {
+    for (const [providerKey, pv] of Object.entries(normalizedProviders)) {
+      const models = Array.isArray(pv?.models) ? pv.models : [];
+      const prefix = `${providerKey}/`;
+      for (const model of models) {
+        if (
+          model &&
+          typeof model === "object" &&
+          typeof (model as { id?: unknown }).id === "string" &&
+          (model as { id: string }).id.startsWith(prefix)
+        ) {
+          (model as { id: string }).id = (model as { id: string }).id.slice(prefix.length);
+        }
+      }
+    }
+  }
+
   const next = `${JSON.stringify({ providers: normalizedProviders }, null, 2)}\n`;
   try {
     existingRaw = await fs.readFile(targetPath, "utf8");

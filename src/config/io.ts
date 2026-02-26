@@ -718,7 +718,7 @@ export function createConfigIO(overrides: ConfigIoDeps = {}) {
         const details = validated.warnings
           .map((iss) => `- ${iss.path || "<root>"}: ${iss.message}`)
           .join("\n");
-        deps.logger.warn(`Config warnings:\\n${details}`);
+        deps.logger.warn(`Config warnings:\n${details}`);
       }
       warnIfConfigFromFuture(validated.config, deps.logger);
       const cfg = applyTalkConfigNormalization(
