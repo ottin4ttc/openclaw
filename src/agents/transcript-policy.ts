@@ -40,6 +40,9 @@ const OPENAI_MODEL_APIS = new Set([
 const OPENAI_PROVIDERS = new Set(["openai", "openai-codex"]);
 const OPENAI_COMPAT_TURN_MERGE_EXCLUDED_PROVIDERS = new Set(["openrouter", "opencode"]);
 
+const ANTHROPIC_MODEL_HINTS = ["claude"];
+const GOOGLE_MODEL_HINTS = ["gemini"];
+
 function isOpenAiApi(modelApi?: string | null): boolean {
   if (!modelApi) {
     return false;
@@ -82,6 +85,7 @@ export function resolveTranscriptPolicy(params: {
 }): TranscriptPolicy {
   const provider = normalizeProviderId(params.provider ?? "");
   const modelId = params.modelId ?? "";
+  const modelIdLower = modelId.toLowerCase();
   const isGoogle = isGoogleModelApi(params.modelApi);
   const isAnthropic = isAnthropicApi(params.modelApi, provider);
   const isOpenAi = isOpenAiProvider(provider) || (!provider && isOpenAiApi(params.modelApi));
@@ -92,17 +96,32 @@ export function resolveTranscriptPolicy(params: {
   const isMistral = isMistralModel({ provider, modelId });
   const isOpenRouterGemini =
     (provider === "openrouter" || provider === "opencode" || provider === "kilocode") &&
-    modelId.toLowerCase().includes("gemini");
-  const isCopilotClaude = provider === "github-copilot" && modelId.toLowerCase().includes("claude");
+    modelIdLower.includes("gemini");
+  const isCopilotClaude = provider === "github-copilot" && modelIdLower.includes("claude");
+
+  // Proxy providers (e.g. dmxapi, openrouter) may route to Claude/Gemini backends that
+  // enforce strict tool call ID formats. Detect the underlying model by name so we
+  // apply the right sanitization regardless of provider.
+  const isModelNameClaude =
+    !isAnthropic && ANTHROPIC_MODEL_HINTS.some((hint) => modelIdLower.includes(hint));
+  const isModelNameGemini =
+    !isGoogle && GOOGLE_MODEL_HINTS.some((hint) => modelIdLower.includes(hint));
 
   // GitHub Copilot's Claude endpoints can reject persisted `thinking` blocks with
   // non-binary/non-base64 signatures (e.g. thinkingSignature: "reasoning_text").
   // Drop these blocks at send-time to keep sessions usable.
   const dropThinkingBlocks = isCopilotClaude;
 
-  const needsNonImageSanitize = isGoogle || isAnthropic || isMistral || isOpenRouterGemini;
+  const needsNonImageSanitize =
+    isGoogle ||
+    isAnthropic ||
+    isMistral ||
+    isOpenRouterGemini ||
+    isModelNameClaude ||
+    isModelNameGemini;
 
-  const sanitizeToolCallIds = isGoogle || isMistral || isAnthropic;
+  const sanitizeToolCallIds =
+    isGoogle || isMistral || isAnthropic || isModelNameClaude || isModelNameGemini;
   const toolCallIdMode: ToolCallIdMode | undefined = isMistral
     ? "strict9"
     : sanitizeToolCallIds

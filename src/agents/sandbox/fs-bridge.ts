@@ -260,7 +260,12 @@ class SandboxFsBridgeImpl implements SandboxFsBridge {
       aliasPolicy: options.aliasPolicy,
     });
     if (!guarded.ok) {
-      if (guarded.reason !== "path" || options.allowMissingTarget === false) {
+      // openBoundaryFile is file-oriented: it rejects directories with
+      // reason "validation" (no error). Allow existing directories through
+      // since the boundary path validation already passed above.
+      const isExistingDir =
+        guarded.reason === "validation" && !guarded.error && isDirectorySync(target.hostPath);
+      if ((!isExistingDir && guarded.reason !== "path") || options.allowMissingTarget === false) {
         throw guarded.error instanceof Error
           ? guarded.error
           : new Error(
@@ -349,6 +354,14 @@ class SandboxFsBridgeImpl implements SandboxFsBridge {
 
 function allowsWrites(access: SandboxWorkspaceAccess): boolean {
   return access === "rw";
+}
+
+function isDirectorySync(hostPath: string): boolean {
+  try {
+    return fs.lstatSync(hostPath).isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 function coerceStatType(typeRaw?: string): "file" | "directory" | "other" {

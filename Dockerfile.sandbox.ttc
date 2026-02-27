@@ -1,12 +1,12 @@
-FROM openclaw-sandbox:bookworm-slim                                                                                                               │·········································
-USER root                                                                                                                                         │·········································
-RUN apt-get update && apt-get install -y \                                                                                                        │·········································
-    python3 python3-pip curl jq git ca-certificates gnupg \                                                                                       │·········································
-    --no-install-recommends \                                                                                                                     │·········································
-    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \                                                                                │·········································
-    && apt-get install -y nodejs --no-install-recommends \                                                                                        │·········································
-    && rm -rf /var/lib/apt/lists/* \                                                                                                              │·········································
-    && npm i -g clawhub \                                                                                                                         │·········································
-    && mkdir -p /home/sandbox/.config /home/sandbox/.local \                                                                                      │·········································
-    && chown -R sandbox:sandbox /home/sandbox                                                                                                     │·········································
+FROM openclaw-sandbox:bookworm-slim
+USER root
+RUN apt-get update && apt-get install -y \
+    python3 python3-pip curl jq git ca-certificates gnupg \
+    --no-install-recommends \
+    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y nodejs --no-install-recommends \
+    && rm -rf /var/lib/apt/lists/* \
+    && npm i -g clawhub \
+    && mkdir -p /home/sandbox/.config /home/sandbox/.local \
+    && chown -R sandbox:sandbox /home/sandbox
 USER sandbox
