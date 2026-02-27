@@ -102,4 +102,6 @@ export type EmbeddedSandboxInfo = {
     allowed: boolean;
     defaultLevel: "on" | "off" | "ask" | "full";
   };
+  /** Read-only bind mounts visible inside the container (container path only). */
+  customMounts?: string[];
 };

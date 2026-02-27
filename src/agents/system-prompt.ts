@@ -545,6 +545,11 @@ export function buildAgentSystemPrompt(params: {
           params.sandboxInfo.elevated?.allowed
             ? `Current elevated level: ${params.sandboxInfo.elevated.defaultLevel} (ask runs exec on host with approvals; full auto-approves).`
             : "",
+          ...(params.sandboxInfo.customMounts?.length
+            ? [
+                `Additional bind mounts available inside the container: ${params.sandboxInfo.customMounts.join(", ")}. Use exec (e.g. cat/ls) to browse these paths.`,
+              ]
+            : []),
         ]
           .filter(Boolean)
           .join("\n")

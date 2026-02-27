@@ -1,5 +1,6 @@
 import type { ExecElevatedDefaults } from "../bash-tools.js";
 import type { resolveSandboxContext } from "../sandbox.js";
+import { parseSandboxBindMount } from "../sandbox/fs-paths.js";
 import type { EmbeddedSandboxInfo } from "./types.js";
 
 export function buildEmbeddedSandboxInfo(
@@ -10,6 +11,7 @@ export function buildEmbeddedSandboxInfo(
     return undefined;
   }
   const elevatedAllowed = Boolean(execElevated?.enabled && execElevated.allowed);
+  const customMounts = resolveCustomMountPaths(sandbox.docker.binds);
   return {
     enabled: true,
     workspaceDir: sandbox.workspaceDir,
@@ -19,6 +21,7 @@ export function buildEmbeddedSandboxInfo(
     browserBridgeUrl: sandbox.browser?.bridgeUrl,
     browserNoVncUrl: sandbox.browser?.noVncUrl,
     hostBrowserAllowed: sandbox.browserAllowHostControl,
+    ...(customMounts.length > 0 ? { customMounts } : {}),
     ...(elevatedAllowed
       ? {
           elevated: {
@@ -28,4 +31,19 @@ export function buildEmbeddedSandboxInfo(
         }
       : {}),
   };
+}
+
+function resolveCustomMountPaths(binds?: string[]): string[] {
+  if (!binds?.length) {
+    return [];
+  }
+  const paths: string[] = [];
+  for (const spec of binds) {
+    const parsed = parseSandboxBindMount(spec);
+    if (parsed) {
+      const mode = parsed.writable ? "rw" : "ro";
+      paths.push(`${parsed.containerRoot} (${mode}, host: ${parsed.hostRoot})`);
+    }
+  }
+  return paths;
 }
