@@ -1,8 +1,6 @@
-import {
-  assertNoPathAliasEscape,
-  PATH_ALIAS_POLICIES,
-  type PathAliasPolicy,
-} from "../../infra/path-alias-guards.js";
+import fs from "node:fs";
+import { openBoundaryFile } from "../../infra/boundary-file-read.js";
+import { PATH_ALIAS_POLICIES, type PathAliasPolicy } from "../../infra/path-alias-guards.js";
 import { execDockerRaw, type ExecDockerRawResult } from "./docker.js";
 import {
   buildSandboxFsMounts,
@@ -24,6 +22,7 @@ type PathSafetyOptions = {
   action: string;
   aliasPolicy?: PathAliasPolicy;
   requireWritable?: boolean;
+  allowMissingTarget?: boolean;
 };
 
 export type SandboxResolvedPath = {
@@ -254,12 +253,28 @@ class SandboxFsBridgeImpl implements SandboxFsBridge {
       );
     }
 
-    await assertNoPathAliasEscape({
+    const guarded = await openBoundaryFile({
       absolutePath: target.hostPath,
       rootPath: lexicalMount.hostRoot,
       boundaryLabel: "sandbox mount root",
-      policy: options.aliasPolicy,
+      aliasPolicy: options.aliasPolicy,
     });
+    if (!guarded.ok) {
+      // openBoundaryFile is file-oriented: it rejects directories with
+      // reason "validation" (no error). Allow existing directories through
+      // since the boundary path validation already passed above.
+      const isExistingDir =
+        guarded.reason === "validation" && !guarded.error && isDirectorySync(target.hostPath);
+      if ((!isExistingDir && guarded.reason !== "path") || options.allowMissingTarget === false) {
+        throw guarded.error instanceof Error
+          ? guarded.error
+          : new Error(
+              `Sandbox boundary checks failed; cannot ${options.action}: ${target.containerPath}`,
+            );
+      }
+    } else {
+      fs.closeSync(guarded.fd);
+    }
 
     const canonicalContainerPath = await this.resolveCanonicalContainerPath({
       containerPath: target.containerPath,
@@ -339,6 +354,14 @@ class SandboxFsBridgeImpl implements SandboxFsBridge {
 
 function allowsWrites(access: SandboxWorkspaceAccess): boolean {
   return access === "rw";
+}
+
+function isDirectorySync(hostPath: string): boolean {
+  try {
+    return fs.lstatSync(hostPath).isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 function coerceStatType(typeRaw?: string): "file" | "directory" | "other" {

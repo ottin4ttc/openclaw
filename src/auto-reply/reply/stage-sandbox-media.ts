@@ -145,6 +145,9 @@ export async function stageSandboxMedia(params: {
         await scpFile(ctx.MediaRemoteHost, source, dest);
       } else {
         await fs.copyFile(source, dest);
+        // Ensure the staged copy is readable inside the sandbox container
+        // where the agent runs as a different (non-root) user.
+        await fs.chmod(dest, 0o644);
       }
       // For sandbox use relative path, for remote cache use absolute path
       const stagedPath = sandbox ? path.posix.join("media", "inbound", fileName) : dest;
