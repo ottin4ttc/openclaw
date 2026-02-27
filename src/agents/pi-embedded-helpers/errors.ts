@@ -829,6 +829,17 @@ export function isCloudCodeAssistFormatError(raw: string): boolean {
   return !isImageDimensionErrorMessage(raw) && matchesErrorPatterns(raw, ERROR_PATTERNS.format);
 }
 
+const MALFORMED_TOOL_CALL_JSON_RE =
+  /unexpected (?:non-whitespace )?character after JSON|unexpected token.*position \d+|unterminated string in JSON/i;
+
+/**
+ * Detect malformed JSON in tool call arguments from weaker models (e.g. Kimi-K2)
+ * that fail to properly escape nested quotes in complex shell commands.
+ */
+export function isMalformedToolCallJsonError(raw: string): boolean {
+  return MALFORMED_TOOL_CALL_JSON_RE.test(raw);
+}
+
 export function isAuthAssistantError(msg: AssistantMessage | undefined): boolean {
   if (!msg || msg.stopReason !== "error") {
     return false;
@@ -891,6 +902,9 @@ export function classifyFailoverReason(raw: string): FailoverReason | null {
     return "rate_limit";
   }
   if (isCloudCodeAssistFormatError(raw)) {
+    return "format";
+  }
+  if (isMalformedToolCallJsonError(raw)) {
     return "format";
   }
   if (isBillingErrorMessage(raw)) {
