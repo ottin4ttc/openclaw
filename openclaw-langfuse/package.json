@@ -4,6 +4,9 @@
   "description": "Langfuse tracing and prompt management for OpenClaw",
   "license": "MIT",
   "type": "module",
+  "scripts": {
+    "diagnose": "bun scripts/diagnose-model-config.ts"
+  },
   "dependencies": {
     "langfuse": "latest"
   },

@@ -11,6 +11,7 @@ import type {
 } from "openclaw/plugin-sdk";
 import { resolveCredentials } from "./config.js";
 import type { LangfusePluginConfig } from "./config.js";
+import { checkModelCostConfig, formatCostWarning } from "./diagnose.js";
 import { findMatchingRule } from "./matcher.js";
 import { PromptManager } from "./prompt-manager.js";
 import { redactText, redactObject } from "./redact.js";
@@ -601,7 +602,13 @@ export function createLangfuseService(
           sessionKey: ctx.sessionKey,
           trigger: ctx.trigger,
         });
+        serviceLogger?.debug?.(
+          `Langfuse: resolveSync(${agentId}) → ${syncResult ? `hit: ${syncResult.matchInfo.name}` : "miss"}`,
+        );
         if (syncResult) {
+          serviceLogger?.info?.(
+            `Langfuse: prompt injection → ${JSON.stringify(syncResult.injection).slice(0, 100)}`,
+          );
           if (entry) {
             entry.promptMatch = syncResult.matchInfo;
             entry.promptClient = syncResult.promptClient;
@@ -1077,6 +1084,16 @@ export function createLangfuseService(
         return;
       }
 
+      // Check for missing model cost config that causes zero usage data
+      try {
+        const costIssues = checkModelCostConfig();
+        if (costIssues.length > 0) {
+          ctx.logger.warn(formatCostWarning(costIssues));
+        }
+      } catch {
+        // Non-critical check — don't block startup
+      }
+
       langfuse = new Langfuse({ publicKey, secretKey, baseUrl });
       contextMap = new TraceContextMap();
       contextMap.startSweep();
@@ -1084,7 +1101,14 @@ export function createLangfuseService(
       promptManager = config.prompts?.length ? new PromptManager(langfuse, config) : null;
       // Pre-warm prompt cache so resolveSync() works on the first message
       if (promptManager) {
-        promptManager.warmCache().catch(() => {});
+        promptManager
+          .warmCache()
+          .then(() => {
+            ctx.logger.info(`Langfuse: prompt cache warmed (${config.prompts?.length ?? 0} rules)`);
+          })
+          .catch((err: unknown) => {
+            ctx.logger.warn(`Langfuse: warmCache failed: ${err}`);
+          });
       }
 
       // Dynamically import onDiagnosticEvent — this module is only available
