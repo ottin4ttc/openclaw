@@ -195,14 +195,16 @@ function readSessionMessages(agentId: string, sessionId: string): SessionEntry[]
       const parsed = JSON.parse(line);
       if (parsed?.message) {
         const msg = parsed.message as Record<string, unknown>;
-        // Derive timestamp: prefer message.timestamp, then outer timestamp field
+        // Derive timestamp: prefer outer entry timestamp (when JSONL line was written,
+        // i.e. message completion time) over inner message.timestamp (which for assistant
+        // messages is the LLM call initiation time, not completion time).
         let ts: number;
-        if (typeof msg.timestamp === "number") {
-          ts = msg.timestamp;
-        } else if (typeof parsed.timestamp === "string") {
+        if (typeof parsed.timestamp === "string") {
           ts = Date.parse(parsed.timestamp);
         } else if (typeof parsed.timestamp === "number") {
           ts = parsed.timestamp;
+        } else if (typeof msg.timestamp === "number") {
+          ts = msg.timestamp;
         } else {
           ts = Date.now();
         }
