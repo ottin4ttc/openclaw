@@ -1,0 +1,92 @@
+{
+  "plugins": {
+    "entries": {
+      "openclaw-langfuse": {
+        "enabled": true,
+        "config": {
+          // ============================================================
+          // Langfuse Connection
+          // ============================================================
+          // Credentials can also be set via environment variables:
+          //   LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, LANGFUSE_BASE_URL
+          // Env vars take precedence over config values.
+
+          "baseUrl": "https://langfuse.your-company.com",
+          "publicKey": "pk-lf-xxxxxxxx",
+          "secretKey": "sk-lf-xxxxxxxx",
+
+          // ============================================================
+          // LLM Tracing
+          // ============================================================
+          // Captures full LLM call chains as nested Langfuse traces:
+          //   Trace (agent turn)
+          //     +-- Generation (llm-call-1, model, input/output, tokens)
+          //     +-- Span (tool:read, params, result, duration)
+          //     +-- Generation (llm-call-2, model, input/output, tokens)
+          //     +-- Span (tool:openmai_internal_api_call, params, result)
+          //     +-- Generation (llm-call-3, final answer)
+
+          "tracing": {
+            "enabled": true,
+            "tags": ["production"],
+            "redact": true
+          },
+
+          // ============================================================
+          // Prompt Management (optional)
+          // ============================================================
+          // Fetches prompts from Langfuse Prompt Management and injects
+          // them into OpenClaw agent system prompts.
+          //
+          // Rules are evaluated in order (first match wins):
+          //   - Exact match:    "main"
+          //   - Wildcard prefix: "openmai-*"
+          //   - Catch-all:       "*"
+          //
+          // inject modes:
+          //   - "prepend" (default): add before existing system prompt
+          //   - "append":  add after existing system prompt
+          //   - "replace": completely replace the system prompt
+          //
+          // If no rule matches or Langfuse is unavailable, the original
+          // OpenClaw prompt is used unchanged (safe degradation).
+
+          "prompts": [
+            {
+              "match": "main",
+              "langfusePrompt": "main-agent-prompt",
+              "inject": "replace"
+            },
+            {
+              "match": "my-agent",
+              "langfusePrompt": "my-agent-prompt",
+              "label": "production",
+              "inject": "prepend"
+            },
+            {
+              "match": "openmai-test-*",
+              "langfusePrompt": "openmai-test-prompt",
+              "label": "staging",
+              "inject": "prepend"
+            },
+            {
+              "match": "openmai-*",
+              "langfusePrompt": "openmai-default-prompt",
+              "version": 3,
+              "inject": "prepend"
+            },
+            {
+              "match": "*",
+              "langfusePrompt": "fallback-prompt",
+              "inject": "append"
+            }
+          ],
+
+          // Cache fetched prompts for 60 seconds (default).
+          // Set to 0 to disable caching.
+          "promptCacheTtlMs": 60000
+        }
+      }
+    }
+  }
+}

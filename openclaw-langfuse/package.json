@@ -1,0 +1,15 @@
+{
+  "name": "openclaw-langfuse",
+  "version": "1.0.0",
+  "description": "Langfuse tracing and prompt management for OpenClaw",
+  "license": "MIT",
+  "type": "module",
+  "dependencies": {
+    "langfuse": "latest"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}
