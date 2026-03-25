@@ -21,6 +21,20 @@ export type TraceContextEntry = {
   pendingSpans: Map<string, LangfuseSpanClient>; // keyed by toolCallId
   createdAt: number;
   timestamp: number; // agent turn start timestamp
+  sessionId?: string; // needed to read JSONL in agent_end
+  // Stored from llm_input/llm_output for use in agent_end generation creation
+  storedUsage?: {
+    input?: number;
+    output?: number;
+    cacheRead?: number;
+    cacheWrite?: number;
+    total?: number;
+  };
+  storedOutput?: string;
+  lastModel?: string;
+  lastProvider?: string;
+  initialMessages?: unknown[]; // historyMessages from first llm_input call
+  finalized?: boolean; // set by agent_end; prevents diagnostic handler from overwriting metadata
 };
 
 const MAX_ENTRIES = 1000;

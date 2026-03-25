@@ -157,11 +157,13 @@ function truncatePayload(obj: unknown): unknown {
 // Session JSONL reading helpers (for gateway mode content extraction)
 // ---------------------------------------------------------------------------
 
+type SessionEntry = { timestamp: number; message: Record<string, unknown> };
+
 /**
  * Read messages from a session JSONL file on disk.
- * Returns an array of message objects ({ role, content, ... }).
+ * Returns entries with timestamps so callers can derive accurate startTime/endTime.
  */
-function readSessionMessages(agentId: string, sessionId: string): unknown[] {
+function readSessionMessages(agentId: string, sessionId: string): SessionEntry[] {
   const homeDir = os.homedir();
   const sessionFile = path.join(
     homeDir,
@@ -183,7 +185,7 @@ function readSessionMessages(agentId: string, sessionId: string): unknown[] {
   }
 
   const lines = raw.split(/\r?\n/);
-  const messages: unknown[] = [];
+  const entries: SessionEntry[] = [];
   for (const line of lines) {
     if (!line.trim()) {
       continue;
@@ -191,13 +193,25 @@ function readSessionMessages(agentId: string, sessionId: string): unknown[] {
     try {
       const parsed = JSON.parse(line);
       if (parsed?.message) {
-        messages.push(parsed.message);
+        const msg = parsed.message as Record<string, unknown>;
+        // Derive timestamp: prefer message.timestamp, then outer timestamp field
+        let ts: number;
+        if (typeof msg.timestamp === "number") {
+          ts = msg.timestamp;
+        } else if (typeof parsed.timestamp === "string") {
+          ts = Date.parse(parsed.timestamp);
+        } else if (typeof parsed.timestamp === "number") {
+          ts = parsed.timestamp;
+        } else {
+          ts = Date.now();
+        }
+        entries.push({ timestamp: ts, message: msg });
       }
     } catch {
       /* ignore malformed lines */
     }
   }
-  return messages;
+  return entries;
 }
 
 /**
@@ -274,6 +288,202 @@ function extractConversation(messages: unknown[]): {
   });
 
   return { input, output: lastAssistantText, lastUserText };
+}
+
+/**
+ * Build an API-shaped message object from a session entry message.
+ * Preserves structure: assistant with tool calls, toolResult -> tool role, etc.
+ * Matches the actual LLM API request format (see langfuse_api_reference.md).
+ */
+function buildApiMessage(msg: SessionEntry["message"]): unknown {
+  const role = msg.role;
+
+  if (role === "assistant") {
+    const textContent = extractTextContent(msg.content);
+    if (Array.isArray(msg.content)) {
+      const toolCalls = (msg.content as Record<string, unknown>[])
+        .filter((b) => b?.type === "toolCall")
+        .map((b) => ({
+          id: b.id,
+          type: "function",
+          function: {
+            name: b.name,
+            arguments: JSON.stringify(b.input ?? b.args ?? b.arguments ?? {}),
+          },
+        }));
+      if (toolCalls.length > 0) {
+        return { role: "assistant", content: textContent || null, tool_calls: toolCalls };
+      }
+    }
+    return { role: "assistant", content: textContent };
+  }
+
+  if (role === "toolResult") {
+    return {
+      role: "tool",
+      tool_call_id: msg.toolCallId ?? msg.toolName ?? "unknown",
+      content: extractTextContent(msg.content),
+    };
+  }
+
+  // user, system, etc.
+  return { role, content: extractTextContent(msg.content) };
+}
+
+/**
+ * Extract individual LLM turns from session messages.
+ * Each assistant message = one LLM call. Input is the preceding user/toolResult messages.
+ */
+function extractLLMTurns(messages: unknown[]): Array<{
+  inputMessages: unknown[];
+  assistantMessage: Record<string, unknown>;
+  assistantText: string;
+  toolCalls: Array<{ name: string; id: string; input: unknown }>;
+}> {
+  const turns: Array<{
+    inputMessages: unknown[];
+    assistantMessage: Record<string, unknown>;
+    assistantText: string;
+    toolCalls: Array<{ name: string; id: string; input: unknown }>;
+  }> = [];
+  let currentInput: unknown[] = [];
+
+  for (const msg of messages) {
+    const m = msg as Record<string, unknown>;
+    if (m.role === "assistant") {
+      const toolCalls: Array<{ name: string; id: string; input: unknown }> = [];
+      if (Array.isArray(m.content)) {
+        for (const block of m.content as Record<string, unknown>[]) {
+          if (block?.type === "toolCall") {
+            toolCalls.push({
+              name: String(block.name ?? "unknown"),
+              id: String(block.id ?? ""),
+              input: block.input ?? block.args,
+            });
+          }
+        }
+      }
+      turns.push({
+        inputMessages: [...currentInput],
+        assistantMessage: m,
+        assistantText: extractTextContent(m.content),
+        toolCalls,
+      });
+      currentInput = [];
+    } else {
+      currentInput.push(msg);
+    }
+  }
+
+  return turns;
+}
+
+/**
+ * Filter session entries to only the current agent turn.
+ * A turn starts at the last user message; everything after it
+ * (assistant responses, toolResults) belongs to that turn.
+ */
+function filterCurrentTurnEntries(entries: SessionEntry[]): SessionEntry[] {
+  let lastUserIdx = 0;
+  for (let i = entries.length - 1; i >= 0; i--) {
+    if (entries[i].message.role === "user") {
+      lastUserIdx = i;
+      break;
+    }
+  }
+  return entries.slice(lastUserIdx);
+}
+
+/**
+ * Legacy wrapper: filter plain message arrays (used by diagnostic handler).
+ */
+function filterCurrentTurnMessages(messages: unknown[]): unknown[] {
+  let lastUserIdx = 0;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i] as Record<string, unknown>;
+    if (m.role === "user") {
+      lastUserIdx = i;
+      break;
+    }
+  }
+  return messages.slice(lastUserIdx);
+}
+
+/**
+ * Build structured generation output from assistant message content (D3 format).
+ * - Has tool calls + text: {text, toolCalls}
+ * - Pure text: direct string
+ * - Only tool calls: {toolCalls}
+ */
+function buildGenerationOutput(content: unknown, redactEnabled: boolean): unknown {
+  const text = extractTextContent(content);
+  const toolCalls: Array<{
+    id: unknown;
+    type: string;
+    function: { name: string; arguments: string };
+  }> = [];
+
+  if (Array.isArray(content)) {
+    for (const block of content as Record<string, unknown>[]) {
+      if (block?.type === "toolCall") {
+        toolCalls.push({
+          id: block.id,
+          type: "function",
+          function: {
+            name: String(block.name ?? "unknown"),
+            arguments: JSON.stringify(block.input ?? block.args ?? block.arguments ?? {}),
+          },
+        });
+      }
+    }
+  }
+
+  const redactedText = text ? redactText(text, redactEnabled) : "";
+
+  if (toolCalls.length > 0) {
+    return {
+      content: redactedText || null,
+      tool_calls: toolCalls,
+    };
+  }
+  return redactedText || undefined;
+}
+
+/**
+ * Extract the plain user message text from a user message content field.
+ * Strips the "Sender (untrusted metadata):" wrapper to get the actual user input.
+ */
+function extractUserMessageText(content: unknown): string {
+  const text = extractTextContent(content);
+  if (!text) {
+    return "";
+  }
+
+  // Look for the last line after the metadata JSON block wrapper
+  // Pattern: everything after the last "]" followed by newlines + actual text
+  const lastClosingBracket = text.lastIndexOf("```");
+  if (lastClosingBracket !== -1) {
+    const afterBlock = text.slice(lastClosingBracket + 3).trim();
+    // Find text after the timestamp line like "[Wed 2026-03-25 17:00 GMT+8]"
+    const tsMatch = afterBlock.match(/\[.+?\]\s*([\s\S]+)/);
+    if (tsMatch?.[1]?.trim()) {
+      return tsMatch[1].trim();
+    }
+    if (afterBlock) {
+      return afterBlock;
+    }
+  }
+  return text;
+}
+
+/**
+ * Check if a usage object has any non-zero values.
+ */
+function hasNonZeroUsage(usage: Record<string, number> | undefined): boolean {
+  if (!usage) {
+    return false;
+  }
+  return Object.values(usage).some((v) => typeof v === "number" && v > 0);
 }
 
 /**
@@ -386,10 +596,25 @@ export function createLangfuseService(
           entry.systemPrompt = event.prompt;
         }
 
-        // Record prompt match info and fetch prompt client for generation linking
+        // Record prompt match info and inject Langfuse prompt content.
+        // Must be SYNCHRONOUS — before_prompt_build hook needs to return injection immediately.
+        // Use resolveSync (cache-based) for the return value, then fire async resolve
+        // in background to update cache + fetch promptClient for generation linking.
         if (promptManager) {
           const agentId = ctx.agentId ?? "unknown";
           const capturedEntry = entry;
+          const syncResult = promptManager.resolveSync(agentId, {
+            agentId: ctx.agentId,
+            channelId: ctx.channelId,
+            sessionKey: ctx.sessionKey,
+            trigger: ctx.trigger,
+          });
+          if (syncResult) {
+            capturedEntry.promptMatch = syncResult.matchInfo;
+            capturedEntry.promptClient = syncResult.promptClient;
+            return syncResult.injection;
+          }
+          // Cache miss — fire async resolve to populate cache for next time
           promptManager
             .resolve(agentId, {
               agentId: ctx.agentId,
@@ -401,16 +626,9 @@ export function createLangfuseService(
               if (result) {
                 capturedEntry.promptMatch = result.matchInfo;
                 capturedEntry.promptClient = result.promptClient;
-                serviceLogger?.debug?.(
-                  `Langfuse: prompt client fetched for "${result.matchInfo.name}" (agent=${agentId})`,
-                );
               }
             })
-            .catch((err: unknown) => {
-              serviceLogger?.warn?.(
-                `Langfuse: failed to resolve prompt (agent=${agentId}): ${err}`,
-              );
-            });
+            .catch(() => {});
         } else if (config.prompts?.length) {
           // Fallback: record match info without prompt client
           const agentId = ctx.agentId ?? "unknown";
@@ -439,8 +657,12 @@ export function createLangfuseService(
       // Skip if a trace already exists for this agent turn (multiple registry passes
       // can cause register() to be called multiple times, each registering hooks)
       const existingKey = TraceContextMap.key(ctx.agentId, ctx.sessionKey);
-      if (contextMap.get(existingKey)) {
+      const existing = contextMap.get(existingKey);
+      if (existing && !existing.finalized) {
         return;
+      }
+      if (existing) {
+        contextMap.delete(existingKey);
       }
 
       const timestamp = Date.now();
@@ -474,13 +696,14 @@ export function createLangfuseService(
         pendingSpans: new Map(),
         createdAt: Date.now(),
         timestamp,
+        sessionId: ctx.sessionId,
       };
 
       contextMap.create(TraceContextMap.key(ctx.agentId, ctx.sessionKey), entry);
       serviceLogger?.info?.(`Langfuse: trace created (agent=${ctx.agentId}, traceId=${traceId})`);
     },
 
-    // llm_input: start a generation span for this LLM call (CLI mode only)
+    // llm_input: store model/provider/systemPrompt on entry (generation created in agent_end)
     llmInput(event: LlmInputEvent, ctx: AgentCtx): void {
       if (disabled || !langfuse || !contextMap) {
         return;
@@ -488,6 +711,12 @@ export function createLangfuseService(
 
       const key = TraceContextMap.key(ctx.agentId, ctx.sessionKey);
       let entry = contextMap.get(key);
+
+      // If previous turn's entry is finalized, discard and create fresh
+      if (entry?.finalized) {
+        contextMap.delete(key);
+        entry = undefined;
+      }
 
       // Create trace entry on-demand if before_agent_start didn't create one
       if (!entry) {
@@ -527,39 +756,20 @@ export function createLangfuseService(
         );
       }
 
-      // Capture system prompt for trace metadata and diagnostic event fallback
+      // Store data for agent_end to use when creating generations
       if (event.systemPrompt) {
         entry.systemPrompt = event.systemPrompt;
       }
-
-      entry.llmCallCount += 1;
-
-      const startTime = new Date();
-      const generation = entry.trace.generation({
-        name: `llm-call-${entry.llmCallCount}`,
-        model: event.model,
-        startTime,
-        input: redactObject(
-          {
-            systemPrompt: event.systemPrompt,
-            prompt: event.prompt,
-            historyMessages: event.historyMessages,
-          },
-          redactEnabled,
-        ),
-        metadata: {
-          provider: event.provider,
-          runId: event.runId,
-          imagesCount: event.imagesCount,
-        },
-        // Link generation to Langfuse prompt (makes Observations count > 0)
-        ...(entry.promptClient ? { prompt: entry.promptClient } : {}),
-      });
-
-      entry.pendingGenerations.set(event.runId, generation);
+      // Store historyMessages from first llm_input call for generation input
+      if (!entry.initialMessages && event.historyMessages) {
+        entry.initialMessages = event.historyMessages;
+      }
+      entry.lastModel = event.model;
+      entry.lastProvider = event.provider;
+      entry.sessionId = ctx.sessionId;
     },
 
-    // llm_output: end the generation span (CLI mode only)
+    // llm_output: store usage/output on entry (generation created in agent_end)
     llmOutput(event: LlmOutputEvent, ctx: AgentCtx): void {
       if (disabled || !langfuse) {
         return;
@@ -570,39 +780,11 @@ export function createLangfuseService(
         return;
       }
 
-      const generation = entry.pendingGenerations.get(event.runId);
-      if (!generation) {
-        return;
-      }
-
-      // Extract thinking content if present in lastAssistant block
-      let thinkingText: string | undefined;
-      if (
-        event.lastAssistant &&
-        typeof event.lastAssistant === "object" &&
-        (event.lastAssistant as Record<string, unknown>)["type"] === "thinking"
-      ) {
-        const thinking = event.lastAssistant as Record<string, unknown>;
-        thinkingText = typeof thinking["thinking"] === "string" ? thinking["thinking"] : undefined;
-      }
-
-      generation.end({
-        output: redactText(event.assistantTexts.join("\n"), redactEnabled),
-        usage: {
-          input: event.usage?.input,
-          output: event.usage?.output,
-          total: event.usage?.total,
-        },
-        metadata: {
-          cacheRead: event.usage?.cacheRead,
-          cacheWrite: event.usage?.cacheWrite,
-          thinkingContent: thinkingText,
-          provider: event.provider,
-          model: event.model,
-        },
-      });
-
-      entry.pendingGenerations.delete(event.runId);
+      // Store data for agent_end to use when creating generations
+      entry.storedUsage = event.usage;
+      entry.storedOutput = event.assistantTexts.join("\n");
+      entry.lastModel = event.model;
+      entry.lastProvider = event.provider;
     },
 
     // before_tool_call: start a span for the tool call (CLI mode only)
@@ -667,7 +849,7 @@ export function createLangfuseService(
       entry.pendingSpans.delete(event.toolCallId);
     },
 
-    // agent_end: finalize the trace (CLI mode only)
+    // agent_end: create per-LLM-call generations from JSONL and finalize the trace
     agentEnd(event: AgentEndEvent, ctx: AgentCtx): void {
       if (disabled || !langfuse || !contextMap) {
         return;
@@ -679,45 +861,187 @@ export function createLangfuseService(
         return;
       }
 
-      // Extract last assistant text from messages
-      let lastAssistantText: string | undefined;
-      if (Array.isArray(event.messages)) {
-        for (let i = event.messages.length - 1; i >= 0; i--) {
-          const msg = event.messages[i];
-          if (
-            msg &&
-            typeof msg === "object" &&
-            (msg as Record<string, unknown>)["role"] === "assistant"
-          ) {
-            const content = (msg as Record<string, unknown>)["content"];
-            if (typeof content === "string") {
-              lastAssistantText = content;
-            } else if (Array.isArray(content)) {
-              const texts = content
-                .filter(
-                  (block): block is Record<string, unknown> =>
-                    block !== null &&
-                    typeof block === "object" &&
-                    (block as Record<string, unknown>)["type"] === "text",
-                )
-                .map((block) => String(block["text"] ?? ""));
-              if (texts.length > 0) {
-                lastAssistantText = texts.join("\n");
-              }
-            }
-            break;
-          }
-        }
+      const agentId = ctx.agentId ?? "unknown";
+      const sessionId = entry.sessionId ?? ctx.sessionId ?? "";
+
+      // Read JSONL and filter to current turn
+      let allEntries: SessionEntry[] = [];
+      let turnEntries: SessionEntry[] = [];
+      if (sessionId) {
+        allEntries = readSessionMessages(agentId, sessionId);
+        turnEntries = filterCurrentTurnEntries(allEntries);
       }
 
+      // Fallback: if JSONL unavailable, build entries from event.messages
+      if (turnEntries.length === 0 && Array.isArray(event.messages)) {
+        const now = Date.now();
+        turnEntries = (event.messages as Record<string, unknown>[]).map((msg, i) => ({
+          timestamp: now - (event.messages.length - i) * 1000,
+          message: msg,
+        }));
+      }
+
+      // Create a generation for each assistant message in the turn
+      let llmCallCount = 0;
+      let lastAssistantText: string | undefined;
+      let lastProvider: string | undefined;
+      let lastModel: string | undefined;
+      let prevTimestamp: number | undefined;
+
+      // Aggregate usage across all assistant messages
+      let totalUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
+      let hasPerCallUsage = false;
+
+      // Count total assistant messages to know which is last
+      const assistantCount = turnEntries.filter((e) => e.message.role === "assistant").length;
+
+      for (const te of turnEntries) {
+        const msg = te.message;
+
+        if (msg.role === "assistant") {
+          llmCallCount += 1;
+          const isLast = llmCallCount === assistantCount;
+
+          const assistantTs = te.timestamp;
+          const startTime = prevTimestamp ? new Date(prevTimestamp) : new Date(entry.timestamp);
+          const endTime = new Date(assistantTs);
+
+          // Build output (D3 format)
+          const output = buildGenerationOutput(msg.content, redactEnabled);
+
+          // Build generation input matching LLM API structure: {model, messages}
+          // Use ALL session entries up to this assistant message as input
+          // (includes full history + current user message + any prior tool results)
+          const systemMessage = entry.systemPrompt
+            ? [{ role: "system", content: entry.systemPrompt }]
+            : [];
+          const allPriorEntries = allEntries.slice(0, allEntries.indexOf(te));
+          const accumulatedMessages = allPriorEntries.map((e) => buildApiMessage(e.message));
+          const genInput = redactObject(
+            {
+              model: String(msg.model ?? entry.lastModel ?? "unknown"),
+              messages: [...systemMessage, ...accumulatedMessages],
+            },
+            redactEnabled,
+          );
+
+          // Extract per-call usage from JSONL assistant message
+          const msgUsage = msg.usage as Record<string, number> | undefined;
+          let genUsage: { input?: number; output?: number; total?: number } | undefined;
+
+          if (hasNonZeroUsage(msgUsage)) {
+            hasPerCallUsage = true;
+            genUsage = {
+              input: msgUsage?.input ?? 0,
+              output: msgUsage?.output ?? 0,
+              total: msgUsage?.totalTokens ?? msgUsage?.total ?? 0,
+              ...(msgUsage?.cacheRead ? { cache_read_input_tokens: msgUsage.cacheRead } : {}),
+              ...(msgUsage?.cacheWrite ? { cache_creation_input_tokens: msgUsage.cacheWrite } : {}),
+            };
+            // Aggregate
+            totalUsage.input += msgUsage?.input ?? 0;
+            totalUsage.output += msgUsage?.output ?? 0;
+            totalUsage.cacheRead += msgUsage?.cacheRead ?? 0;
+            totalUsage.cacheWrite += msgUsage?.cacheWrite ?? 0;
+            totalUsage.total += msgUsage?.totalTokens ?? msgUsage?.total ?? 0;
+          } else if (isLast && entry.storedUsage) {
+            // Fall back to stored usage from llm_output for last generation
+            genUsage = {
+              input: entry.storedUsage.input,
+              output: entry.storedUsage.output,
+              total: entry.storedUsage.total,
+            };
+            totalUsage.input += entry.storedUsage.input ?? 0;
+            totalUsage.output += entry.storedUsage.output ?? 0;
+            totalUsage.cacheRead += entry.storedUsage.cacheRead ?? 0;
+            totalUsage.cacheWrite += entry.storedUsage.cacheWrite ?? 0;
+            totalUsage.total += entry.storedUsage.total ?? 0;
+          }
+
+          const model = String(msg.model ?? entry.lastModel ?? "unknown");
+          const provider = String(msg.provider ?? entry.lastProvider ?? "");
+
+          entry.trace.generation({
+            name: `llm-call-${llmCallCount}`,
+            model,
+            startTime,
+            endTime,
+            input: truncatePayload(genInput),
+            output: truncatePayload(output),
+            usageDetails: genUsage as Record<string, number> | undefined,
+            metadata: {
+              provider,
+              model: msg.model,
+              stopReason: msg.stopReason,
+              ...(msgUsage?.cost ? { cost: msgUsage.cost } : {}),
+            },
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            ...(entry.promptClient ? { prompt: entry.promptClient as any } : {}),
+          });
+
+          // Track last assistant text for trace output
+          const text = extractTextContent(msg.content);
+          if (text) {
+            lastAssistantText = text;
+          }
+          lastProvider = provider;
+          lastModel = model;
+        } else {
+          // non-assistant entries (user, toolResult) are captured via allEntries
+        }
+
+        prevTimestamp = te.timestamp;
+      }
+
+      // Update entry counts
+      entry.llmCallCount = llmCallCount;
+
+      // Extract user message for trace input
+      const userEntry = turnEntries.find((e) => e.message.role === "user");
+      const userInputText = userEntry
+        ? extractUserMessageText(userEntry.message.content)
+        : undefined;
+
+      // Use aggregated usage if we have per-call data, otherwise use stored usage
+      const finalUsage = hasPerCallUsage
+        ? {
+            inputTokens: totalUsage.input,
+            outputTokens: totalUsage.output,
+            cacheReadInputTokens: totalUsage.cacheRead || undefined,
+            cacheWriteInputTokens: totalUsage.cacheWrite || undefined,
+            totalTokens: totalUsage.total,
+          }
+        : entry.storedUsage
+          ? {
+              inputTokens: entry.storedUsage.input,
+              outputTokens: entry.storedUsage.output,
+              cacheReadInputTokens: entry.storedUsage.cacheRead || undefined,
+              cacheWriteInputTokens: entry.storedUsage.cacheWrite || undefined,
+              totalTokens: entry.storedUsage.total,
+            }
+          : undefined;
+
+      // Update trace with structured metadata matching yesterday's working format
       entry.trace.update({
+        input: userInputText ? redactText(userInputText, redactEnabled) : undefined,
         output: lastAssistantText ? redactText(lastAssistantText, redactEnabled) : undefined,
         metadata: {
-          success: event.success,
-          durationMs: event.durationMs,
-          messageCount: event.messages?.length,
-          llmCallCount: entry.llmCallCount,
-          toolCallCount: entry.toolCallCount,
+          sessionId,
+          sessionKey: ctx.sessionKey,
+          agentId,
+          channelId: ctx.channelId,
+          trigger: ctx.trigger,
+          timestamp: entry.timestamp,
+          stats: {
+            success: event.success,
+            durationMs: event.durationMs,
+            messageCount: event.messages?.length ?? turnEntries.length,
+            llmCallCount,
+            toolCallCount: entry.toolCallCount,
+          },
+          usage: finalUsage,
+          lastModel:
+            lastModel || lastProvider ? { provider: lastProvider, model: lastModel } : undefined,
           prompt: entry.promptMatch,
         },
         ...(event.error
@@ -728,7 +1052,9 @@ export function createLangfuseService(
           : {}),
       });
 
-      contextMap.delete(key);
+      // Mark as finalized instead of deleting — diagnostic events may still arrive
+      // but should not overwrite our clean metadata structure.
+      entry.finalized = true;
     },
 
     // session_end: log session metadata
@@ -763,6 +1089,10 @@ export function createLangfuseService(
       contextMap.startSweep();
       disabled = false;
       promptManager = config.prompts?.length ? new PromptManager(langfuse, config) : null;
+      // Pre-warm prompt cache so resolveSync() works on the first message
+      if (promptManager) {
+        promptManager.warmCache().catch(() => {});
+      }
 
       // Dynamically import onDiagnosticEvent — this module is only available
       // at runtime inside the openclaw process (not during npm install).
@@ -849,9 +1179,12 @@ export function createLangfuseService(
               }
             }
 
-            // Read session JSONL to get full input/output content
+            // Read session JSONL and filter to current turn only.
+            // The JSONL contains the full session history across turns;
+            // we only want messages from the latest user message onward.
             const sessionId = String(diagEvt.sessionId ?? "");
-            const messages = sessionId ? readSessionMessages(agentId, sessionId) : [];
+            const allEntries = sessionId ? readSessionMessages(agentId, sessionId) : [];
+            const messages = filterCurrentTurnMessages(allEntries.map((e) => e.message));
             const turn = extractConversation(messages);
 
             // Create tool call spans from session messages (only if llm hooks didn't already)
@@ -872,70 +1205,172 @@ export function createLangfuseService(
                 gen.update({
                   endTime,
                   output: turn.output ? redactText(turn.output, redactEnabled) : undefined,
-                  usage: {
-                    input: usage?.input,
-                    output: usage?.output,
-                    total: usage?.total,
+                  usageDetails: {
+                    input: usage?.input ?? 0,
+                    output: usage?.output ?? 0,
+                    total: usage?.total ?? 0,
+                    ...(usage?.cacheRead ? { cache_read_input_tokens: usage.cacheRead } : {}),
+                    ...(usage?.cacheWrite ? { cache_creation_input_tokens: usage.cacheWrite } : {}),
                   },
                   metadata: {
                     costUsd: diagEvt.costUsd,
                     durationMs,
-                    cacheRead: usage?.cacheRead,
-                    cacheWrite: usage?.cacheWrite,
                   },
                 });
                 entry.pendingGenerations.delete(runId);
               }
             } else {
-              // llm_input didn't fire — create generation from diagnostic event + JSONL
-              entry.llmCallCount += 1;
-              const genInput = redactEnabled ? redactObject(turn.input, redactEnabled) : turn.input;
-              const genOutput = turn.output ? redactText(turn.output, redactEnabled) : undefined;
+              // llm_input didn't fire — create generations from diagnostic event + JSONL.
+              // Each assistant message in the session = one LLM call.
+              const llmTurns = extractLLMTurns(messages);
 
-              const gen = entry.trace.generation({
-                name: `llm-call-${entry.llmCallCount}`,
-                model: String(diagEvt.model ?? "unknown"),
-                startTime,
-                input: {
-                  systemPrompt: entry.systemPrompt
-                    ? redactText(entry.systemPrompt, redactEnabled)
-                    : undefined,
-                  messages: genInput,
-                },
+              if (llmTurns.length === 0) {
+                // Fallback: no parseable turns, create single generation as before
+                entry.llmCallCount += 1;
+                const genInput = redactEnabled
+                  ? redactObject(turn.input, redactEnabled)
+                  : turn.input;
+                const genOutput = turn.output ? redactText(turn.output, redactEnabled) : undefined;
+                const gen = entry.trace.generation({
+                  name: `llm-call-${entry.llmCallCount}`,
+                  model: String(diagEvt.model ?? "unknown"),
+                  startTime,
+                  input: {
+                    systemPrompt: entry.systemPrompt
+                      ? redactText(entry.systemPrompt, redactEnabled)
+                      : undefined,
+                    messages: genInput,
+                  },
+                  metadata: {
+                    provider: String(diagEvt.provider ?? ""),
+                    costUsd: diagEvt.costUsd,
+                    durationMs,
+                    cacheRead: usage?.cacheRead,
+                    cacheWrite: usage?.cacheWrite,
+                    lastUserInput: turn.lastUserText,
+                  },
+                  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                  ...(entry.promptClient ? { prompt: entry.promptClient as any } : {}),
+                });
+                gen.update({
+                  endTime,
+                  output: genOutput,
+                  usageDetails: {
+                    input: usage?.input ?? 0,
+                    output: usage?.output ?? 0,
+                    total: usage?.total ?? 0,
+                    ...(usage?.cacheRead ? { cache_read_input_tokens: usage.cacheRead } : {}),
+                    ...(usage?.cacheWrite ? { cache_creation_input_tokens: usage.cacheWrite } : {}),
+                  },
+                });
+              } else {
+                // Create a generation for each LLM turn
+                for (let i = 0; i < llmTurns.length; i++) {
+                  const llmTurn = llmTurns[i];
+                  entry.llmCallCount += 1;
+                  const isLast = i === llmTurns.length - 1;
+
+                  // Build per-turn input: summarize preceding messages
+                  const turnInput = llmTurn.inputMessages.map((msg) => {
+                    const m = msg as Record<string, unknown>;
+                    const role = String(m.role ?? "unknown");
+                    const text = extractTextContent(m.content);
+                    if (role === "toolResult") {
+                      return {
+                        role,
+                        toolName: m.toolName ?? m.toolCallId,
+                        content: text.length > 2000 ? text.slice(0, 2000) + "...[truncated]" : text,
+                      };
+                    }
+                    return {
+                      role,
+                      content: text.length > 2000 ? text.slice(0, 2000) + "...[truncated]" : text,
+                    };
+                  });
+
+                  const genInput = redactEnabled
+                    ? redactObject(turnInput, redactEnabled)
+                    : turnInput;
+                  const genOutput = llmTurn.assistantText
+                    ? redactText(llmTurn.assistantText, redactEnabled)
+                    : undefined;
+
+                  const gen = entry.trace.generation({
+                    name: `llm-call-${entry.llmCallCount}`,
+                    model: String(diagEvt.model ?? "unknown"),
+                    input: {
+                      // Include system prompt only on the first generation
+                      ...(i === 0 && entry.systemPrompt
+                        ? {
+                            systemPrompt: redactText(entry.systemPrompt, redactEnabled),
+                          }
+                        : {}),
+                      messages: genInput,
+                    },
+                    metadata: {
+                      provider: String(diagEvt.provider ?? ""),
+                      ...(llmTurn.toolCalls.length > 0
+                        ? {
+                            toolCalls: llmTurn.toolCalls.map((t) => t.name),
+                          }
+                        : {}),
+                    },
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                    ...(entry.promptClient ? { prompt: entry.promptClient as any } : {}),
+                  });
+
+                  // Only the last generation gets usage/timing (we only have aggregate data)
+                  if (isLast) {
+                    gen.update({
+                      endTime,
+                      output: genOutput,
+                      usageDetails: {
+                        input: usage?.input ?? 0,
+                        output: usage?.output ?? 0,
+                        total: usage?.total ?? 0,
+                        ...(usage?.cacheRead ? { cache_read_input_tokens: usage.cacheRead } : {}),
+                        ...(usage?.cacheWrite
+                          ? { cache_creation_input_tokens: usage.cacheWrite }
+                          : {}),
+                      },
+                      metadata: {
+                        costUsd: diagEvt.costUsd,
+                        durationMs,
+                      },
+                    });
+                  } else {
+                    gen.end({ output: genOutput });
+                  }
+                }
+              }
+            }
+
+            // Update trace metadata only if agentEnd hasn't finalized it
+            // (Langfuse update is full-replace, not merge)
+            if (!entry.finalized) {
+              entry.trace.update({
+                output: turn.output ? redactText(turn.output, redactEnabled) : undefined,
                 metadata: {
-                  provider: String(diagEvt.provider ?? ""),
-                  costUsd: diagEvt.costUsd,
-                  durationMs,
-                  cacheRead: usage?.cacheRead,
-                  cacheWrite: usage?.cacheWrite,
-                  lastUserInput: turn.lastUserText,
-                },
-                // Link generation to Langfuse prompt (makes Observations count > 0)
-                ...(entry.promptClient ? { prompt: entry.promptClient } : {}),
-              });
-              gen.update({
-                endTime,
-                output: genOutput,
-                usage: {
-                  input: usage?.input,
-                  output: usage?.output,
-                  total: usage?.total,
+                  sessionKey,
+                  agentId,
+                  channelId: diagEvt.channel,
+                  trigger: "diagnostic",
+                  timestamp: entry.timestamp,
+                  stats: {
+                    durationMs,
+                    messageCount: messages.length,
+                    llmCallCount: entry.llmCallCount,
+                    toolCallCount: entry.toolCallCount,
+                  },
+                  ...(entry.lastModel
+                    ? { lastModel: { provider: entry.lastProvider, model: entry.lastModel } }
+                    : {}),
+                  ...(entry.promptMatch && "name" in entry.promptMatch
+                    ? { prompt: entry.promptMatch }
+                    : {}),
                 },
               });
             }
-
-            // Update trace with output and full metadata
-            entry.trace.update({
-              output: turn.output ? redactText(turn.output, redactEnabled) : undefined,
-              metadata: {
-                durationMs,
-                llmCallCount: entry.llmCallCount,
-                costUsd: diagEvt.costUsd,
-                provider: diagEvt.provider,
-                model: diagEvt.model,
-                messageCount: messages.length,
-              },
-            });
 
             serviceLogger?.info?.(
               `Langfuse: generation created (agent=${agentId}, model=${diagEvt.model}, tokens=${usage?.total})`,

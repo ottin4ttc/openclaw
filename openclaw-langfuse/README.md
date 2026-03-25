@@ -28,53 +28,31 @@ openclaw plugins install /path/to/openclaw-langfuse
 
 ## Configuration
 
-Add the plugin config to your `~/.openclaw/openclaw.json`:
+### Quick Setup via CLI
 
-```jsonc
-{
-  "plugins": {
-    "entries": {
-      "openclaw-langfuse": {
-        "enabled": true,
-        "config": {
-          // Langfuse credentials (env vars LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY take precedence)
-          "baseUrl": "https://cloud.langfuse.com",
-          "publicKey": "pk-lf-...",
-          "secretKey": "sk-lf-...",
+```bash
+# Enable plugin
+openclaw config set plugins.entries.openclaw-langfuse.enabled true
 
-          // LLM tracing
-          "tracing": {
-            "enabled": true,
-            "tags": ["production"],
-            "redact": true,
-          },
+# Langfuse connection
+openclaw config set plugins.entries.openclaw-langfuse.config.baseUrl "https://cloud.langfuse.com"
+openclaw config set plugins.entries.openclaw-langfuse.config.publicKey "pk-lf-your-public-key"
+openclaw config set plugins.entries.openclaw-langfuse.config.secretKey "sk-lf-your-secret-key"
 
-          // Prompt management (optional)
-          "prompts": [
-            {
-              "match": "main",
-              "langfusePrompt": "main-agent-prompt",
-              "inject": "replace",
-            },
-            {
-              "match": "my-agent-*",
-              "langfusePrompt": "my-agent-prompt",
-              "label": "production",
-              "inject": "prepend",
-            },
-            {
-              "match": "*",
-              "langfusePrompt": "fallback-prompt",
-              "inject": "append",
-            },
-          ],
+# Tracing (enabled by default, content redacted for privacy)
+openclaw config set plugins.entries.openclaw-langfuse.config.tracing '{"enabled":true,"tags":["production"],"redact":true}'
 
-          "promptCacheTtlMs": 60000,
-        },
-      },
-    },
-  },
-}
+# Prompt management (optional) -- inject Langfuse prompts into agents
+openclaw config set plugins.entries.openclaw-langfuse.config.prompts '[{"match":"main","langfusePrompt":"oh-my-langfuse-prompt","inject":"replace"},{"match":"support-*","langfusePrompt":"oh-my-langfuse-support","label":"production","inject":"prepend"},{"match":"*","langfusePrompt":"oh-my-langfuse-fallback","inject":"append"}]'
+
+# Prompt cache TTL (default: 60 seconds)
+openclaw config set plugins.entries.openclaw-langfuse.config.promptCacheTtlMs 60000
+```
+
+Then restart the gateway:
+
+```bash
+openclaw gateway restart
 ```
 
 ### Configuration Reference
@@ -94,11 +72,11 @@ Add the plugin config to your `~/.openclaw/openclaw.json`:
 
 Rules are evaluated in order (first match wins):
 
-| Pattern        | Match type      | Example                                     |
-| -------------- | --------------- | ------------------------------------------- |
-| `"main"`       | Exact match     | Matches agent ID `main` only                |
-| `"my-agent-*"` | Wildcard prefix | Matches `my-agent-1`, `my-agent-test`, etc. |
-| `"*"`          | Catch-all       | Matches any agent ID                        |
+| Pattern       | Match type      | Example                                             |
+| ------------- | --------------- | --------------------------------------------------- |
+| `"main"`      | Exact match     | Matches agent ID `main` only                        |
+| `"support-*"` | Wildcard prefix | Matches `support-tier1`, `support-enterprise`, etc. |
+| `"*"`         | Catch-all       | Matches any agent ID                                |
 
 Each rule supports:
 

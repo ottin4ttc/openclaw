@@ -23,7 +23,7 @@
           //     +-- Generation (llm-call-1, model, input/output, tokens)
           //     +-- Span (tool:read, params, result, duration)
           //     +-- Generation (llm-call-2, model, input/output, tokens)
-          //     +-- Span (tool:openmai_internal_api_call, params, result)
+          //     +-- Span (tool:search, params, result)
           //     +-- Generation (llm-call-3, final answer)
 
           "tracing": {
@@ -40,7 +40,7 @@
           //
           // Rules are evaluated in order (first match wins):
           //   - Exact match:    "main"
-          //   - Wildcard prefix: "openmai-*"
+          //   - Wildcard prefix: "support-*"
           //   - Catch-all:       "*"
           //
           // inject modes:
@@ -54,30 +54,24 @@
           "prompts": [
             {
               "match": "main",
-              "langfusePrompt": "main-agent-prompt",
+              "langfusePrompt": "oh-my-langfuse-prompt",
               "inject": "replace"
             },
             {
-              "match": "my-agent",
-              "langfusePrompt": "my-agent-prompt",
+              "match": "support-*",
+              "langfusePrompt": "oh-my-langfuse-support",
               "label": "production",
               "inject": "prepend"
             },
             {
-              "match": "openmai-test-*",
-              "langfusePrompt": "openmai-test-prompt",
+              "match": "dev-*",
+              "langfusePrompt": "oh-my-langfuse-dev",
               "label": "staging",
               "inject": "prepend"
             },
             {
-              "match": "openmai-*",
-              "langfusePrompt": "openmai-default-prompt",
-              "version": 3,
-              "inject": "prepend"
-            },
-            {
               "match": "*",
-              "langfusePrompt": "fallback-prompt",
+              "langfusePrompt": "oh-my-langfuse-fallback",
               "inject": "append"
             }
           ],

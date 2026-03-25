@@ -44,7 +44,33 @@ export class PromptManager {
   constructor(langfuse: Langfuse, config: LangfusePluginConfig) {
     this.langfuse = langfuse;
     this.rules = config.prompts ?? [];
-    this.cacheTtlMs = config.promptCacheTtlMs ?? 60000;
+    this.cacheTtlMs = config.promptCacheTtlMs ?? 300000; // 5 minutes default
+  }
+
+  /**
+   * Pre-fetch all configured prompt rules into the cache.
+   * Fire-and-forget — errors are silently ignored per rule.
+   */
+  async warmCache(): Promise<void> {
+    for (const rule of this.rules) {
+      try {
+        const cacheKey = `${rule.langfusePrompt}:${rule.version ?? "latest"}:${rule.label ?? "default"}`;
+        if (this.cache.has(cacheKey)) {
+          continue;
+        }
+        const { promptText, promptClient } = await this.fetchWithTimeout(rule);
+        this.cache.set(cacheKey, {
+          compiledPrompt: promptText,
+          fetchedAt: Date.now(),
+          promptName: rule.langfusePrompt,
+          version: rule.version,
+          label: rule.label,
+          promptClient,
+        });
+      } catch {
+        // Silently skip — will retry on next resolve
+      }
+    }
   }
 
   /**
@@ -62,7 +88,22 @@ export class PromptManager {
     // 2. Check cache
     const cacheKey = `${rule.langfusePrompt}:${rule.version ?? "latest"}:${rule.label ?? "default"}`;
     const cached = this.cache.get(cacheKey);
-    if (cached && Date.now() - cached.fetchedAt < this.cacheTtlMs) {
+    // If cache expired, still use stale data but trigger background refresh
+    if (cached && Date.now() - cached.fetchedAt >= this.cacheTtlMs) {
+      this.fetchWithTimeout(rule)
+        .then(({ promptText, promptClient }) =>
+          this.cache.set(cacheKey, {
+            compiledPrompt: promptText,
+            fetchedAt: Date.now(),
+            promptName: rule.langfusePrompt,
+            version: rule.version,
+            label: rule.label,
+            promptClient,
+          }),
+        )
+        .catch(() => {}); // silently ignore refresh failures
+    }
+    if (cached) {
       // compile with context vars
       const compiled = this.compileTemplate(cached.compiledPrompt, ctx);
       return {
@@ -106,6 +147,53 @@ export class PromptManager {
       // Graceful degradation - return undefined, don't throw
       return undefined;
     }
+  }
+
+  /**
+   * Synchronous resolve — returns cached prompt injection if available.
+   * Does NOT fetch from Langfuse. Use warmCache() or resolve() to populate cache first.
+   * Used by before_prompt_build hook which must return synchronously.
+   */
+  resolveSync(agentId: string, ctx: AgentContext): PromptResolveResult | undefined {
+    const rule = findMatchingRule(agentId, this.rules);
+    if (!rule) {
+      return undefined;
+    }
+
+    const cacheKey = `${rule.langfusePrompt}:${rule.version ?? "latest"}:${rule.label ?? "default"}`;
+    const cached = this.cache.get(cacheKey);
+    if (!cached) {
+      return undefined;
+    }
+
+    // If cache expired, trigger background refresh but still return stale data
+    if (Date.now() - cached.fetchedAt >= this.cacheTtlMs) {
+      this.fetchWithTimeout(rule)
+        .then(({ promptText, promptClient }) =>
+          this.cache.set(cacheKey, {
+            compiledPrompt: promptText,
+            fetchedAt: Date.now(),
+            promptName: rule.langfusePrompt,
+            version: rule.version,
+            label: rule.label,
+            promptClient,
+          }),
+        )
+        .catch(() => {});
+    }
+
+    const compiled = this.compileTemplate(cached.compiledPrompt, ctx);
+    return {
+      injection: this.buildInjection(compiled, rule.inject),
+      matchInfo: {
+        name: rule.langfusePrompt,
+        version: rule.version,
+        label: rule.label,
+        inject: rule.inject,
+        matchRule: rule.match,
+      },
+      promptClient: cached.promptClient,
+    };
   }
 
   private async fetchWithTimeout(
