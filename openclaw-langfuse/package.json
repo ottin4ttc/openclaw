@@ -5,7 +5,7 @@
   "license": "MIT",
   "type": "module",
   "scripts": {
-    "diagnose": "bun scripts/diagnose-model-config.ts"
+    "diagnose": "node scripts/diagnose-model-config.mjs"
   },
   "dependencies": {
     "langfuse": "latest"
