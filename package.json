@@ -453,9 +453,7 @@
       "protobufjs",
       "sharp"
     ],
-    "patchedDependencies": {
-      "@mariozechner/pi-ai@0.55.3": "patches/@mariozechner__pi-ai@0.55.3.patch"
-    },
+    "patchedDependencies": {},
     "packageExtensions": {
       "@mariozechner/pi-coding-agent": {
         "dependencies": {
