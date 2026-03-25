@@ -587,61 +587,54 @@ export function createLangfuseService(
       }
 
       const entry = getEntry(ctx.agentId, ctx.sessionKey);
-      if (entry) {
-        // Capture the user prompt as system prompt context (event.prompt contains the user input,
-        // but more importantly event.messages may have system-level context)
-        // The actual system prompt is built by OpenClaw internally and not directly exposed,
-        // but we can capture what's available
-        if (event.prompt) {
-          entry.systemPrompt = event.prompt;
-        }
+      if (entry && event.prompt) {
+        entry.systemPrompt = event.prompt;
+      }
 
-        // Record prompt match info and inject Langfuse prompt content.
-        // Must be SYNCHRONOUS — before_prompt_build hook needs to return injection immediately.
-        // Use resolveSync (cache-based) for the return value, then fire async resolve
-        // in background to update cache + fetch promptClient for generation linking.
-        if (promptManager) {
-          const agentId = ctx.agentId ?? "unknown";
-          const capturedEntry = entry;
-          const syncResult = promptManager.resolveSync(agentId, {
+      // Prompt injection MUST work even before entry exists (beforePromptBuild fires before beforeAgentStart).
+      // Use resolveSync for synchronous injection, fall back to async resolve for cache population.
+      if (promptManager) {
+        const agentId = ctx.agentId ?? "unknown";
+        const syncResult = promptManager.resolveSync(agentId, {
+          agentId: ctx.agentId,
+          channelId: ctx.channelId,
+          sessionKey: ctx.sessionKey,
+          trigger: ctx.trigger,
+        });
+        if (syncResult) {
+          if (entry) {
+            entry.promptMatch = syncResult.matchInfo;
+            entry.promptClient = syncResult.promptClient;
+          }
+          return syncResult.injection;
+        }
+        // Cache miss — fire async resolve to populate cache for next time
+        promptManager
+          .resolve(agentId, {
             agentId: ctx.agentId,
             channelId: ctx.channelId,
             sessionKey: ctx.sessionKey,
             trigger: ctx.trigger,
-          });
-          if (syncResult) {
-            capturedEntry.promptMatch = syncResult.matchInfo;
-            capturedEntry.promptClient = syncResult.promptClient;
-            return syncResult.injection;
-          }
-          // Cache miss — fire async resolve to populate cache for next time
-          promptManager
-            .resolve(agentId, {
-              agentId: ctx.agentId,
-              channelId: ctx.channelId,
-              sessionKey: ctx.sessionKey,
-              trigger: ctx.trigger,
-            })
-            .then((result) => {
-              if (result) {
-                capturedEntry.promptMatch = result.matchInfo;
-                capturedEntry.promptClient = result.promptClient;
-              }
-            })
-            .catch(() => {});
-        } else if (config.prompts?.length) {
-          // Fallback: record match info without prompt client
-          const agentId = ctx.agentId ?? "unknown";
-          const rule = findMatchingRule(agentId, config.prompts);
-          if (rule) {
-            entry.promptMatch = {
-              name: rule.langfusePrompt,
-              version: rule.version,
-              label: rule.label,
-              inject: rule.inject,
-              matchRule: rule.match,
-            };
-          }
+          })
+          .then((result) => {
+            if (result && entry) {
+              entry.promptMatch = result.matchInfo;
+              entry.promptClient = result.promptClient;
+            }
+          })
+          .catch(() => {});
+      } else if (entry && config.prompts?.length) {
+        // Fallback: record match info without prompt client
+        const agentId = ctx.agentId ?? "unknown";
+        const rule = findMatchingRule(agentId, config.prompts);
+        if (rule) {
+          entry.promptMatch = {
+            name: rule.langfusePrompt,
+            version: rule.version,
+            label: rule.label,
+            inject: rule.inject,
+            matchRule: rule.match,
+          };
         }
       }
 
