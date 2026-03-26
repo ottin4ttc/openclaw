@@ -44,8 +44,8 @@
           //   - Catch-all:       "*"
           //
           // inject modes:
-          //   - "prepend" (default): add before existing system prompt
-          //   - "append":  add after existing system prompt
+          //   - "append" (default): add after existing system prompt
+          //   - "prepend": add before existing system prompt
           //   - "replace": completely replace the system prompt
           //
           // If no rule matches or Langfuse is unavailable, the original

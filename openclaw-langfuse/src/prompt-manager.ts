@@ -241,11 +241,11 @@ export class PromptManager {
     switch (inject) {
       case "replace":
         return { systemPrompt: prompt };
-      case "append":
-        return { appendSystemContext: prompt };
       case "prepend":
-      default:
         return { prependSystemContext: prompt };
+      case "append":
+      default:
+        return { appendSystemContext: prompt };
     }
   }
 }

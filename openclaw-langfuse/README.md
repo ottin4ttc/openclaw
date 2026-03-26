@@ -43,7 +43,7 @@ openclaw config set plugins.entries.openclaw-langfuse.config.secretKey "sk-lf-yo
 openclaw config set plugins.entries.openclaw-langfuse.config.tracing '{"enabled":true,"tags":["production"],"redact":true}'
 
 # Prompt management (optional) -- inject Langfuse prompts into agents
-openclaw config set plugins.entries.openclaw-langfuse.config.prompts '[{"match":"main","langfusePrompt":"oh-my-langfuse-prompt","inject":"replace"},{"match":"support-*","langfusePrompt":"oh-my-langfuse-support","label":"production","inject":"prepend"},{"match":"*","langfusePrompt":"oh-my-langfuse-fallback","inject":"append"}]'
+openclaw config set plugins.entries.openclaw-langfuse.config.prompts '[{"match":"main","langfusePrompt":"oh-my-langfuse-prompt","label":"latest","inject":"replace"},{"match":"support-*","langfusePrompt":"oh-my-langfuse-support","label":"production","inject":"append"},{"match":"*","langfusePrompt":"oh-my-langfuse-fallback","label":"latest","inject":"append"}]'
 
 # Prompt cache TTL (default: 60 seconds)
 openclaw config set plugins.entries.openclaw-langfuse.config.promptCacheTtlMs 60000
@@ -83,7 +83,7 @@ Each rule supports:
 - `langfusePrompt` -- Name of the Langfuse prompt to fetch
 - `version` -- Specific prompt version (omit for latest)
 - `label` -- Prompt label (e.g. `"production"`, `"staging"`)
-- `inject` -- How to inject: `"prepend"` (default), `"append"`, or `"replace"`
+- `inject` -- How to inject: `"append"` (default), `"prepend"`, or `"replace"`
 
 ### Template Variables
 

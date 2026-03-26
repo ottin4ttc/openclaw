@@ -971,11 +971,19 @@ export function createLangfuseService(
             input: truncatePayload(genInput),
             output: truncatePayload(output),
             usageDetails: genUsage as Record<string, number> | undefined,
+            ...(msgUsage?.cost
+              ? {
+                  costDetails: {
+                    input: msgUsage.cost.input ?? 0,
+                    output: msgUsage.cost.output ?? 0,
+                    total: msgUsage.cost.total ?? 0,
+                  },
+                }
+              : {}),
             metadata: {
               provider,
               model: msg.model,
               stopReason: msg.stopReason,
-              ...(msgUsage?.cost ? { cost: msgUsage.cost } : {}),
             },
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             ...(entry.promptClient ? { prompt: entry.promptClient as any } : {}),
@@ -1216,6 +1224,15 @@ export function createLangfuseService(
             const endTime = new Date();
             const startTime = new Date(endTime.getTime() - durationMs);
 
+            // If agent_end already finalized this entry (created generations from JSONL),
+            // skip generation creation to avoid duplicates.
+            if (entry.finalized) {
+              serviceLogger?.info?.(
+                `Langfuse: skipping diagnostic generation — agent_end already finalized (agent=${agentId})`,
+              );
+              return;
+            }
+
             // If llm_input hook already created a generation, just update it with usage/output
             // Otherwise create a new generation from diagnostic event data
             if (entry.llmCallCount > 0 && entry.pendingGenerations.size > 0) {
@@ -1231,8 +1248,10 @@ export function createLangfuseService(
                     ...(usage?.cacheRead ? { cache_read_input_tokens: usage.cacheRead } : {}),
                     ...(usage?.cacheWrite ? { cache_creation_input_tokens: usage.cacheWrite } : {}),
                   },
+                  ...(typeof diagEvt.costUsd === "number"
+                    ? { costDetails: { total: diagEvt.costUsd } }
+                    : {}),
                   metadata: {
-                    costUsd: diagEvt.costUsd,
                     durationMs,
                   },
                 });
@@ -1260,9 +1279,11 @@ export function createLangfuseService(
                       : undefined,
                     messages: genInput,
                   },
+                  ...(typeof diagEvt.costUsd === "number"
+                    ? { costDetails: { total: diagEvt.costUsd } }
+                    : {}),
                   metadata: {
                     provider: String(diagEvt.provider ?? ""),
-                    costUsd: diagEvt.costUsd,
                     durationMs,
                     cacheRead: usage?.cacheRead,
                     cacheWrite: usage?.cacheWrite,
@@ -1352,8 +1373,10 @@ export function createLangfuseService(
                           ? { cache_creation_input_tokens: usage.cacheWrite }
                           : {}),
                       },
+                      ...(typeof diagEvt.costUsd === "number"
+                        ? { costDetails: { total: diagEvt.costUsd } }
+                        : {}),
                       metadata: {
-                        costUsd: diagEvt.costUsd,
                         durationMs,
                       },
                     });

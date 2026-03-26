@@ -53,27 +53,29 @@ export function normalizeModelCompat(model: Model<Api>): Model<Api> {
   }
 
   // The `developer` role and stream usage chunks are OpenAI-native behaviors.
-  // Many OpenAI-compatible backends reject `developer` and/or emit usage-only
-  // chunks that break strict parsers expecting choices[0]. For non-native
-  // openai-completions endpoints, force both compat flags off.
+  // Many OpenAI-compatible backends reject `developer` and/or may not support
+  // stream_options. For non-native openai-completions endpoints:
+  // - supportsDeveloperRole: always forced off (most backends reject it)
+  // - supportsUsageInStreaming: defaults to false, but respects explicit user
+  //   config (true) so users can opt in per provider via compat settings
   const compat = model.compat ?? undefined;
   // When baseUrl is empty the pi-ai library defaults to api.openai.com, so
   // leave compat unchanged and let default native behavior apply.
-  // Note: explicit true values are intentionally overridden for non-native
-  // endpoints for safety.
   const needsForce = baseUrl ? !isOpenAINativeEndpoint(baseUrl) : false;
   if (!needsForce) {
     return model;
   }
-  if (compat?.supportsDeveloperRole === false && compat?.supportsUsageInStreaming === false) {
+  if (compat?.supportsDeveloperRole === false && compat?.supportsUsageInStreaming !== undefined) {
     return model;
   }
 
   // Return a new object — do not mutate the caller's model reference.
+  // Respect explicit supportsUsageInStreaming from user config; default to false.
+  const usageInStreaming = compat?.supportsUsageInStreaming ?? false;
   return {
     ...model,
     compat: compat
-      ? { ...compat, supportsDeveloperRole: false, supportsUsageInStreaming: false }
-      : { supportsDeveloperRole: false, supportsUsageInStreaming: false },
+      ? { ...compat, supportsDeveloperRole: false, supportsUsageInStreaming: usageInStreaming }
+      : { supportsDeveloperRole: false, supportsUsageInStreaming: usageInStreaming },
   } as typeof model;
 }

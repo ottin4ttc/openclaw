@@ -219,7 +219,7 @@ describe("normalizeModelCompat", () => {
     });
   });
 
-  it("forces supportsUsageInStreaming off for generic custom openai-completions provider", () => {
+  it("defaults supportsUsageInStreaming to false for generic custom openai-completions provider", () => {
     expectSupportsUsageInStreamingForcedOff({
       provider: "custom-cpa",
       baseUrl: "https://cpa.example.com/v1",
@@ -262,7 +262,7 @@ describe("normalizeModelCompat", () => {
     expect(supportsDeveloperRole(normalized)).toBe(false);
   });
 
-  it("overrides explicit supportsUsageInStreaming true on non-native endpoints", () => {
+  it("respects explicit supportsUsageInStreaming true on non-native endpoints", () => {
     const model = {
       ...baseModel(),
       provider: "custom-cpa",
@@ -270,7 +270,7 @@ describe("normalizeModelCompat", () => {
       compat: { supportsUsageInStreaming: true },
     };
     const normalized = normalizeModelCompat(model);
-    expect(supportsUsageInStreaming(normalized)).toBe(false);
+    expect(supportsUsageInStreaming(normalized)).toBe(true);
   });
 
   it("does not mutate caller model when forcing supportsDeveloperRole off", () => {

@@ -43,7 +43,7 @@
             "inject": {
               "type": "string",
               "enum": ["prepend", "append", "replace"],
-              "description": "How to inject the fetched prompt into the system prompt"
+              "description": "How to inject the fetched prompt (default: append)"
             }
           }
         }
