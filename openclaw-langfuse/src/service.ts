@@ -1,7 +1,6 @@
 /* eslint-disable @typescript-eslint/no-base-to-string, @typescript-eslint/restrict-template-expressions, @typescript-eslint/no-redundant-type-constituents */
 import { createHash } from "node:crypto";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import Langfuse from "langfuse";
 import type {
@@ -165,23 +164,27 @@ type SessionEntry = { timestamp: number; message: Record<string, unknown> };
  * Returns entries with timestamps so callers can derive accurate startTime/endTime.
  */
 function readSessionMessages(agentId: string, sessionId: string): SessionEntry[] {
-  const homeDir = os.homedir();
+  if (!serviceStateDir) {
+    serviceLogger?.warn?.(`Langfuse: no stateDir available, cannot locate session JSONL`);
+    return [];
+  }
   const sessionFile = path.join(
-    homeDir,
-    ".openclaw",
+    serviceStateDir,
     "agents",
     agentId,
     "sessions",
     `${sessionId}.jsonl`,
   );
   if (!fs.existsSync(sessionFile)) {
+    serviceLogger?.warn?.(`Langfuse: session JSONL not found: ${sessionFile}`);
     return [];
   }
 
   let raw: string;
   try {
     raw = fs.readFileSync(sessionFile, "utf-8");
-  } catch {
+  } catch (err) {
+    serviceLogger?.warn?.(`Langfuse: failed to read session JSONL: ${sessionFile} — ${err}`);
     return [];
   }
 
@@ -561,6 +564,7 @@ let langfuse: Langfuse | null = null;
 let contextMap: TraceContextMap | null = null;
 let disabled = false;
 let serviceLogger: PluginLogger | null = null;
+let serviceStateDir: string | null = null;
 let unsubscribeDiagnostics: (() => void) | null = null;
 let promptManager: PromptManager | null = null;
 
@@ -593,6 +597,9 @@ export function createLangfuseService(
       if (entry && event.prompt) {
         entry.systemPrompt = event.prompt;
       }
+      serviceLogger?.debug?.(
+        `Langfuse: beforePromptBuild — entry=${entry ? "found" : "null"} prompt=${event.prompt ? `${event.prompt.length}chars` : "empty"}`,
+      );
 
       // Prompt injection MUST work even before entry exists (beforePromptBuild fires before beforeAgentStart).
       // Use resolveSync for synchronous injection, fall back to async resolve for cache population.
@@ -614,6 +621,20 @@ export function createLangfuseService(
           if (entry) {
             entry.promptMatch = syncResult.matchInfo;
             entry.promptClient = syncResult.promptClient;
+            // Store injection text for merging into systemPrompt in generation input
+            const injection = syncResult.injection as Record<string, unknown> | undefined;
+            if (injection) {
+              entry.promptInjection = {
+                prepend:
+                  typeof injection.prependSystemContext === "string"
+                    ? injection.prependSystemContext
+                    : undefined,
+                append:
+                  typeof injection.appendSystemContext === "string"
+                    ? injection.appendSystemContext
+                    : undefined,
+              };
+            }
           }
           return syncResult.injection;
         }
@@ -762,6 +783,9 @@ export function createLangfuseService(
       if (event.systemPrompt) {
         entry.systemPrompt = event.systemPrompt;
       }
+      serviceLogger?.debug?.(
+        `Langfuse: llmInput — systemPrompt=${entry.systemPrompt ? `${entry.systemPrompt.length}chars` : "not set"}`,
+      );
       // Store historyMessages from first llm_input call for generation input
       if (!entry.initialMessages && event.historyMessages) {
         entry.initialMessages = event.historyMessages;
@@ -789,67 +813,23 @@ export function createLangfuseService(
       entry.lastProvider = event.provider;
     },
 
-    // before_tool_call: start a span for the tool call (CLI mode only)
-    beforeToolCall(event: BeforeToolCallEvent, ctx: ToolCtx): void {
+    // before_tool_call: track tool call count only.
+    // Tool spans are created from JSONL in agent_end for reliable timing and output.
+    beforeToolCall(_event: BeforeToolCallEvent, ctx: ToolCtx): void {
       if (disabled || !langfuse) {
         return;
       }
-
-      const entry = getEntry(ctx.agentId, ctx.sessionKey);
-      if (!entry) {
-        return;
+      let entry = getEntry(ctx.agentId, ctx.sessionKey);
+      if (!entry && contextMap) {
+        entry = contextMap.findActive();
       }
-
-      entry.toolCallCount += 1;
-
-      const truncatedParams = truncatePayload(event.params);
-
-      const span = entry.trace.span({
-        name: `tool:${event.toolName}`,
-        input: redactObject(truncatedParams, redactEnabled),
-        metadata: {
-          runId: event.runId,
-          toolCallId: event.toolCallId,
-        },
-      });
-
-      if (event.toolCallId) {
-        entry.pendingSpans.set(event.toolCallId, span);
+      if (entry) {
+        entry.toolCallCount += 1;
       }
     },
 
-    // after_tool_call: end the tool span (CLI mode only)
-    afterToolCall(event: AfterToolCallEvent, ctx: ToolCtx): void {
-      if (disabled || !langfuse) {
-        return;
-      }
-
-      const entry = getEntry(ctx.agentId, ctx.sessionKey);
-      if (!entry) {
-        return;
-      }
-
-      if (!event.toolCallId) {
-        return;
-      }
-      const span = entry.pendingSpans.get(event.toolCallId);
-      if (!span) {
-        return;
-      }
-
-      const truncatedResult = truncatePayload(event.result);
-
-      span.end({
-        output: event.error ? { error: event.error } : redactObject(truncatedResult, redactEnabled),
-        statusMessage: event.error,
-        level: event.error ? "ERROR" : "DEFAULT",
-        metadata: {
-          durationMs: event.durationMs,
-        },
-      });
-
-      entry.pendingSpans.delete(event.toolCallId);
-    },
+    // after_tool_call: no-op — tool spans are completed from JSONL in agent_end.
+    afterToolCall(): void {},
 
     // agent_end: create per-LLM-call generations from JSONL and finalize the trace
     agentEnd(event: AgentEndEvent, ctx: AgentCtx): void {
@@ -865,7 +845,6 @@ export function createLangfuseService(
 
       const agentId = ctx.agentId ?? "unknown";
       const sessionId = entry.sessionId ?? ctx.sessionId ?? "";
-
       // Read JSONL and filter to current turn
       let allEntries: SessionEntry[] = [];
       let turnEntries: SessionEntry[] = [];
@@ -876,11 +855,25 @@ export function createLangfuseService(
 
       // Fallback: if JSONL unavailable, build entries from event.messages
       if (turnEntries.length === 0 && Array.isArray(event.messages)) {
+        serviceLogger?.warn?.(
+          `Langfuse: JSONL unavailable for agent=${agentId} session=${sessionId}, using event.messages fallback`,
+        );
         const now = Date.now();
-        turnEntries = (event.messages as Record<string, unknown>[]).map((msg, i) => ({
-          timestamp: now - (event.messages.length - i) * 1000,
+        const fallbackEntries = (event.messages as Record<string, unknown>[]).map((msg, i) => ({
+          timestamp:
+            typeof msg.timestamp === "number"
+              ? msg.timestamp
+              : now - (event.messages.length - i) * 1000,
           message: msg,
         }));
+        // Apply turn filtering to fallback entries too — event.messages may contain
+        // messages from previous turns in the same session.
+        turnEntries = filterCurrentTurnEntries(fallbackEntries);
+        if (turnEntries.length === 0) {
+          turnEntries = fallbackEntries;
+        }
+        // Also set allEntries for generation input building
+        allEntries = turnEntries;
       }
 
       // Create a generation for each assistant message in the turn
@@ -914,8 +907,16 @@ export function createLangfuseService(
           // Build generation input matching LLM API structure: {model, messages}
           // Use ALL session entries up to this assistant message as input
           // (includes full history + current user message + any prior tool results)
-          const systemMessage = entry.systemPrompt
-            ? [{ role: "system", content: entry.systemPrompt }]
+          // Merge Langfuse prompt injection into system prompt
+          let fullSystemPrompt = entry.systemPrompt ?? "";
+          if (entry.promptInjection?.prepend) {
+            fullSystemPrompt = `${entry.promptInjection.prepend}\n\n${fullSystemPrompt}`;
+          }
+          if (entry.promptInjection?.append) {
+            fullSystemPrompt = `${fullSystemPrompt}\n\n${entry.promptInjection.append}`;
+          }
+          const systemMessage = fullSystemPrompt
+            ? [{ role: "system", content: fullSystemPrompt }]
             : [];
           const allPriorEntries = allEntries.slice(0, allEntries.indexOf(te));
           const accumulatedMessages = allPriorEntries.map((e) => buildApiMessage(e.message));
@@ -971,12 +972,12 @@ export function createLangfuseService(
             input: truncatePayload(genInput),
             output: truncatePayload(output),
             usageDetails: genUsage as Record<string, number> | undefined,
-            ...(msgUsage?.cost
+            ...(msgUsage?.cost && typeof msgUsage.cost === "object"
               ? {
                   costDetails: {
-                    input: msgUsage.cost.input ?? 0,
-                    output: msgUsage.cost.output ?? 0,
-                    total: msgUsage.cost.total ?? 0,
+                    input: (msgUsage.cost as Record<string, number>).input ?? 0,
+                    output: (msgUsage.cost as Record<string, number>).output ?? 0,
+                    total: (msgUsage.cost as Record<string, number>).total ?? 0,
                   },
                 }
               : {}),
@@ -1062,6 +1063,109 @@ export function createLangfuseService(
           : {}),
       });
 
+      // Complete tool spans from JSONL data.
+      // The after_tool_call hook may not fire reliably (ctx.agentId can be undefined,
+      // or the hook may not be dispatched to this plugin). Use JSONL toolResult entries
+      // to end pending spans or create+end spans that were never started.
+      if (turnEntries.length > 0) {
+        // Build a map of toolCallId → { callTimestamp, resultTimestamp, toolName, result, error }
+        const toolMap = new Map<
+          string,
+          {
+            callTs?: number;
+            resultTs?: number;
+            toolName?: string;
+            input?: unknown;
+            result?: unknown;
+            error?: string;
+          }
+        >();
+        for (const te of turnEntries) {
+          const msg = te.message;
+          // Assistant messages may contain toolCall content blocks
+          if (msg.role === "assistant" && Array.isArray(msg.content)) {
+            for (const block of msg.content as Record<string, unknown>[]) {
+              if (block?.type === "toolCall" && block.id) {
+                const id = String(block.id);
+                const existing = toolMap.get(id) ?? {};
+                existing.callTs = te.timestamp;
+                existing.toolName = String(block.name ?? "unknown");
+                existing.input = block.input ?? block.args ?? block.arguments;
+                toolMap.set(id, existing);
+              }
+            }
+          }
+          // ToolResult messages
+          if (msg.role === "toolResult" && msg.toolCallId) {
+            const id = String(msg.toolCallId);
+            const existing = toolMap.get(id) ?? {};
+            // Use inner msg.timestamp for tool completion time (more accurate than
+            // outer JSONL entry timestamp which may be delayed by batch writes).
+            existing.resultTs = typeof msg.timestamp === "number" ? msg.timestamp : te.timestamp;
+            existing.toolName = existing.toolName ?? String(msg.toolName ?? "unknown");
+            existing.result = msg.content;
+            if (msg.isError) {
+              existing.error = extractTextContent(msg.content);
+            }
+            toolMap.set(id, existing);
+          }
+        }
+
+        serviceLogger?.debug?.(
+          `Langfuse: agentEnd toolMap has ${toolMap.size} tool calls, pendingSpans=${entry.pendingSpans.size}`,
+        );
+        for (const [toolCallId, info] of toolMap) {
+          entry.toolCallCount += 1;
+          const pendingSpan = entry.pendingSpans.get(toolCallId);
+          if (pendingSpan) {
+            // Update existing pending span with output and endTime from JSONL.
+            // NOTE: span.end() Omits endTime (SDK auto-sets to now), so we use
+            // update() to set the correct endTime, then end() to mark completion.
+            const durationMs =
+              info.callTs && info.resultTs ? info.resultTs - info.callTs : undefined;
+            pendingSpan.update({
+              endTime: info.resultTs ? new Date(info.resultTs) : undefined,
+              output: info.error
+                ? { error: info.error }
+                : redactObject(truncatePayload(info.result), redactEnabled),
+              statusMessage: info.error,
+              level: info.error ? "ERROR" : "DEFAULT",
+              metadata: durationMs != null ? { durationMs } : {},
+            });
+            entry.pendingSpans.delete(toolCallId);
+            serviceLogger?.debug?.(
+              `Langfuse: ended pending tool span ${info.toolName} (${toolCallId}) durationMs=${durationMs}`,
+            );
+          } else if (info.callTs && info.resultTs) {
+            // No pending span — create span with all data including endTime.
+            // NOTE: span.end() Omits endTime (SDK auto-sets to now), so we set
+            // endTime on creation via trace.span() which accepts it.
+            const durationMs = info.resultTs - info.callTs;
+            serviceLogger?.debug?.(
+              `Langfuse: creating tool span ${info.toolName} (${toolCallId}) callTs=${info.callTs} resultTs=${info.resultTs} durationMs=${durationMs}`,
+            );
+            entry.trace.span({
+              name: `tool:${info.toolName ?? "unknown"}`,
+              startTime: new Date(info.callTs),
+              endTime: new Date(info.resultTs),
+              input: info.input
+                ? redactObject(truncatePayload(info.input), redactEnabled)
+                : undefined,
+              output: info.error
+                ? { error: info.error }
+                : redactObject(truncatePayload(info.result), redactEnabled),
+              statusMessage: info.error,
+              level: info.error ? "ERROR" : "DEFAULT",
+              metadata: { durationMs },
+            });
+          } else {
+            serviceLogger?.warn?.(
+              `Langfuse: tool span ${info.toolName} (${toolCallId}) missing timestamps — callTs=${info.callTs} resultTs=${info.resultTs}`,
+            );
+          }
+        }
+      }
+
       // Mark as finalized instead of deleting — diagnostic events may still arrive
       // but should not overwrite our clean metadata structure.
       entry.finalized = true;
@@ -1083,6 +1187,7 @@ export function createLangfuseService(
 
     async start(ctx: OpenClawPluginServiceContext): Promise<void> {
       serviceLogger = ctx.logger;
+      serviceStateDir = ctx.stateDir ?? null;
       const { publicKey, secretKey, baseUrl } = resolveCredentials(config);
 
       if (!publicKey || !secretKey) {
@@ -1096,7 +1201,7 @@ export function createLangfuseService(
 
       // Check for missing model cost config that causes zero usage data
       try {
-        const costIssues = checkModelCostConfig();
+        const costIssues = checkModelCostConfig(serviceStateDir ?? undefined);
         if (costIssues.length > 0) {
           ctx.logger.warn(formatCostWarning(costIssues));
         }
@@ -1105,8 +1210,13 @@ export function createLangfuseService(
       }
 
       langfuse = new Langfuse({ publicKey, secretKey, baseUrl });
-      contextMap = new TraceContextMap();
-      contextMap.startSweep();
+      // Preserve existing contextMap if it has active (non-finalized) entries.
+      // The plugin may be re-registered mid-run (e.g., openmai reloads config);
+      // recreating contextMap would lose the in-flight trace entry.
+      if (!contextMap || contextMap.size === 0) {
+        contextMap = new TraceContextMap();
+        contextMap.startSweep();
+      }
       disabled = false;
       promptManager = config.prompts?.length ? new PromptManager(langfuse, config) : null;
       // Pre-warm prompt cache so resolveSync() works on the first message
@@ -1206,6 +1316,15 @@ export function createLangfuseService(
               }
             }
 
+            // If agent_end already finalized this entry (created generations from JSONL),
+            // skip entirely to avoid duplicate spans/generations.
+            if (entry.finalized) {
+              serviceLogger?.info?.(
+                `Langfuse: skipping diagnostic handler — agent_end already finalized (agent=${agentId})`,
+              );
+              return;
+            }
+
             // Read session JSONL and filter to current turn only.
             // The JSONL contains the full session history across turns;
             // we only want messages from the latest user message onward.
@@ -1223,15 +1342,6 @@ export function createLangfuseService(
             const durationMs = typeof diagEvt.durationMs === "number" ? diagEvt.durationMs : 0;
             const endTime = new Date();
             const startTime = new Date(endTime.getTime() - durationMs);
-
-            // If agent_end already finalized this entry (created generations from JSONL),
-            // skip generation creation to avoid duplicates.
-            if (entry.finalized) {
-              serviceLogger?.info?.(
-                `Langfuse: skipping diagnostic generation — agent_end already finalized (agent=${agentId})`,
-              );
-              return;
-            }
 
             // If llm_input hook already created a generation, just update it with usage/output
             // Otherwise create a new generation from diagnostic event data

@@ -15,7 +15,8 @@ export type TraceContextEntry = {
   llmCallCount: number;
   toolCallCount: number;
   promptMatch?: PromptMatchInfo;
-  systemPrompt?: string; // captured from before_prompt_build
+  systemPrompt?: string; // captured from before_prompt_build / llm_input
+  promptInjection?: { prepend?: string; append?: string }; // from Langfuse prompt injection
   promptClient?: unknown; // fetched Langfuse prompt client for generation linking
   pendingGenerations: Map<string, LangfuseGenerationClient>; // keyed by runId
   pendingSpans: Map<string, LangfuseSpanClient>; // keyed by toolCallId
@@ -96,5 +97,26 @@ export class TraceContextMap {
 
   get size(): number {
     return this.map.size;
+  }
+
+  /** Find entry that has a pending span for the given toolCallId. */
+  findByPendingSpan(toolCallId: string): TraceContextEntry | undefined {
+    for (const entry of this.map.values()) {
+      if (entry.pendingSpans.has(toolCallId)) {
+        return entry;
+      }
+    }
+    return undefined;
+  }
+
+  /** Find the most recent non-finalized entry (fallback when ctx.agentId is missing). */
+  findActive(): TraceContextEntry | undefined {
+    let best: TraceContextEntry | undefined;
+    for (const entry of this.map.values()) {
+      if (!entry.finalized && (!best || entry.createdAt > best.createdAt)) {
+        best = entry;
+      }
+    }
+    return best;
   }
 }

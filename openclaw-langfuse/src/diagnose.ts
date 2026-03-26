@@ -1,5 +1,4 @@
 import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 
 type ModelEntry = {
@@ -30,8 +29,12 @@ const DEFAULT_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
  * Check all custom providers in openclaw.json for models missing `cost` config.
  * Missing cost causes pi-ai's calculateCost() to crash, resulting in zero usage data.
  */
-export function checkModelCostConfig(): ModelCostIssue[] {
-  const configPath = join(homedir(), ".openclaw", "openclaw.json");
+export function checkModelCostConfig(stateDir?: string): ModelCostIssue[] {
+  if (!stateDir) {
+    return [];
+  }
+  const effectiveStateDir = stateDir;
+  const configPath = join(effectiveStateDir, "openclaw.json");
 
   let config: Record<string, unknown>;
   try {
