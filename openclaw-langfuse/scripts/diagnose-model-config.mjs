@@ -35,6 +35,9 @@ if (!providers) {
 
 const costIssues = [];
 const usageIssues = [];
+const cacheRetentionIssues = [];
+
+const modelOverrides = config?.agents?.defaults?.models ?? {};
 
 for (const [providerName, providerConfig] of Object.entries(providers)) {
   if (!providerConfig?.models || !Array.isArray(providerConfig.models)) {
@@ -42,6 +45,9 @@ for (const [providerName, providerConfig] of Object.entries(providers)) {
   }
   // Only openai-completions providers need supportsUsageInStreaming
   const isOpenAICompat = providerConfig.api === "openai-completions";
+  // Custom anthropic-messages providers need explicit cacheRetention
+  const isCustomAnthropic =
+    providerConfig.api === "anthropic-messages" && providerName !== "anthropic";
 
   for (let idx = 0; idx < providerConfig.models.length; idx++) {
     const model = providerConfig.models[idx];
@@ -54,11 +60,25 @@ for (const [providerName, providerConfig] of Object.entries(providers)) {
     if (isOpenAICompat && model.compat?.supportsUsageInStreaming !== true) {
       usageIssues.push({ provider: providerName, modelId: model.id, modelName: model.name, idx });
     }
+    if (isCustomAnthropic) {
+      const modelKey = `${providerName}/${model.id}`;
+      const params = modelOverrides[modelKey]?.params;
+      if (!params?.cacheRetention) {
+        cacheRetentionIssues.push({
+          provider: providerName,
+          modelId: model.id,
+          modelName: model.name,
+          modelKey,
+        });
+      }
+    }
   }
 }
 
-if (costIssues.length === 0 && usageIssues.length === 0) {
-  console.log("✅ All custom models have cost and usage streaming configuration. No issues found.");
+if (costIssues.length === 0 && usageIssues.length === 0 && cacheRetentionIssues.length === 0) {
+  console.log(
+    "✅ All custom models have cost, usage streaming, and cache retention configuration. No issues found.",
+  );
   process.exit(0);
 }
 
@@ -90,6 +110,26 @@ if (usageIssues.length > 0) {
     console.log(`# ${issue.provider}: ${label}`);
     console.log(
       `openclaw config set models.providers.${issue.provider}.models.${issue.idx}.compat '{"supportsUsageInStreaming":true}'\n`,
+    );
+  }
+}
+
+if (cacheRetentionIssues.length > 0) {
+  console.log(
+    `⚠️  Found ${cacheRetentionIssues.length} anthropic-messages model(s) missing cacheRetention config.`,
+  );
+  console.log(
+    `Without explicit cacheRetention, prompt cache will only create entries but never read them,`,
+  );
+  console.log(
+    `resulting in wasted tokens on every LLM call (only cache_creation, no cache_read).\n`,
+  );
+  console.log(`Run the following commands to enable prompt caching:\n`);
+  for (const issue of cacheRetentionIssues) {
+    const label = issue.modelName ? `${issue.modelId} (${issue.modelName})` : issue.modelId;
+    console.log(`# ${issue.provider}: ${label}`);
+    console.log(
+      `openclaw config set agents.defaults.models.${issue.modelKey}.params.cacheRetention '"short"'\n`,
     );
   }
 }

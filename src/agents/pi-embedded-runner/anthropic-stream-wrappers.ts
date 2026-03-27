@@ -183,18 +183,20 @@ export function resolveCacheRetention(
   extraParams: Record<string, unknown> | undefined,
   provider: string,
 ): CacheRetention | undefined {
+  // Explicit cacheRetention in extraParams is always honoured, regardless of
+  // provider name. This allows custom providers using anthropic-messages API
+  // (e.g. third-party proxies) to opt into prompt caching.
+  const newVal = extraParams?.cacheRetention;
+  if (newVal === "none" || newVal === "short" || newVal === "long") {
+    return newVal;
+  }
+
   const isAnthropicDirect = provider === "anthropic";
-  const hasBedrockOverride =
-    extraParams?.cacheRetention !== undefined || extraParams?.cacheControlTtl !== undefined;
+  const hasBedrockOverride = extraParams?.cacheControlTtl !== undefined;
   const isAnthropicBedrock = provider === "amazon-bedrock" && hasBedrockOverride;
 
   if (!isAnthropicDirect && !isAnthropicBedrock) {
     return undefined;
-  }
-
-  const newVal = extraParams?.cacheRetention;
-  if (newVal === "none" || newVal === "short" || newVal === "long") {
-    return newVal;
   }
 
   const legacy = extraParams?.cacheControlTtl;
