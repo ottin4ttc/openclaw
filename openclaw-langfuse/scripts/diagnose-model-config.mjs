@@ -7,7 +7,7 @@
  * 2. Missing `compat.supportsUsageInStreaming: true` — prevents streaming
  *    usage data (token counts) from being returned by the provider
  *
- * Usage: npm run diagnose
+ * Usage: npm run diagnose [-- /path/to/openclaw.json]
  */
 
 import { readFileSync } from "node:fs";
@@ -16,7 +16,7 @@ import { join } from "node:path";
 
 const DEFAULT_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 
-const configPath = join(homedir(), ".openclaw", "openclaw.json");
+const configPath = process.argv[2] || join(homedir(), ".openclaw", "openclaw.json");
 
 let config;
 try {
