@@ -20,7 +20,54 @@ const configPath = join(homedir(), ".openclaw", "openclaw.json");
 
 let config;
 try {
-  config = JSON.parse(readFileSync(configPath, "utf-8"));
+  const raw = readFileSync(configPath, "utf-8");
+  config = JSON.parse(raw);
+
+  // Detect duplicate provider keys (JSON silently drops earlier duplicates)
+  const providerMatch = raw.match(/"providers"\s*:\s*\{/);
+  if (providerMatch) {
+    const providerNames = [];
+    const duplicates = new Set();
+    // Simple regex scan for top-level provider keys inside "providers": { ... }
+    const providerSection = raw.slice(providerMatch.index);
+    let depth = 0;
+    // Walk through the providers section to find duplicate keys
+    for (const line of providerSection.split("\n")) {
+      const trimmed = line.trim();
+      if (depth === 1) {
+        const keyMatch = trimmed.match(/^"(\w[\w-]*)"\s*:/);
+        if (keyMatch) {
+          const name = keyMatch[1];
+          if (providerNames.includes(name)) {
+            duplicates.add(name);
+          }
+          providerNames.push(name);
+        }
+      }
+      for (const ch of trimmed) {
+        if (ch === "{") {
+          depth++;
+        }
+        if (ch === "}") {
+          depth--;
+        }
+      }
+      if (depth <= 0 && providerNames.length > 0) {
+        break;
+      }
+    }
+    if (duplicates.size > 0) {
+      console.log(
+        `🚨 Duplicate provider key(s) detected: ${[...duplicates].map((d) => `"${String(d)}"`).join(", ")}`,
+      );
+      console.log(
+        `JSON silently discards earlier entries with the same key — only the LAST definition is used.`,
+      );
+      console.log(
+        `Fix: rename duplicates (e.g. "dmxapi" → "dmxapi-anthropic" for the anthropic-messages variant).\n`,
+      );
+    }
+  }
 } catch (err) {
   console.error(`Failed to read ${configPath}: ${err.message}`);
   process.exit(1);
