@@ -1,0 +1,161 @@
+# SearXNG 配置 - 针对中国大陆服务器优化
+# 文档: https://docs.searxng.org/admin/settings/
+
+use_default_settings: true
+
+general:
+  debug: false
+  instance_name: "私有搜索"
+  privacypolicy_url: false
+  donation_url: false
+  contact_url: false
+  enable_metrics: false
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  default_lang: "zh-CN"
+  ban_time_on_fail: 5
+  max_ban_time_on_fail: 120
+  # ⚠️  重要：必须保留 json 格式，否则 OpenClaw web_search 工具将报错：
+  #    "SearXNG returned non-JSON response ... Enable JSON output by adding
+  #     'json' under search.formats in your SearXNG settings.yml."
+  # 删除 json 行 = OpenClaw 搜索完全不可用。
+  formats:
+    - html
+    - json
+
+server:
+  # 内网部署不需要 secret_key 随机性极高，但必须设置
+  secret_key: "请替换为随机字符串，例如运行: openssl rand -hex 32"
+  limiter: false       # 内网私有部署关闭限流
+  image_proxy: false
+  port: 8080
+  bind_address: "0.0.0.0"
+  public_instance: false
+
+# 允许 OpenClaw 从其他地址调用 JSON API
+outgoing:
+  request_timeout: 10.0
+  max_request_timeout: 30.0
+  pool_connections: 100
+  pool_maxsize: 20
+  # 如果服务器本身需要代理才能访问 Bing 等，取消下面的注释
+  # proxies:
+  #   all://:
+  #     - socks5://your-proxy:1080
+
+ui:
+  static_use_hash: true
+  default_locale: ""
+  theme_args:
+    simple_style: auto
+
+# 引擎配置：优先国内可用引擎，禁用被墙引擎
+engines:
+  # ========== 国内可用引擎 ==========
+  - name: baidu
+    engine: baidu
+    shortcut: bd
+    categories: general
+    disabled: false
+
+  - name: bing
+    engine: bing
+    shortcut: bi
+    categories: general, news
+    disabled: false
+
+  - name: 360search
+    engine: "360search"
+    shortcut: "360"
+    categories: general
+    disabled: false
+
+  - name: sogou
+    engine: sogou
+    shortcut: so
+    categories: general
+    disabled: false
+
+  # ========== 技术类（国内可访问）==========
+  - name: github
+    engine: github
+    shortcut: gh
+    disabled: false
+
+  - name: stackoverflow
+    engine: stackexchange
+    api_site: stackoverflow
+    shortcut: st
+    disabled: false
+
+  - name: pypi
+    engine: pypi
+    shortcut: pypi
+    disabled: false
+
+  # ========== 中国大陆不可用引擎 - 全部禁用 ==========
+  - name: wikipedia
+    engine: wikipedia
+    shortcut: wp
+    disabled: true
+
+  - name: startpage
+    engine: startpage
+    shortcut: sp
+    disabled: true
+
+  - name: wikidata
+    engine: wikidata
+    shortcut: wd
+    disabled: true
+  - name: google
+    engine: google
+    shortcut: g
+    disabled: true
+
+  - name: google news
+    engine: google_news
+    shortcut: gn
+    disabled: true
+
+  - name: google images
+    engine: google_images
+    shortcut: gimg
+    disabled: true
+
+  - name: google videos
+    engine: google_videos
+    shortcut: gv
+    disabled: true
+
+  - name: google scholar
+    engine: google_scholar
+    shortcut: gsc
+    disabled: true
+
+  - name: duckduckgo
+    engine: duckduckgo
+    shortcut: ddg
+    disabled: true
+
+  - name: duckduckgo images
+    engine: duckduckgo_images
+    shortcut: ddi
+    disabled: true
+
+  - name: brave
+    engine: brave
+    shortcut: br
+    disabled: true
+
+  - name: youtube
+    engine: youtube_noapi
+    shortcut: yt
+    disabled: true
+
+  - name: twitter
+    engine: twitter
+    shortcut: tw
+    disabled: true

@@ -4,12 +4,20 @@ function isOpenAiCompletionsModel(model: Model<Api>): model is Model<"openai-com
   return model.api === "openai-completions";
 }
 
-function isDashScopeCompatibleEndpoint(baseUrl: string): boolean {
-  return (
-    baseUrl.includes("dashscope.aliyuncs.com") ||
-    baseUrl.includes("dashscope-intl.aliyuncs.com") ||
-    baseUrl.includes("dashscope-us.aliyuncs.com")
-  );
+/**
+ * Returns true only for endpoints that are confirmed to be native OpenAI
+ * infrastructure and therefore accept the `developer` message role.
+ * Azure OpenAI uses the Chat Completions API and does NOT accept `developer`.
+ * All other openai-completions backends (proxies, Qwen, GLM, DeepSeek, etc.)
+ * only support the standard `system` role.
+ */
+function isOpenAINativeEndpoint(baseUrl: string): boolean {
+  try {
+    const host = new URL(baseUrl).hostname.toLowerCase();
+    return host === "api.openai.com";
+  } catch {
+    return false;
+  }
 }
 
 function isAnthropicMessagesModel(model: Model<Api>): model is Model<"anthropic-messages"> {
@@ -40,24 +48,34 @@ export function normalizeModelCompat(model: Model<Api>): Model<Api> {
     }
   }
 
-  const isZai = model.provider === "zai" || baseUrl.includes("api.z.ai");
-  const isMoonshot =
-    model.provider === "moonshot" ||
-    baseUrl.includes("moonshot.ai") ||
-    baseUrl.includes("moonshot.cn");
-  const isDashScope = model.provider === "dashscope" || isDashScopeCompatibleEndpoint(baseUrl);
-  if ((!isZai && !isMoonshot && !isDashScope) || !isOpenAiCompletionsModel(model)) {
+  if (!isOpenAiCompletionsModel(model)) {
     return model;
   }
 
-  const openaiModel = model;
-  const compat = openaiModel.compat ?? undefined;
-  if (compat?.supportsDeveloperRole === false) {
+  // The `developer` role and stream usage chunks are OpenAI-native behaviors.
+  // Many OpenAI-compatible backends reject `developer` and/or may not support
+  // stream_options. For non-native openai-completions endpoints:
+  // - supportsDeveloperRole: always forced off (most backends reject it)
+  // - supportsUsageInStreaming: defaults to false, but respects explicit user
+  //   config (true) so users can opt in per provider via compat settings
+  const compat = model.compat ?? undefined;
+  // When baseUrl is empty the pi-ai library defaults to api.openai.com, so
+  // leave compat unchanged and let default native behavior apply.
+  const needsForce = baseUrl ? !isOpenAINativeEndpoint(baseUrl) : false;
+  if (!needsForce) {
+    return model;
+  }
+  if (compat?.supportsDeveloperRole === false && compat?.supportsUsageInStreaming !== undefined) {
     return model;
   }
 
-  openaiModel.compat = compat
-    ? { ...compat, supportsDeveloperRole: false }
-    : { supportsDeveloperRole: false };
-  return openaiModel;
+  // Return a new object — do not mutate the caller's model reference.
+  // Respect explicit supportsUsageInStreaming from user config; default to false.
+  const usageInStreaming = compat?.supportsUsageInStreaming ?? false;
+  return {
+    ...model,
+    compat: compat
+      ? { ...compat, supportsDeveloperRole: false, supportsUsageInStreaming: usageInStreaming }
+      : { supportsDeveloperRole: false, supportsUsageInStreaming: usageInStreaming },
+  } as typeof model;
 }

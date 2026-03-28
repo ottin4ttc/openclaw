@@ -1,0 +1,18 @@
+{
+  "name": "openclaw-langfuse",
+  "version": "1.0.0",
+  "description": "Langfuse tracing and prompt management for OpenClaw",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "diagnose": "node scripts/diagnose-model-config.mjs"
+  },
+  "dependencies": {
+    "langfuse": "latest"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}
