@@ -1,7 +1,4 @@
 /* eslint-disable @typescript-eslint/no-base-to-string, @typescript-eslint/restrict-template-expressions, @typescript-eslint/no-redundant-type-constituents */
-import { createHash } from "node:crypto";
-import fs from "node:fs";
-import path from "node:path";
 import Langfuse from "langfuse";
 import type {
   OpenClawPluginService,
@@ -12,528 +9,43 @@ import { resolveCredentials } from "./config.js";
 import type { LangfusePluginConfig } from "./config.js";
 import { checkModelCostConfig, formatCostWarning } from "./diagnose.js";
 import { findMatchingRule } from "./matcher.js";
+import { buildObservationsFromEntries, createToolSpansFromMessages } from "./observations.js";
 import { PromptManager } from "./prompt-manager.js";
-import { redactText, redactObject } from "./redact.js";
+import { scanIncompleteTraces, recoverTrace } from "./recovery.js";
+import { redactObject, redactText } from "./redact.js";
+import { readSessionMessages, writeTraceMarker } from "./session.js";
 import { TraceContextMap } from "./trace-context.js";
 import type { TraceContextEntry } from "./trace-context.js";
+import type {
+  AgentCtx,
+  ToolCtx,
+  SessionCtx,
+  BeforePromptBuildEvent,
+  BeforePromptBuildResult,
+  BeforeAgentStartEvent,
+  BeforeAgentStartResult,
+  LlmInputEvent,
+  LlmOutputEvent,
+  AgentEndEvent,
+  BeforeToolCallEvent,
+  AfterToolCallEvent,
+  SessionEndEvent,
+  SessionEntry,
+} from "./types.js";
+import {
+  generateTraceId,
+  generateObservationId,
+  qualifiedModel,
+  extractTextContent,
+  extractConversation,
+  extractLLMTurns,
+  extractUserMessageText,
+  filterCurrentTurnEntries,
+  filterCurrentTurnMessages,
+} from "./utils.js";
 
-const MAX_PAYLOAD_BYTES = 100 * 1024; // 100KB
-
-// ---------------------------------------------------------------------------
-// Local hook event/context type definitions (subset of what we use).
-// These mirror the canonical types in src/plugins/types.ts but are defined
-// locally because they are not re-exported from openclaw/plugin-sdk.
-// ---------------------------------------------------------------------------
-
-type AgentCtx = {
-  agentId?: string;
-  sessionKey?: string;
-  sessionId?: string;
-  channelId?: string;
-  trigger?: string;
-};
-
-type ToolCtx = {
-  agentId?: string;
-  sessionKey?: string;
-  sessionId?: string;
-  toolName: string;
-  toolCallId?: string;
-};
-
-type SessionCtx = {
-  agentId?: string;
-  sessionId: string;
-  sessionKey?: string;
-};
-
-type BeforePromptBuildEvent = {
-  prompt: string;
-  messages: unknown[];
-};
-
-type BeforePromptBuildResult = {
-  systemPrompt?: string;
-  prependContext?: string;
-  prependSystemContext?: string;
-  appendSystemContext?: string;
-};
-
-type BeforeAgentStartEvent = {
-  prompt: string;
-  messages?: unknown[];
-};
-
-type BeforeAgentStartResult = BeforePromptBuildResult & {
-  modelOverride?: string;
-  providerOverride?: string;
-};
-
-type LlmInputEvent = {
-  runId: string;
-  sessionId: string;
-  provider: string;
-  model: string;
-  systemPrompt?: string;
-  prompt: string;
-  historyMessages: unknown[];
-  imagesCount: number;
-};
-
-type LlmOutputEvent = {
-  runId: string;
-  sessionId: string;
-  provider: string;
-  model: string;
-  assistantTexts: string[];
-  lastAssistant?: unknown;
-  usage?: {
-    input?: number;
-    output?: number;
-    cacheRead?: number;
-    cacheWrite?: number;
-    total?: number;
-  };
-};
-
-type AgentEndEvent = {
-  messages: unknown[];
-  success: boolean;
-  error?: string;
-  durationMs?: number;
-};
-
-type BeforeToolCallEvent = {
-  toolName: string;
-  params: Record<string, unknown>;
-  runId?: string;
-  toolCallId?: string;
-};
-
-type AfterToolCallEvent = {
-  toolName: string;
-  params: Record<string, unknown>;
-  runId?: string;
-  toolCallId?: string;
-  result?: unknown;
-  error?: string;
-  durationMs?: number;
-};
-
-type SessionEndEvent = {
-  sessionId: string;
-  sessionKey?: string;
-  messageCount: number;
-  durationMs?: number;
-};
-
-// ---------------------------------------------------------------------------
-
-/**
- * Generate a deterministic trace ID from session key and timestamp.
- * Exported so external callers can compute the same ID.
- */
-export function generateTraceId(sessionKey: string, timestamp: number): string {
-  return createHash("sha256").update(`${sessionKey}:${timestamp}`).digest("hex").slice(0, 32);
-}
-
-/**
- * Truncate a payload to MAX_PAYLOAD_BYTES. Returns original object if small
- * enough, otherwise a truncated string with a size notice.
- */
-function truncatePayload(obj: unknown): unknown {
-  if (obj === undefined || obj === null) {
-    return obj;
-  }
-  const serialized = JSON.stringify(obj);
-  if (!serialized || serialized.length <= MAX_PAYLOAD_BYTES) {
-    return obj;
-  }
-  const originalKb = Math.round(serialized.length / 1024);
-  return serialized.slice(0, MAX_PAYLOAD_BYTES) + `\n[truncated: original size ${originalKb}kb]`;
-}
-
-// ---------------------------------------------------------------------------
-// Session JSONL reading helpers (for gateway mode content extraction)
-// ---------------------------------------------------------------------------
-
-type SessionEntry = { timestamp: number; message: Record<string, unknown> };
-
-/**
- * Read messages from a session JSONL file on disk.
- * Returns entries with timestamps so callers can derive accurate startTime/endTime.
- */
-function readSessionMessages(agentId: string, sessionId: string): SessionEntry[] {
-  if (!serviceStateDir) {
-    serviceLogger?.warn?.(`Langfuse: no stateDir available, cannot locate session JSONL`);
-    return [];
-  }
-  const sessionFile = path.join(
-    serviceStateDir,
-    "agents",
-    agentId,
-    "sessions",
-    `${sessionId}.jsonl`,
-  );
-  if (!fs.existsSync(sessionFile)) {
-    serviceLogger?.warn?.(`Langfuse: session JSONL not found: ${sessionFile}`);
-    return [];
-  }
-
-  let raw: string;
-  try {
-    raw = fs.readFileSync(sessionFile, "utf-8");
-  } catch (err) {
-    serviceLogger?.warn?.(`Langfuse: failed to read session JSONL: ${sessionFile} — ${err}`);
-    return [];
-  }
-
-  const lines = raw.split(/\r?\n/);
-  const entries: SessionEntry[] = [];
-  for (const line of lines) {
-    if (!line.trim()) {
-      continue;
-    }
-    try {
-      const parsed = JSON.parse(line);
-      if (parsed?.message) {
-        const msg = parsed.message as Record<string, unknown>;
-        // Derive timestamp: prefer outer entry timestamp (when JSONL line was written,
-        // i.e. message completion time) over inner message.timestamp (which for assistant
-        // messages is the LLM call initiation time, not completion time).
-        let ts: number;
-        if (typeof parsed.timestamp === "string") {
-          ts = Date.parse(parsed.timestamp);
-        } else if (typeof parsed.timestamp === "number") {
-          ts = parsed.timestamp;
-        } else if (typeof msg.timestamp === "number") {
-          ts = msg.timestamp;
-        } else {
-          ts = Date.now();
-        }
-        entries.push({ timestamp: ts, message: msg });
-      }
-    } catch {
-      /* ignore malformed lines */
-    }
-  }
-  return entries;
-}
-
-/**
- * Extract text content from a message content field.
- * Handles both plain string content and content-block arrays.
- */
-function extractTextContent(content: unknown): string {
-  if (typeof content === "string") {
-    return content;
-  }
-  if (Array.isArray(content)) {
-    return content
-      .filter(
-        (b): b is Record<string, unknown> =>
-          b !== null && typeof b === "object" && (b as Record<string, unknown>).type === "text",
-      )
-      .map((b) => String(b.text ?? ""))
-      .join("\n");
-  }
-  return "";
-}
-
-/**
- * Extract the full conversation as structured input and the last assistant response as output.
- * Input includes all messages as a structured array for full context visibility.
- * Output is the last assistant text response.
- */
-function extractConversation(messages: unknown[]): {
-  input: unknown[];
-  output: string;
-  lastUserText: string;
-} {
-  let lastAssistantText = "";
-  let lastUserText = "";
-
-  // Find last assistant output and last user input
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i] as Record<string, unknown>;
-    if (msg.role === "assistant" && !lastAssistantText) {
-      lastAssistantText = extractTextContent(msg.content);
-    }
-    if (msg.role === "user" && !lastUserText) {
-      lastUserText = extractTextContent(msg.content);
-      break;
-    }
-  }
-
-  // Build structured input: summarize each message with role + content preview
-  const input = messages.map((msg) => {
-    const m = msg as Record<string, unknown>;
-    const role = String(m.role ?? "unknown");
-    const text = extractTextContent(m.content);
-    // For toolResult, include toolName
-    if (role === "toolResult") {
-      return {
-        role,
-        toolName: m.toolName ?? m.toolCallId,
-        content: text.length > 2000 ? text.slice(0, 2000) + "...[truncated]" : text,
-      };
-    }
-    // For assistant with toolCall, show tool calls
-    if (role === "assistant" && Array.isArray(m.content)) {
-      const toolCalls = (m.content as Record<string, unknown>[])
-        .filter((b) => b?.type === "toolCall")
-        .map((b) => ({ name: b.name, id: b.id }));
-      if (toolCalls.length > 0) {
-        return { role, toolCalls, text: text.length > 500 ? text.slice(0, 500) + "..." : text };
-      }
-    }
-    return {
-      role,
-      content: text.length > 2000 ? text.slice(0, 2000) + "...[truncated]" : text,
-    };
-  });
-
-  return { input, output: lastAssistantText, lastUserText };
-}
-
-/**
- * Build an API-shaped message object from a session entry message.
- * Preserves structure: assistant with tool calls, toolResult -> tool role, etc.
- * Matches the actual LLM API request format (see langfuse_api_reference.md).
- */
-function buildApiMessage(msg: SessionEntry["message"]): unknown {
-  const role = msg.role;
-
-  if (role === "assistant") {
-    const textContent = extractTextContent(msg.content);
-    if (Array.isArray(msg.content)) {
-      const toolCalls = (msg.content as Record<string, unknown>[])
-        .filter((b) => b?.type === "toolCall")
-        .map((b) => ({
-          id: b.id,
-          type: "function",
-          function: {
-            name: b.name,
-            arguments: JSON.stringify(b.input ?? b.args ?? b.arguments ?? {}),
-          },
-        }));
-      if (toolCalls.length > 0) {
-        return { role: "assistant", content: textContent || null, tool_calls: toolCalls };
-      }
-    }
-    return { role: "assistant", content: textContent };
-  }
-
-  if (role === "toolResult") {
-    return {
-      role: "tool",
-      tool_call_id: msg.toolCallId ?? msg.toolName ?? "unknown",
-      content: extractTextContent(msg.content),
-    };
-  }
-
-  // user, system, etc.
-  return { role, content: extractTextContent(msg.content) };
-}
-
-/**
- * Extract individual LLM turns from session messages.
- * Each assistant message = one LLM call. Input is the preceding user/toolResult messages.
- */
-function extractLLMTurns(messages: unknown[]): Array<{
-  inputMessages: unknown[];
-  assistantMessage: Record<string, unknown>;
-  assistantText: string;
-  toolCalls: Array<{ name: string; id: string; input: unknown }>;
-}> {
-  const turns: Array<{
-    inputMessages: unknown[];
-    assistantMessage: Record<string, unknown>;
-    assistantText: string;
-    toolCalls: Array<{ name: string; id: string; input: unknown }>;
-  }> = [];
-  let currentInput: unknown[] = [];
-
-  for (const msg of messages) {
-    const m = msg as Record<string, unknown>;
-    if (m.role === "assistant") {
-      const toolCalls: Array<{ name: string; id: string; input: unknown }> = [];
-      if (Array.isArray(m.content)) {
-        for (const block of m.content as Record<string, unknown>[]) {
-          if (block?.type === "toolCall") {
-            toolCalls.push({
-              name: String(block.name ?? "unknown"),
-              id: String(block.id ?? ""),
-              input: block.input ?? block.args,
-            });
-          }
-        }
-      }
-      turns.push({
-        inputMessages: [...currentInput],
-        assistantMessage: m,
-        assistantText: extractTextContent(m.content),
-        toolCalls,
-      });
-      currentInput = [];
-    } else {
-      currentInput.push(msg);
-    }
-  }
-
-  return turns;
-}
-
-/**
- * Filter session entries to only the current agent turn.
- * A turn starts at the last user message; everything after it
- * (assistant responses, toolResults) belongs to that turn.
- */
-function filterCurrentTurnEntries(entries: SessionEntry[]): SessionEntry[] {
-  let lastUserIdx = 0;
-  for (let i = entries.length - 1; i >= 0; i--) {
-    if (entries[i].message.role === "user") {
-      lastUserIdx = i;
-      break;
-    }
-  }
-  return entries.slice(lastUserIdx);
-}
-
-/**
- * Legacy wrapper: filter plain message arrays (used by diagnostic handler).
- */
-function filterCurrentTurnMessages(messages: unknown[]): unknown[] {
-  let lastUserIdx = 0;
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const m = messages[i] as Record<string, unknown>;
-    if (m.role === "user") {
-      lastUserIdx = i;
-      break;
-    }
-  }
-  return messages.slice(lastUserIdx);
-}
-
-/**
- * Build structured generation output from assistant message content (D3 format).
- * - Has tool calls + text: {text, toolCalls}
- * - Pure text: direct string
- * - Only tool calls: {toolCalls}
- */
-function buildGenerationOutput(content: unknown, redactEnabled: boolean): unknown {
-  const text = extractTextContent(content);
-  const toolCalls: Array<{
-    id: unknown;
-    type: string;
-    function: { name: string; arguments: string };
-  }> = [];
-
-  if (Array.isArray(content)) {
-    for (const block of content as Record<string, unknown>[]) {
-      if (block?.type === "toolCall") {
-        toolCalls.push({
-          id: block.id,
-          type: "function",
-          function: {
-            name: String(block.name ?? "unknown"),
-            arguments: JSON.stringify(block.input ?? block.args ?? block.arguments ?? {}),
-          },
-        });
-      }
-    }
-  }
-
-  const redactedText = text ? redactText(text, redactEnabled) : "";
-
-  if (toolCalls.length > 0) {
-    return {
-      content: redactedText || null,
-      tool_calls: toolCalls,
-    };
-  }
-  return redactedText || undefined;
-}
-
-/**
- * Extract the plain user message text from a user message content field.
- * Strips the "Sender (untrusted metadata):" wrapper to get the actual user input.
- */
-function extractUserMessageText(content: unknown): string {
-  const text = extractTextContent(content);
-  if (!text) {
-    return "";
-  }
-
-  // Look for the last line after the metadata JSON block wrapper
-  // Pattern: everything after the last "]" followed by newlines + actual text
-  const lastClosingBracket = text.lastIndexOf("```");
-  if (lastClosingBracket !== -1) {
-    const afterBlock = text.slice(lastClosingBracket + 3).trim();
-    // Find text after the timestamp line like "[Wed 2026-03-25 17:00 GMT+8]"
-    const tsMatch = afterBlock.match(/\[.+?\]\s*([\s\S]+)/);
-    if (tsMatch?.[1]?.trim()) {
-      return tsMatch[1].trim();
-    }
-    if (afterBlock) {
-      return afterBlock;
-    }
-  }
-  return text;
-}
-
-/**
- * Check if a usage object has any non-zero values.
- */
-function hasNonZeroUsage(usage: Record<string, number> | undefined): boolean {
-  if (!usage) {
-    return false;
-  }
-  return Object.values(usage).some((v) => typeof v === "number" && v > 0);
-}
-
-/**
- * Create Langfuse spans for tool calls found in session messages.
- */
-function createToolSpansFromMessages(
-  messages: unknown[],
-  entry: TraceContextEntry,
-  redactEnabled: boolean,
-): void {
-  for (const msg of messages) {
-    const m = msg as Record<string, unknown>;
-    if (m.role === "assistant" && Array.isArray(m.content)) {
-      for (const block of m.content) {
-        const b = block as Record<string, unknown> | null;
-        if (!b || b.type !== "toolCall") {
-          continue;
-        }
-
-        entry.toolCallCount += 1;
-
-        // Find matching toolResult
-        const toolResultMsg = messages.find((r) => {
-          const rm = r as Record<string, unknown>;
-          return rm.role === "toolResult" && rm.toolCallId === b.id;
-        }) as Record<string, unknown> | undefined;
-
-        const toolInput = truncatePayload(b.input ?? b.args);
-        const toolOutput = toolResultMsg ? extractTextContent(toolResultMsg.content) : undefined;
-
-        entry.trace.span({
-          name: `tool:${String(b.name ?? "unknown")}`,
-          input: redactObject(toolInput, redactEnabled),
-          output: toolOutput
-            ? redactText(String(truncatePayload(toolOutput)), redactEnabled)
-            : undefined,
-          metadata: { toolCallId: b.id },
-        });
-      }
-    }
-  }
-}
-
-// ---------------------------------------------------------------------------
+// Re-export for external consumers (e.g. tracer.test.ts)
+export { generateTraceId, generateObservationId } from "./utils.js";
 
 export type LangfuseServiceHookHandlers = {
   beforePromptBuild: (
@@ -594,9 +106,8 @@ export function createLangfuseService(
       }
 
       const entry = getEntry(ctx.agentId, ctx.sessionKey);
-      if (entry && event.prompt) {
-        entry.systemPrompt = event.prompt;
-      }
+      // Note: event.prompt here is the user's message, NOT the system prompt.
+      // The actual system prompt is captured later in llmInput via event.systemPrompt.
       serviceLogger?.debug?.(
         `Langfuse: beforePromptBuild — entry=${entry ? "found" : "null"} prompt=${event.prompt ? `${event.prompt.length}chars` : "empty"}`,
       );
@@ -713,6 +224,7 @@ export function createLangfuseService(
 
       const entry: TraceContextEntry = {
         trace,
+        traceId,
         llmCallCount: 0,
         toolCallCount: 0,
         pendingGenerations: new Map(),
@@ -724,6 +236,14 @@ export function createLangfuseService(
 
       contextMap.create(TraceContextMap.key(ctx.agentId, ctx.sessionKey), entry);
       serviceLogger?.info?.(`Langfuse: trace created (agent=${ctx.agentId}, traceId=${traceId})`);
+      writeTraceMarker(
+        serviceStateDir,
+        ctx.agentId ?? "unknown",
+        ctx.sessionId ?? "",
+        "start",
+        traceId,
+        serviceLogger,
+      );
     },
 
     // llm_input: store model/provider/systemPrompt on entry (generation created in agent_end)
@@ -766,6 +286,7 @@ export function createLangfuseService(
         });
         entry = {
           trace,
+          traceId,
           llmCallCount: 0,
           toolCallCount: 0,
           pendingGenerations: new Map(),
@@ -777,10 +298,20 @@ export function createLangfuseService(
         serviceLogger?.info?.(
           `Langfuse: trace created from llm_input fallback (agent=${ctx.agentId}, traceId=${traceId})`,
         );
+        writeTraceMarker(
+          serviceStateDir,
+          ctx.agentId ?? "unknown",
+          ctx.sessionId ?? "",
+          "start",
+          traceId,
+          serviceLogger,
+        );
       }
 
       // Store data for agent_end to use when creating generations
-      if (event.systemPrompt) {
+      // Set systemPrompt from the first llm_input call only; subsequent calls in the same
+      // turn reuse the same system prompt so we avoid overwriting with a post-injection version.
+      if (event.systemPrompt && !entry.systemPrompt) {
         entry.systemPrompt = event.systemPrompt;
       }
       serviceLogger?.debug?.(
@@ -838,9 +369,46 @@ export function createLangfuseService(
       }
 
       const key = TraceContextMap.key(ctx.agentId, ctx.sessionKey);
-      const entry = contextMap.get(key);
+      let entry = contextMap.get(key);
       if (!entry) {
-        return;
+        // Restart resilience: if no entry exists (e.g., gateway restarted mid-conversation),
+        // create a new trace on the fly so observations are still recorded.
+        const timestamp = Date.now();
+        const sessionKey = ctx.sessionKey ?? "unknown";
+        const traceId = generateTraceId(sessionKey, timestamp);
+        const tags = [ctx.agentId, ctx.channelId, ...(config.tracing?.tags ?? [])].filter(
+          (t): t is string => Boolean(t),
+        );
+        const trace = langfuse.trace({
+          id: traceId,
+          name: ctx.agentId ?? "agent",
+          sessionId: ctx.sessionKey,
+          tags,
+          metadata: {
+            sessionId: ctx.sessionId,
+            sessionKey: ctx.sessionKey,
+            agentId: ctx.agentId,
+            channelId: ctx.channelId,
+            trigger: ctx.trigger,
+            timestamp,
+            source: "agent_end-recovery",
+          },
+        });
+        entry = {
+          trace,
+          traceId,
+          llmCallCount: 0,
+          toolCallCount: 0,
+          pendingGenerations: new Map(),
+          pendingSpans: new Map(),
+          createdAt: timestamp,
+          timestamp,
+          sessionId: ctx.sessionId,
+        };
+        contextMap.create(key, entry);
+        serviceLogger?.info?.(
+          `Langfuse: trace created from agentEnd recovery (agent=${ctx.agentId}, traceId=${traceId})`,
+        );
       }
 
       const agentId = ctx.agentId ?? "unknown";
@@ -849,7 +417,7 @@ export function createLangfuseService(
       let allEntries: SessionEntry[] = [];
       let turnEntries: SessionEntry[] = [];
       if (sessionId) {
-        allEntries = readSessionMessages(agentId, sessionId);
+        allEntries = readSessionMessages(serviceStateDir, agentId, sessionId, serviceLogger);
         turnEntries = filterCurrentTurnEntries(allEntries);
       }
 
@@ -876,136 +444,29 @@ export function createLangfuseService(
         allEntries = turnEntries;
       }
 
-      // Create a generation for each assistant message in the turn
-      let llmCallCount = 0;
-      let lastAssistantText: string | undefined;
-      let lastProvider: string | undefined;
-      let lastModel: string | undefined;
-      let prevTimestamp: number | undefined;
-
-      // Aggregate usage across all assistant messages
-      let totalUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
-      let hasPerCallUsage = false;
-
-      // Count total assistant messages to know which is last
-      const assistantCount = turnEntries.filter((e) => e.message.role === "assistant").length;
-
-      for (const te of turnEntries) {
-        const msg = te.message;
-
-        if (msg.role === "assistant") {
-          llmCallCount += 1;
-          const isLast = llmCallCount === assistantCount;
-
-          const assistantTs = te.timestamp;
-          const startTime = prevTimestamp ? new Date(prevTimestamp) : new Date(entry.timestamp);
-          const endTime = new Date(assistantTs);
-
-          // Build output (D3 format)
-          const output = buildGenerationOutput(msg.content, redactEnabled);
-
-          // Build generation input matching LLM API structure: {model, messages}
-          // Use ALL session entries up to this assistant message as input
-          // (includes full history + current user message + any prior tool results)
-          // Merge Langfuse prompt injection into system prompt
-          let fullSystemPrompt = entry.systemPrompt ?? "";
-          if (entry.promptInjection?.prepend) {
-            fullSystemPrompt = `${entry.promptInjection.prepend}\n\n${fullSystemPrompt}`;
-          }
-          if (entry.promptInjection?.append) {
-            fullSystemPrompt = `${fullSystemPrompt}\n\n${entry.promptInjection.append}`;
-          }
-          const systemMessage = fullSystemPrompt
-            ? [{ role: "system", content: fullSystemPrompt }]
-            : [];
-          const allPriorEntries = allEntries.slice(0, allEntries.indexOf(te));
-          const accumulatedMessages = allPriorEntries.map((e) => buildApiMessage(e.message));
-          const genInput = redactObject(
-            {
-              model: String(msg.model ?? entry.lastModel ?? "unknown"),
-              messages: [...systemMessage, ...accumulatedMessages],
-            },
-            redactEnabled,
-          );
-
-          // Extract per-call usage from JSONL assistant message
-          const msgUsage = msg.usage as Record<string, number> | undefined;
-          let genUsage: { input?: number; output?: number; total?: number } | undefined;
-
-          if (hasNonZeroUsage(msgUsage)) {
-            hasPerCallUsage = true;
-            genUsage = {
-              input: msgUsage?.input ?? 0,
-              output: msgUsage?.output ?? 0,
-              total: msgUsage?.totalTokens ?? msgUsage?.total ?? 0,
-              ...(msgUsage?.cacheRead ? { cache_read_input_tokens: msgUsage.cacheRead } : {}),
-              ...(msgUsage?.cacheWrite ? { cache_creation_input_tokens: msgUsage.cacheWrite } : {}),
-            };
-            // Aggregate
-            totalUsage.input += msgUsage?.input ?? 0;
-            totalUsage.output += msgUsage?.output ?? 0;
-            totalUsage.cacheRead += msgUsage?.cacheRead ?? 0;
-            totalUsage.cacheWrite += msgUsage?.cacheWrite ?? 0;
-            totalUsage.total += msgUsage?.totalTokens ?? msgUsage?.total ?? 0;
-          } else if (isLast && entry.storedUsage) {
-            // Fall back to stored usage from llm_output for last generation
-            genUsage = {
-              input: entry.storedUsage.input,
-              output: entry.storedUsage.output,
-              total: entry.storedUsage.total,
-            };
-            totalUsage.input += entry.storedUsage.input ?? 0;
-            totalUsage.output += entry.storedUsage.output ?? 0;
-            totalUsage.cacheRead += entry.storedUsage.cacheRead ?? 0;
-            totalUsage.cacheWrite += entry.storedUsage.cacheWrite ?? 0;
-            totalUsage.total += entry.storedUsage.total ?? 0;
-          }
-
-          const model = String(msg.model ?? entry.lastModel ?? "unknown");
-          const provider = String(msg.provider ?? entry.lastProvider ?? "");
-
-          entry.trace.generation({
-            name: `llm-call-${llmCallCount}`,
-            model,
-            startTime,
-            endTime,
-            input: truncatePayload(genInput),
-            output: truncatePayload(output),
-            usageDetails: genUsage as Record<string, number> | undefined,
-            ...(msgUsage?.cost && typeof msgUsage.cost === "object"
-              ? {
-                  costDetails: {
-                    input: (msgUsage.cost as Record<string, number>).input ?? 0,
-                    output: (msgUsage.cost as Record<string, number>).output ?? 0,
-                    total: (msgUsage.cost as Record<string, number>).total ?? 0,
-                  },
-                }
-              : {}),
-            metadata: {
-              provider,
-              model: msg.model,
-              stopReason: msg.stopReason,
-            },
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            ...(entry.promptClient ? { prompt: entry.promptClient as any } : {}),
-          });
-
-          // Track last assistant text for trace output
-          const text = extractTextContent(msg.content);
-          if (text) {
-            lastAssistantText = text;
-          }
-          lastProvider = provider;
-          lastModel = model;
-        } else {
-          // non-assistant entries (user, toolResult) are captured via allEntries
-        }
-
-        prevTimestamp = te.timestamp;
-      }
+      // Build generations and tool spans from JSONL entries
+      const obsResult = buildObservationsFromEntries(
+        entry.trace,
+        entry.traceId,
+        turnEntries,
+        allEntries,
+        {
+          entryTimestamp: entry.timestamp,
+          systemPrompt: entry.systemPrompt,
+          storedUsage: entry.storedUsage,
+          promptClient: entry.promptClient,
+          pendingSpans: entry.pendingSpans,
+          lastModel: entry.lastModel,
+          lastProvider: entry.lastProvider,
+          redactEnabled,
+          langfuseClient: langfuse ?? undefined,
+        },
+        serviceLogger,
+      );
 
       // Update entry counts
-      entry.llmCallCount = llmCallCount;
+      entry.llmCallCount = obsResult.llmCallCount;
+      entry.toolCallCount += obsResult.toolCallCount;
 
       // Extract user message for trace input
       const userEntry = turnEntries.find((e) => e.message.role === "user");
@@ -1014,13 +475,17 @@ export function createLangfuseService(
         : undefined;
 
       // Use aggregated usage if we have per-call data, otherwise use stored usage
+      const hasPerCallUsage =
+        obsResult.totalUsage.input > 0 ||
+        obsResult.totalUsage.output > 0 ||
+        obsResult.totalUsage.total > 0;
       const finalUsage = hasPerCallUsage
         ? {
-            inputTokens: totalUsage.input,
-            outputTokens: totalUsage.output,
-            cacheReadInputTokens: totalUsage.cacheRead || undefined,
-            cacheWriteInputTokens: totalUsage.cacheWrite || undefined,
-            totalTokens: totalUsage.total,
+            inputTokens: obsResult.totalUsage.input,
+            outputTokens: obsResult.totalUsage.output,
+            cacheReadInputTokens: obsResult.totalUsage.cacheRead || undefined,
+            cacheWriteInputTokens: obsResult.totalUsage.cacheWrite || undefined,
+            totalTokens: obsResult.totalUsage.total,
           }
         : entry.storedUsage
           ? {
@@ -1035,7 +500,9 @@ export function createLangfuseService(
       // Update trace with structured metadata matching yesterday's working format
       entry.trace.update({
         input: userInputText ? redactText(userInputText, redactEnabled) : undefined,
-        output: lastAssistantText ? redactText(lastAssistantText, redactEnabled) : undefined,
+        output: obsResult.lastAssistantText
+          ? redactText(obsResult.lastAssistantText, redactEnabled)
+          : undefined,
         metadata: {
           sessionId,
           sessionKey: ctx.sessionKey,
@@ -1047,12 +514,14 @@ export function createLangfuseService(
             success: event.success,
             durationMs: event.durationMs,
             messageCount: event.messages?.length ?? turnEntries.length,
-            llmCallCount,
+            llmCallCount: obsResult.llmCallCount,
             toolCallCount: entry.toolCallCount,
           },
           usage: finalUsage,
           lastModel:
-            lastModel || lastProvider ? { provider: lastProvider, model: lastModel } : undefined,
+            obsResult.lastModel || obsResult.lastProvider
+              ? { provider: obsResult.lastProvider, model: obsResult.lastModel }
+              : undefined,
           prompt: entry.promptMatch,
         },
         ...(event.error
@@ -1063,112 +532,10 @@ export function createLangfuseService(
           : {}),
       });
 
-      // Complete tool spans from JSONL data.
-      // The after_tool_call hook may not fire reliably (ctx.agentId can be undefined,
-      // or the hook may not be dispatched to this plugin). Use JSONL toolResult entries
-      // to end pending spans or create+end spans that were never started.
-      if (turnEntries.length > 0) {
-        // Build a map of toolCallId → { callTimestamp, resultTimestamp, toolName, result, error }
-        const toolMap = new Map<
-          string,
-          {
-            callTs?: number;
-            resultTs?: number;
-            toolName?: string;
-            input?: unknown;
-            result?: unknown;
-            error?: string;
-          }
-        >();
-        for (const te of turnEntries) {
-          const msg = te.message;
-          // Assistant messages may contain toolCall content blocks
-          if (msg.role === "assistant" && Array.isArray(msg.content)) {
-            for (const block of msg.content as Record<string, unknown>[]) {
-              if (block?.type === "toolCall" && block.id) {
-                const id = String(block.id);
-                const existing = toolMap.get(id) ?? {};
-                existing.callTs = te.timestamp;
-                existing.toolName = String(block.name ?? "unknown");
-                existing.input = block.input ?? block.args ?? block.arguments;
-                toolMap.set(id, existing);
-              }
-            }
-          }
-          // ToolResult messages
-          if (msg.role === "toolResult" && msg.toolCallId) {
-            const id = String(msg.toolCallId);
-            const existing = toolMap.get(id) ?? {};
-            // Use inner msg.timestamp for tool completion time (more accurate than
-            // outer JSONL entry timestamp which may be delayed by batch writes).
-            existing.resultTs = typeof msg.timestamp === "number" ? msg.timestamp : te.timestamp;
-            existing.toolName = existing.toolName ?? String(msg.toolName ?? "unknown");
-            existing.result = msg.content;
-            if (msg.isError) {
-              existing.error = extractTextContent(msg.content);
-            }
-            toolMap.set(id, existing);
-          }
-        }
-
-        serviceLogger?.debug?.(
-          `Langfuse: agentEnd toolMap has ${toolMap.size} tool calls, pendingSpans=${entry.pendingSpans.size}`,
-        );
-        for (const [toolCallId, info] of toolMap) {
-          entry.toolCallCount += 1;
-          const pendingSpan = entry.pendingSpans.get(toolCallId);
-          if (pendingSpan) {
-            // Update existing pending span with output and endTime from JSONL.
-            // NOTE: span.end() Omits endTime (SDK auto-sets to now), so we use
-            // update() to set the correct endTime, then end() to mark completion.
-            const durationMs =
-              info.callTs && info.resultTs ? info.resultTs - info.callTs : undefined;
-            pendingSpan.update({
-              endTime: info.resultTs ? new Date(info.resultTs) : undefined,
-              output: info.error
-                ? { error: info.error }
-                : redactObject(truncatePayload(info.result), redactEnabled),
-              statusMessage: info.error,
-              level: info.error ? "ERROR" : "DEFAULT",
-              metadata: durationMs != null ? { durationMs } : {},
-            });
-            entry.pendingSpans.delete(toolCallId);
-            serviceLogger?.debug?.(
-              `Langfuse: ended pending tool span ${info.toolName} (${toolCallId}) durationMs=${durationMs}`,
-            );
-          } else if (info.callTs && info.resultTs) {
-            // No pending span — create span with all data including endTime.
-            // NOTE: span.end() Omits endTime (SDK auto-sets to now), so we set
-            // endTime on creation via trace.span() which accepts it.
-            const durationMs = info.resultTs - info.callTs;
-            serviceLogger?.debug?.(
-              `Langfuse: creating tool span ${info.toolName} (${toolCallId}) callTs=${info.callTs} resultTs=${info.resultTs} durationMs=${durationMs}`,
-            );
-            entry.trace.span({
-              name: `tool:${info.toolName ?? "unknown"}`,
-              startTime: new Date(info.callTs),
-              endTime: new Date(info.resultTs),
-              input: info.input
-                ? redactObject(truncatePayload(info.input), redactEnabled)
-                : undefined,
-              output: info.error
-                ? { error: info.error }
-                : redactObject(truncatePayload(info.result), redactEnabled),
-              statusMessage: info.error,
-              level: info.error ? "ERROR" : "DEFAULT",
-              metadata: { durationMs },
-            });
-          } else {
-            serviceLogger?.warn?.(
-              `Langfuse: tool span ${info.toolName} (${toolCallId}) missing timestamps — callTs=${info.callTs} resultTs=${info.resultTs}`,
-            );
-          }
-        }
-      }
-
       // Mark as finalized instead of deleting — diagnostic events may still arrive
       // but should not overwrite our clean metadata structure.
       entry.finalized = true;
+      writeTraceMarker(serviceStateDir, agentId, sessionId, "end", entry.traceId, serviceLogger);
     },
 
     // session_end: log session metadata
@@ -1231,6 +598,44 @@ export function createLangfuseService(
           });
       }
 
+      // Fire-and-forget: recover incomplete traces from previous runs
+      void (async () => {
+        try {
+          if (!serviceStateDir) {
+            return;
+          }
+          const incompleteTraces = scanIncompleteTraces(serviceStateDir);
+          if (incompleteTraces.length === 0) {
+            return;
+          }
+          serviceLogger?.info?.(
+            `Langfuse: recovering ${incompleteTraces.length} incomplete trace(s)`,
+          );
+          for (const traceInfo of incompleteTraces) {
+            try {
+              const count = await recoverTrace(
+                langfuse,
+                traceInfo,
+                {
+                  redactEnabled,
+                },
+                serviceStateDir,
+                serviceLogger,
+              );
+              serviceLogger?.info?.(
+                `Langfuse: recovered trace ${traceInfo.traceId} (${count} observations)`,
+              );
+            } catch (err) {
+              serviceLogger?.warn?.(
+                `Langfuse: failed to recover trace ${traceInfo.traceId}: ${err}`,
+              );
+            }
+          }
+        } catch (err) {
+          serviceLogger?.warn?.(`Langfuse: trace recovery scan failed: ${err}`);
+        }
+      })();
+
       // Dynamically import onDiagnosticEvent — this module is only available
       // at runtime inside the openclaw process (not during npm install).
       let onDiagnosticEvent:
@@ -1289,6 +694,7 @@ export function createLangfuseService(
               });
               entry = {
                 trace,
+                traceId,
                 llmCallCount: 0,
                 toolCallCount: 0,
                 pendingGenerations: new Map(),
@@ -1329,7 +735,9 @@ export function createLangfuseService(
             // The JSONL contains the full session history across turns;
             // we only want messages from the latest user message onward.
             const sessionId = String(diagEvt.sessionId ?? "");
-            const allEntries = sessionId ? readSessionMessages(agentId, sessionId) : [];
+            const allEntries = sessionId
+              ? readSessionMessages(serviceStateDir, agentId, sessionId, serviceLogger)
+              : [];
             const messages = filterCurrentTurnMessages(allEntries.map((e) => e.message));
             const turn = extractConversation(messages);
 
@@ -1381,7 +789,10 @@ export function createLangfuseService(
                 const genOutput = turn.output ? redactText(turn.output, redactEnabled) : undefined;
                 const gen = entry.trace.generation({
                   name: `llm-call-${entry.llmCallCount}`,
-                  model: String(diagEvt.model ?? "unknown"),
+                  model: qualifiedModel(
+                    String(diagEvt.provider ?? ""),
+                    String(diagEvt.model ?? "unknown"),
+                  ),
                   startTime,
                   input: {
                     systemPrompt: entry.systemPrompt
@@ -1447,7 +858,10 @@ export function createLangfuseService(
 
                   const gen = entry.trace.generation({
                     name: `llm-call-${entry.llmCallCount}`,
-                    model: String(diagEvt.model ?? "unknown"),
+                    model: qualifiedModel(
+                      String(diagEvt.provider ?? ""),
+                      String(diagEvt.model ?? "unknown"),
+                    ),
                     input: {
                       // Include system prompt only on the first generation
                       ...(i === 0 && entry.systemPrompt

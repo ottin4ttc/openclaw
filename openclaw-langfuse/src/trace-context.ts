@@ -12,6 +12,7 @@ export type PromptMatchInfo =
 
 export type TraceContextEntry = {
   trace: LangfuseTraceClient;
+  traceId: string; // deterministic trace ID, used for deterministic observation IDs
   llmCallCount: number;
   toolCallCount: number;
   promptMatch?: PromptMatchInfo;
