@@ -576,7 +576,14 @@ export function createLangfuseService(
         // Non-critical check — don't block startup
       }
 
-      langfuse = new Langfuse({ publicKey, secretKey, baseUrl });
+      langfuse = new Langfuse({
+        publicKey,
+        secretKey,
+        baseUrl,
+        requestTimeout: 30000,
+        fetchRetryCount: 2,
+        fetchRetryDelay: 2000,
+      });
       // Preserve existing contextMap if it has active (non-finalized) entries.
       // The plugin may be re-registered mid-run (e.g., openmai reloads config);
       // recreating contextMap would lose the in-flight trace entry.
