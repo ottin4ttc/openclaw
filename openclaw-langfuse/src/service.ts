@@ -19,6 +19,15 @@ import type { TraceContextEntry } from "./trace-context.js";
 
 const MAX_PAYLOAD_BYTES = 100 * 1024; // 100KB
 
+/** Build qualified model name: provider/model (e.g. zenmux-anthropic/anthropic/claude-opus-4.6) */
+function qualifiedModel(provider: string | undefined, model: string | undefined): string {
+  const m = String(model ?? "unknown");
+  if (provider && !m.startsWith(provider + "/")) {
+    return `${provider}/${m}`;
+  }
+  return m;
+}
+
 // ---------------------------------------------------------------------------
 // Local hook event/context type definitions (subset of what we use).
 // These mirror the canonical types in src/plugins/types.ts but are defined
@@ -135,6 +144,24 @@ type SessionEndEvent = {
  */
 export function generateTraceId(sessionKey: string, timestamp: number): string {
   return createHash("sha256").update(`${sessionKey}:${timestamp}`).digest("hex").slice(0, 32);
+}
+
+/**
+ * Generate a deterministic observation ID for a generation or span.
+ * - Generations: `${traceId}-gen-${N}` where N is 1-based call index
+ * - Spans: `${traceId}-span-${toolCallId}`
+ */
+export function generateObservationId(traceId: string, type: "gen", index: number): string;
+export function generateObservationId(traceId: string, type: "span", toolCallId: string): string;
+export function generateObservationId(
+  traceId: string,
+  type: "gen" | "span",
+  indexOrToolCallId: number | string,
+): string {
+  if (type === "gen") {
+    return `${traceId}-gen-${indexOrToolCallId}`;
+  }
+  return `${traceId}-span-${indexOrToolCallId}`;
 }
 
 /**
@@ -594,9 +621,8 @@ export function createLangfuseService(
       }
 
       const entry = getEntry(ctx.agentId, ctx.sessionKey);
-      if (entry && event.prompt) {
-        entry.systemPrompt = event.prompt;
-      }
+      // Note: event.prompt here is the user's message, NOT the system prompt.
+      // The actual system prompt is captured later in llmInput via event.systemPrompt.
       serviceLogger?.debug?.(
         `Langfuse: beforePromptBuild — entry=${entry ? "found" : "null"} prompt=${event.prompt ? `${event.prompt.length}chars` : "empty"}`,
       );
@@ -713,6 +739,7 @@ export function createLangfuseService(
 
       const entry: TraceContextEntry = {
         trace,
+        traceId,
         llmCallCount: 0,
         toolCallCount: 0,
         pendingGenerations: new Map(),
@@ -766,6 +793,7 @@ export function createLangfuseService(
         });
         entry = {
           trace,
+          traceId,
           llmCallCount: 0,
           toolCallCount: 0,
           pendingGenerations: new Map(),
@@ -780,7 +808,9 @@ export function createLangfuseService(
       }
 
       // Store data for agent_end to use when creating generations
-      if (event.systemPrompt) {
+      // Set systemPrompt from the first llm_input call only; subsequent calls in the same
+      // turn reuse the same system prompt so we avoid overwriting with a post-injection version.
+      if (event.systemPrompt && !entry.systemPrompt) {
         entry.systemPrompt = event.systemPrompt;
       }
       serviceLogger?.debug?.(
@@ -838,9 +868,46 @@ export function createLangfuseService(
       }
 
       const key = TraceContextMap.key(ctx.agentId, ctx.sessionKey);
-      const entry = contextMap.get(key);
+      let entry = contextMap.get(key);
       if (!entry) {
-        return;
+        // Restart resilience: if no entry exists (e.g., gateway restarted mid-conversation),
+        // create a new trace on the fly so observations are still recorded.
+        const timestamp = Date.now();
+        const sessionKey = ctx.sessionKey ?? "unknown";
+        const traceId = generateTraceId(sessionKey, timestamp);
+        const tags = [ctx.agentId, ctx.channelId, ...(config.tracing?.tags ?? [])].filter(
+          (t): t is string => Boolean(t),
+        );
+        const trace = langfuse.trace({
+          id: traceId,
+          name: ctx.agentId ?? "agent",
+          sessionId: ctx.sessionKey,
+          tags,
+          metadata: {
+            sessionId: ctx.sessionId,
+            sessionKey: ctx.sessionKey,
+            agentId: ctx.agentId,
+            channelId: ctx.channelId,
+            trigger: ctx.trigger,
+            timestamp,
+            source: "agent_end-recovery",
+          },
+        });
+        entry = {
+          trace,
+          traceId,
+          llmCallCount: 0,
+          toolCallCount: 0,
+          pendingGenerations: new Map(),
+          pendingSpans: new Map(),
+          createdAt: timestamp,
+          timestamp,
+          sessionId: ctx.sessionId,
+        };
+        contextMap.create(key, entry);
+        serviceLogger?.info?.(
+          `Langfuse: trace created from agentEnd recovery (agent=${ctx.agentId}, traceId=${traceId})`,
+        );
       }
 
       const agentId = ctx.agentId ?? "unknown";
@@ -907,14 +974,10 @@ export function createLangfuseService(
           // Build generation input matching LLM API structure: {model, messages}
           // Use ALL session entries up to this assistant message as input
           // (includes full history + current user message + any prior tool results)
-          // Merge Langfuse prompt injection into system prompt
-          let fullSystemPrompt = entry.systemPrompt ?? "";
-          if (entry.promptInjection?.prepend) {
-            fullSystemPrompt = `${entry.promptInjection.prepend}\n\n${fullSystemPrompt}`;
-          }
-          if (entry.promptInjection?.append) {
-            fullSystemPrompt = `${fullSystemPrompt}\n\n${entry.promptInjection.append}`;
-          }
+          // Note: entry.systemPrompt already contains the Langfuse prompt injection
+          // (prepend/append) because llm_input fires after injection has been applied.
+          // Do NOT re-apply promptInjection here to avoid duplication.
+          const fullSystemPrompt = entry.systemPrompt ?? "";
           const systemMessage = fullSystemPrompt
             ? [{ role: "system", content: fullSystemPrompt }]
             : [];
@@ -961,10 +1024,12 @@ export function createLangfuseService(
             totalUsage.total += entry.storedUsage.total ?? 0;
           }
 
-          const model = String(msg.model ?? entry.lastModel ?? "unknown");
+          const rawModel = String(msg.model ?? entry.lastModel ?? "unknown");
           const provider = String(msg.provider ?? entry.lastProvider ?? "");
+          const model = qualifiedModel(provider, rawModel);
 
-          entry.trace.generation({
+          const genData = {
+            id: generateObservationId(entry.traceId, "gen", llmCallCount),
             name: `llm-call-${llmCallCount}`,
             model,
             startTime,
@@ -985,10 +1050,19 @@ export function createLangfuseService(
               provider,
               model: msg.model,
               stopReason: msg.stopReason,
+              ...(msg.errorMessage ? { errorMessage: msg.errorMessage } : {}),
             },
+            ...(msg.stopReason === "error" && msg.errorMessage
+              ? {
+                  statusMessage: String(msg.errorMessage),
+                  level: "ERROR" as const,
+                }
+              : {}),
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             ...(entry.promptClient ? { prompt: entry.promptClient as any } : {}),
-          });
+          };
+
+          entry.trace.generation(genData);
 
           // Track last assistant text for trace output
           const text = extractTextContent(msg.content);
@@ -1145,6 +1219,7 @@ export function createLangfuseService(
               `Langfuse: creating tool span ${info.toolName} (${toolCallId}) callTs=${info.callTs} resultTs=${info.resultTs} durationMs=${durationMs}`,
             );
             entry.trace.span({
+              id: generateObservationId(entry.traceId, "span", toolCallId),
               name: `tool:${info.toolName ?? "unknown"}`,
               startTime: new Date(info.callTs),
               endTime: new Date(info.resultTs),
@@ -1289,6 +1364,7 @@ export function createLangfuseService(
               });
               entry = {
                 trace,
+                traceId,
                 llmCallCount: 0,
                 toolCallCount: 0,
                 pendingGenerations: new Map(),
@@ -1381,7 +1457,10 @@ export function createLangfuseService(
                 const genOutput = turn.output ? redactText(turn.output, redactEnabled) : undefined;
                 const gen = entry.trace.generation({
                   name: `llm-call-${entry.llmCallCount}`,
-                  model: String(diagEvt.model ?? "unknown"),
+                  model: qualifiedModel(
+                    String(diagEvt.provider ?? ""),
+                    String(diagEvt.model ?? "unknown"),
+                  ),
                   startTime,
                   input: {
                     systemPrompt: entry.systemPrompt
@@ -1447,7 +1526,10 @@ export function createLangfuseService(
 
                   const gen = entry.trace.generation({
                     name: `llm-call-${entry.llmCallCount}`,
-                    model: String(diagEvt.model ?? "unknown"),
+                    model: qualifiedModel(
+                      String(diagEvt.provider ?? ""),
+                      String(diagEvt.model ?? "unknown"),
+                    ),
                     input: {
                       // Include system prompt only on the first generation
                       ...(i === 0 && entry.systemPrompt

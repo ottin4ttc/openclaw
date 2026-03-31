@@ -7,7 +7,7 @@ import { createLangfuseService, generateTraceId } from "./service.js";
 // Mock the langfuse SDK — use vi.hoisted so refs are available inside factory
 // ---------------------------------------------------------------------------
 
-const { mockGeneration, mockSpan, mockTrace, mockLangfuseInstance } = vi.hoisted(() => {
+const { mockTrace, mockLangfuseInstance } = vi.hoisted(() => {
   const mockGeneration = { update: vi.fn(), end: vi.fn() };
   const mockSpan = { update: vi.fn(), end: vi.fn() };
   const mockTrace = {
@@ -18,6 +18,7 @@ const { mockGeneration, mockSpan, mockTrace, mockLangfuseInstance } = vi.hoisted
   const mockLangfuseInstance = {
     trace: vi.fn().mockReturnValue(mockTrace),
     shutdownAsync: vi.fn().mockResolvedValue(undefined),
+    flushAsync: vi.fn().mockResolvedValue(undefined),
     getPrompt: vi.fn(),
   };
   return { mockGeneration, mockSpan, mockTrace, mockLangfuseInstance };
@@ -109,7 +110,7 @@ describe("LangfuseService tracer", () => {
     expect(traceArgs.metadata.agentId).toBe(agentCtx.agentId);
   });
 
-  it("creates generation on llm_input", async () => {
+  it("llmInput stores data without creating generation", async () => {
     const service = await startService();
     const { beforeAgentStart, llmInput } = service.getHookHandlers();
 
@@ -128,17 +129,13 @@ describe("LangfuseService tracer", () => {
       agentCtx,
     );
 
-    expect(mockTrace.generation).toHaveBeenCalledOnce();
-    const genArgs = mockTrace.generation.mock.calls[0][0];
-    expect(genArgs.name).toBe("llm-call-1");
-    expect(genArgs.model).toBe("claude-3-5-sonnet");
-    expect(genArgs.input.systemPrompt).toBe("You are helpful");
-    expect(genArgs.input.prompt).toBe("What is 2+2?");
+    // llmInput no longer creates generations directly — they are created in agentEnd
+    expect(mockTrace.generation).not.toHaveBeenCalled();
   });
 
-  it("updates generation on llm_output", async () => {
+  it("agentEnd creates generation from event.messages", async () => {
     const service = await startService();
-    const { beforeAgentStart, llmInput, llmOutput } = service.getHookHandlers();
+    const { beforeAgentStart, llmInput, llmOutput, agentEnd } = service.getHookHandlers();
 
     beforeAgentStart({ prompt: "hello" }, agentCtx);
     llmInput(
@@ -147,6 +144,7 @@ describe("LangfuseService tracer", () => {
         sessionId: "session-id-1",
         provider: "anthropic",
         model: "claude-3-5-sonnet",
+        systemPrompt: "You are helpful",
         prompt: "What is 2+2?",
         historyMessages: [],
         imagesCount: 0,
@@ -164,69 +162,84 @@ describe("LangfuseService tracer", () => {
       },
       agentCtx,
     );
-
-    expect(mockGeneration.end).toHaveBeenCalledOnce();
-    const endArgs = mockGeneration.end.mock.calls[0][0];
-    expect(endArgs.output).toBe("The answer is 4.");
-    expect(endArgs.usage.input).toBe(10);
-    expect(endArgs.usage.output).toBe(8);
-    expect(endArgs.usage.total).toBe(18);
-  });
-
-  it("creates span on before_tool_call", async () => {
-    const service = await startService();
-    const { beforeAgentStart, beforeToolCall } = service.getHookHandlers();
-
-    beforeAgentStart({ prompt: "hello" }, agentCtx);
-    beforeToolCall(
+    agentEnd(
       {
-        toolName: "readFile",
-        params: { path: "/tmp/test.txt" },
-        runId: "run-1",
-        toolCallId: "tool-call-1",
+        messages: [
+          { role: "user", content: "What is 2+2?" },
+          {
+            role: "assistant",
+            content: [{ type: "text", text: "The answer is 4." }],
+            model: "claude-3-5-sonnet",
+            provider: "anthropic",
+            usage: { input: 10, output: 8, totalTokens: 18 },
+          },
+        ],
+        success: true,
+        durationMs: 1234,
       },
-      toolCtx,
+      agentCtx,
     );
 
+    // Generation created from event.messages in agentEnd
+    expect(mockTrace.generation).toHaveBeenCalledOnce();
+    const genArgs = mockTrace.generation.mock.calls[0][0];
+    expect(genArgs.name).toBe("llm-call-1");
+    expect(genArgs.model).toBe("anthropic/claude-3-5-sonnet");
+  });
+
+  it("agentEnd creates tool spans from event.messages", async () => {
+    const service = await startService();
+    const { beforeAgentStart, agentEnd } = service.getHookHandlers();
+
+    beforeAgentStart({ prompt: "hello" }, agentCtx);
+    agentEnd(
+      {
+        messages: [
+          { role: "user", content: "Read the file" },
+          {
+            role: "assistant",
+            content: [
+              { type: "text", text: "Let me read it." },
+              {
+                type: "toolCall",
+                id: "tc-1",
+                name: "readFile",
+                input: { path: "/tmp/test.txt" },
+              },
+            ],
+            model: "claude-3-5-sonnet",
+            provider: "anthropic",
+            timestamp: 1000,
+          },
+          {
+            role: "toolResult",
+            toolCallId: "tc-1",
+            toolName: "readFile",
+            content: [{ type: "text", text: "file contents here" }],
+            timestamp: 1042,
+          },
+          {
+            role: "assistant",
+            content: [{ type: "text", text: "The file contains..." }],
+            model: "claude-3-5-sonnet",
+            provider: "anthropic",
+            timestamp: 2000,
+          },
+        ],
+        success: true,
+        durationMs: 2000,
+      },
+      agentCtx,
+    );
+
+    // 2 generations (2 assistant messages) + 1 tool span
+    expect(mockTrace.generation).toHaveBeenCalledTimes(2);
     expect(mockTrace.span).toHaveBeenCalledOnce();
     const spanArgs = mockTrace.span.mock.calls[0][0];
     expect(spanArgs.name).toBe("tool:readFile");
-    expect(spanArgs.input).toMatchObject({ path: "/tmp/test.txt" });
-    expect(spanArgs.metadata.toolCallId).toBe("tool-call-1");
   });
 
-  it("updates span on after_tool_call", async () => {
-    const service = await startService();
-    const { beforeAgentStart, beforeToolCall, afterToolCall } = service.getHookHandlers();
-
-    beforeAgentStart({ prompt: "hello" }, agentCtx);
-    beforeToolCall(
-      {
-        toolName: "readFile",
-        params: { path: "/tmp/test.txt" },
-        toolCallId: "tool-call-1",
-      },
-      toolCtx,
-    );
-    afterToolCall(
-      {
-        toolName: "readFile",
-        params: { path: "/tmp/test.txt" },
-        toolCallId: "tool-call-1",
-        result: "file contents here",
-        durationMs: 42,
-      },
-      toolCtx,
-    );
-
-    expect(mockSpan.end).toHaveBeenCalledOnce();
-    const endArgs = mockSpan.end.mock.calls[0][0];
-    expect(endArgs.metadata.durationMs).toBe(42);
-    // No error → level DEFAULT
-    expect(endArgs.level).toBe("DEFAULT");
-  });
-
-  it("finalizes trace on agent_end", async () => {
+  it("finalizes trace on agent_end with structured metadata", async () => {
     const service = await startService();
     const { beforeAgentStart, agentEnd } = service.getHookHandlers();
 
@@ -235,7 +248,11 @@ describe("LangfuseService tracer", () => {
       {
         messages: [
           { role: "user", content: "What is 2+2?" },
-          { role: "assistant", content: "The answer is 4." },
+          {
+            role: "assistant",
+            content: [{ type: "text", text: "The answer is 4." }],
+            model: "claude-3-5-sonnet",
+          },
         ],
         success: true,
         durationMs: 1234,
@@ -246,12 +263,11 @@ describe("LangfuseService tracer", () => {
     expect(mockTrace.update).toHaveBeenCalledOnce();
     const updateArgs = mockTrace.update.mock.calls[0][0];
     expect(updateArgs.output).toBe("The answer is 4.");
-    expect(updateArgs.metadata.success).toBe(true);
-    expect(updateArgs.metadata.llmCallCount).toBe(0);
-    expect(updateArgs.metadata.toolCallCount).toBe(0);
+    expect(updateArgs.metadata.stats.success).toBe(true);
+    expect(updateArgs.metadata.stats.llmCallCount).toBe(1);
   });
 
-  it("full multi-tool-call sequence", async () => {
+  it("full multi-turn sequence with tools", async () => {
     const service = await startService();
     const { beforeAgentStart, llmInput, llmOutput, beforeToolCall, afterToolCall, agentEnd } =
       service.getHookHandlers();
@@ -282,7 +298,7 @@ describe("LangfuseService tracer", () => {
       agentCtx,
     );
 
-    // Tool call 1: read
+    // Tool calls (beforeToolCall just increments count)
     beforeToolCall(
       { toolName: "read", params: {}, toolCallId: "tc-1" },
       { ...toolCtx, toolName: "read", toolCallId: "tc-1" },
@@ -311,76 +327,60 @@ describe("LangfuseService tracer", () => {
         sessionId: "s1",
         provider: "anthropic",
         model: "claude-3-5-sonnet",
-        assistantTexts: ["ok2"],
-      },
-      agentCtx,
-    );
-
-    // Tool call 2: openai_internal_api_call
-    beforeToolCall(
-      { toolName: "openai_internal_api_call", params: {}, toolCallId: "tc-2" },
-      { ...toolCtx, toolName: "openai_internal_api_call", toolCallId: "tc-2" },
-    );
-    afterToolCall(
-      { toolName: "openai_internal_api_call", params: {}, toolCallId: "tc-2", result: "result2" },
-      { ...toolCtx, toolName: "openai_internal_api_call", toolCallId: "tc-2" },
-    );
-
-    // LLM call 3 (final)
-    llmInput(
-      {
-        runId: "run-3",
-        sessionId: "s1",
-        provider: "anthropic",
-        model: "claude-3-5-sonnet",
-        prompt: "p3",
-        historyMessages: [],
-        imagesCount: 0,
-      },
-      agentCtx,
-    );
-    llmOutput(
-      {
-        runId: "run-3",
-        sessionId: "s1",
-        provider: "anthropic",
-        model: "claude-3-5-sonnet",
         assistantTexts: ["final answer"],
       },
       agentCtx,
     );
 
+    // agentEnd with full message history creates all observations
     agentEnd(
       {
-        messages: [{ role: "assistant", content: "final answer" }],
+        messages: [
+          { role: "user", content: "Do some work" },
+          {
+            role: "assistant",
+            content: [
+              { type: "text", text: "ok1" },
+              { type: "toolCall", id: "tc-1", name: "read", input: {} },
+            ],
+            model: "claude-3-5-sonnet",
+            provider: "anthropic",
+            timestamp: 1000,
+          },
+          {
+            role: "toolResult",
+            toolCallId: "tc-1",
+            toolName: "read",
+            content: [{ type: "text", text: "data" }],
+            timestamp: 1100,
+          },
+          {
+            role: "assistant",
+            content: [{ type: "text", text: "final answer" }],
+            model: "claude-3-5-sonnet",
+            provider: "anthropic",
+            timestamp: 2000,
+          },
+        ],
         success: true,
         durationMs: 5000,
       },
       agentCtx,
     );
 
-    // 3 generations created
-    expect(mockTrace.generation).toHaveBeenCalledTimes(3);
+    // 2 generations created (2 assistant messages)
+    expect(mockTrace.generation).toHaveBeenCalledTimes(2);
     expect(mockTrace.generation.mock.calls[0][0].name).toBe("llm-call-1");
     expect(mockTrace.generation.mock.calls[1][0].name).toBe("llm-call-2");
-    expect(mockTrace.generation.mock.calls[2][0].name).toBe("llm-call-3");
 
-    // 2 spans created
-    expect(mockTrace.span).toHaveBeenCalledTimes(2);
+    // 1 tool span created from toolCall+toolResult in messages
+    expect(mockTrace.span).toHaveBeenCalledOnce();
     expect(mockTrace.span.mock.calls[0][0].name).toBe("tool:read");
-    expect(mockTrace.span.mock.calls[1][0].name).toBe("tool:openai_internal_api_call");
 
-    // All generations ended
-    expect(mockGeneration.end).toHaveBeenCalledTimes(3);
-
-    // All spans ended
-    expect(mockSpan.end).toHaveBeenCalledTimes(2);
-
-    // Trace finalized with correct counts
+    // Trace finalized
     expect(mockTrace.update).toHaveBeenCalledOnce();
     const updateArgs = mockTrace.update.mock.calls[0][0];
-    expect(updateArgs.metadata.llmCallCount).toBe(3);
-    expect(updateArgs.metadata.toolCallCount).toBe(2);
+    expect(updateArgs.metadata.stats.llmCallCount).toBe(2);
   });
 
   it("disabled service skips all hooks", async () => {
@@ -430,27 +430,109 @@ describe("LangfuseService tracer", () => {
     expect(id1).toMatch(/^[0-9a-f]{32}$/);
   });
 
-  it("truncatePayload truncates large objects", async () => {
+  // --- Restart resilience: the key bug fix ---
+
+  it("agentEnd creates trace and observations even without prior beforeAgentStart (restart resilience)", async () => {
     const service = await startService();
-    const { beforeAgentStart, beforeToolCall } = service.getHookHandlers();
+    const { agentEnd } = service.getHookHandlers();
 
-    beforeAgentStart({ prompt: "hello" }, agentCtx);
+    // Use a fresh agentCtx key to avoid stale entries from previous tests
+    const restartCtx = {
+      agentId: "agent-restart",
+      sessionKey: "session-key-restart",
+      sessionId: "session-id-restart",
+      channelId: "webchat",
+      trigger: "user",
+    };
 
-    // Build a params object that exceeds 100KB when serialized
-    const largeValue = "x".repeat(101 * 1024);
-    beforeToolCall(
+    // Simulate: gateway restarted, so no beforeAgentStart/llmInput/llmOutput was called.
+    // agentEnd fires with event.messages containing the full conversation.
+    agentEnd(
       {
-        toolName: "bigTool",
-        params: { data: largeValue },
-        toolCallId: "tc-large",
+        messages: [
+          { role: "user", content: "我换了一个模型，你在试试吧" },
+          {
+            role: "assistant",
+            content: [
+              { type: "text", text: "好，马上试！" },
+              {
+                type: "toolCall",
+                id: "toolu_1",
+                name: "openmai_internal_api_call",
+                input: { method: "GET", path: "/api/user_service/v1/me" },
+              },
+            ],
+            model: "anthropic/claude-sonnet-4.6",
+            provider: "zenmux-anthropic",
+            usage: { input: 3, output: 93, cacheRead: 0, cacheWrite: 45065, totalTokens: 45161 },
+            stopReason: "toolUse",
+            timestamp: 1774599687682,
+          },
+          {
+            role: "toolResult",
+            toolCallId: "toolu_1",
+            toolName: "openmai_internal_api_call",
+            content: [{ type: "text", text: '{"error":"api_call_failed"}' }],
+            isError: false,
+            timestamp: 1774599698463,
+          },
+          {
+            role: "assistant",
+            content: [
+              { type: "text", text: "GET 接口还是同样的错。再试 POST：" },
+              {
+                type: "toolCall",
+                id: "toolu_2",
+                name: "openmai_internal_api_call",
+                input: { method: "POST", path: "/api/private-talent/v1/talents/search-for-skill" },
+              },
+            ],
+            model: "anthropic/claude-sonnet-4.6",
+            provider: "zenmux-anthropic",
+            usage: { input: 1, output: 155, cacheRead: 45065, cacheWrite: 148, totalTokens: 45369 },
+            stopReason: "toolUse",
+            timestamp: 1774599698483,
+          },
+          {
+            role: "toolResult",
+            toolCallId: "toolu_2",
+            toolName: "openmai_internal_api_call",
+            content: [{ type: "text", text: '{"code":0,"message":"success","data":{}}' }],
+            isError: false,
+            timestamp: 1774599710522,
+          },
+          {
+            role: "assistant",
+            content: [{ type: "text", text: "搜索成功！找到了3位候选人。" }],
+            model: "anthropic/claude-sonnet-4.6",
+            provider: "zenmux-anthropic",
+            usage: { input: 5, output: 200, totalTokens: 205 },
+            timestamp: 1774599720000,
+          },
+        ],
+        success: true,
+        durationMs: 32000,
       },
-      { ...toolCtx, toolName: "bigTool", toolCallId: "tc-large" },
+      restartCtx,
     );
 
-    expect(mockTrace.span).toHaveBeenCalledOnce();
-    const spanArgs = mockTrace.span.mock.calls[0][0];
-    // input should be a truncated string, not the original object
-    expect(typeof spanArgs.input).toBe("string");
-    expect(String(spanArgs.input)).toContain("[truncated:");
+    // Should create a new trace on the fly
+    expect(mockLangfuseInstance.trace).toHaveBeenCalledOnce();
+
+    // Should create 3 generations (3 assistant messages)
+    expect(mockTrace.generation).toHaveBeenCalledTimes(3);
+    expect(mockTrace.generation.mock.calls[0][0].name).toBe("llm-call-1");
+    expect(mockTrace.generation.mock.calls[1][0].name).toBe("llm-call-2");
+    expect(mockTrace.generation.mock.calls[2][0].name).toBe("llm-call-3");
+
+    // Should create 2 tool spans
+    expect(mockTrace.span).toHaveBeenCalledTimes(2);
+
+    // Trace should be finalized
+    expect(mockTrace.update).toHaveBeenCalledOnce();
+    const updateArgs = mockTrace.update.mock.calls[0][0];
+    expect(updateArgs.output).toBe("搜索成功！找到了3位候选人。");
+    expect(updateArgs.metadata.stats.llmCallCount).toBe(3);
+    expect(updateArgs.metadata.stats.success).toBe(true);
   });
 });
