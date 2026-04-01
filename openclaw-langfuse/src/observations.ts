@@ -97,8 +97,7 @@ export function buildObservationsFromEntries(
     total: number;
   };
 } {
-  const { entryTimestamp, systemPrompt, storedUsage, promptClient, pendingSpans, redactEnabled } =
-    options;
+  const { entryTimestamp, storedUsage, promptClient, pendingSpans, redactEnabled } = options;
 
   let llmCallCount = 0;
   let toolCallCount = 0;
@@ -128,15 +127,15 @@ export function buildObservationsFromEntries(
       const output = buildGenerationOutput(msg.content, redactEnabled);
 
       // Build generation input matching LLM API structure: {model, messages}
-      // Use ALL session entries up to this assistant message as input
-      const fullSystemPrompt = systemPrompt ?? "";
-      const systemMessage = fullSystemPrompt ? [{ role: "system", content: fullSystemPrompt }] : [];
+      // Use ALL session entries up to this assistant message as input.
+      // System prompt is recorded once at trace level (metadata.system_prompt),
+      // not duplicated in each generation input.
       const allPriorEntries = allEntries.slice(0, allEntries.indexOf(te));
       const accumulatedMessages = allPriorEntries.map((e) => buildApiMessage(e.message));
       const genInput = redactObject(
         {
           model: String(msg.model ?? options.lastModel ?? "unknown"),
-          messages: [...systemMessage, ...accumulatedMessages],
+          messages: accumulatedMessages,
         },
         redactEnabled,
       );

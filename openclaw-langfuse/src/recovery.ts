@@ -3,13 +3,64 @@ import path from "node:path";
 import type Langfuse from "langfuse";
 import { buildObservationsFromEntries } from "./observations.js";
 import { redactText } from "./redact.js";
-import { readSessionMessages, writeTraceMarker } from "./session.js";
+import { readSessionMessages, resolveMarkerFilePath, writeTraceMarker } from "./session.js";
 import type { IncompleteTraceInfo, MinimalLogger } from "./types.js";
 import { extractUserMessageText, filterCurrentTurnEntries } from "./utils.js";
 
 /**
+ * Parse trace markers from raw file content.
+ * Returns sets of started and ended traceIds.
+ */
+function parseMarkers(raw: string): { starts: Set<string>; ends: Set<string> } {
+  const MARKER_KEYWORD = "langfuse-trace-";
+  const starts = new Set<string>();
+  const ends = new Set<string>();
+  for (const line of raw.split("\n")) {
+    if (!line.includes(MARKER_KEYWORD)) {
+      continue;
+    }
+    try {
+      const parsed = JSON.parse(line);
+      if (parsed?.type === "custom" && parsed?.data?.traceId) {
+        if (parsed.customType === "langfuse-trace-start") {
+          starts.add(String(parsed.data.traceId));
+        } else if (parsed.customType === "langfuse-trace-end") {
+          ends.add(String(parsed.data.traceId));
+        }
+      }
+    } catch {
+      /* ignore malformed lines */
+    }
+  }
+  return { starts, ends };
+}
+
+/**
+ * Read file content, optionally reading only the tail for large files.
+ */
+function readFileOrTail(filePath: string, tailBytes: number): string | null {
+  try {
+    const stat = fs.statSync(filePath);
+    if (stat.size <= tailBytes) {
+      return fs.readFileSync(filePath, "utf-8");
+    }
+    const fd = fs.openSync(filePath, "r");
+    const buf = Buffer.alloc(tailBytes);
+    fs.readSync(fd, buf, 0, tailBytes, stat.size - tailBytes);
+    fs.closeSync(fd);
+    const str = buf.toString("utf-8");
+    const firstNewline = str.indexOf("\n");
+    return firstNewline >= 0 ? str.slice(firstNewline + 1) : str;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Scan stateDir for incomplete traces (have trace-start but no trace-end).
- * Only processes JSONL files modified in the last 24 hours.
+ * Prioritizes sidecar `.langfuse-markers.jsonl` files; falls back to scanning
+ * session JSONL for backward compatibility with old embedded markers.
+ * Only processes files modified in the last 24 hours.
  */
 export function scanIncompleteTraces(stateDir: string): IncompleteTraceInfo[] {
   const agentsDir = path.join(stateDir, "agents");
@@ -19,6 +70,7 @@ export function scanIncompleteTraces(stateDir: string): IncompleteTraceInfo[] {
 
   const cutoff = Date.now() - 24 * 60 * 60 * 1000;
   const results: IncompleteTraceInfo[] = [];
+  const TAIL_BYTES = 64 * 1024;
 
   let agentDirs: string[];
   try {
@@ -33,17 +85,36 @@ export function scanIncompleteTraces(stateDir: string): IncompleteTraceInfo[] {
       continue;
     }
 
-    let sessionFiles: string[];
+    let allFiles: string[];
     try {
-      sessionFiles = fs.readdirSync(sessionsDir).filter((f) => f.endsWith(".jsonl"));
+      allFiles = fs.readdirSync(sessionsDir);
     } catch {
       continue;
     }
 
-    for (const file of sessionFiles) {
-      const filePath = path.join(sessionsDir, file);
+    // Collect session IDs from both sidecar and session JSONL files
+    const sidecarFiles = new Set<string>();
+    const sessionFiles = new Set<string>();
+    for (const f of allFiles) {
+      if (f.endsWith(".langfuse-markers.jsonl")) {
+        sidecarFiles.add(f.replace(/\.langfuse-markers\.jsonl$/, ""));
+      } else if (f.endsWith(".jsonl")) {
+        sessionFiles.add(f.replace(/\.jsonl$/, ""));
+      }
+    }
+
+    // All session IDs to check (sidecar takes priority, fallback to session JSONL)
+    const allSessionIds = new Set([...sidecarFiles, ...sessionFiles]);
+
+    for (const sessionId of allSessionIds) {
+      const hasSidecar = sidecarFiles.has(sessionId);
+      const markerSourceFile = hasSidecar
+        ? path.join(sessionsDir, `${sessionId}.langfuse-markers.jsonl`)
+        : path.join(sessionsDir, `${sessionId}.jsonl`);
+      const sessionJsonlPath = path.join(sessionsDir, `${sessionId}.jsonl`);
+
       try {
-        const stat = fs.statSync(filePath);
+        const stat = fs.statSync(markerSourceFile);
         if (stat.mtimeMs < cutoff) {
           continue;
         }
@@ -51,59 +122,18 @@ export function scanIncompleteTraces(stateDir: string): IncompleteTraceInfo[] {
         continue;
       }
 
-      // Scan for trace markers efficiently. JSONL files can be very large (hundreds of MB
-      // for long sessions). Markers are short lines (~120 bytes) appended at turn boundaries.
-      // Strategy: read only the last TAIL_BYTES of the file — this covers all recent turns
-      // while avoiding loading the entire file into memory.
-      const MARKER_KEYWORD = "langfuse-trace-";
-      const TAIL_BYTES = 64 * 1024; // 64KB tail — covers many turns of markers
-      let raw: string;
-      try {
-        const stat = fs.statSync(filePath);
-        if (stat.size <= TAIL_BYTES) {
-          raw = fs.readFileSync(filePath, "utf-8");
-        } else {
-          // Read only the tail of the file
-          const fd = fs.openSync(filePath, "r");
-          const buf = Buffer.alloc(TAIL_BYTES);
-          fs.readSync(fd, buf, 0, TAIL_BYTES, stat.size - TAIL_BYTES);
-          fs.closeSync(fd);
-          // Skip first partial line (we may have landed mid-line)
-          const str = buf.toString("utf-8");
-          const firstNewline = str.indexOf("\n");
-          raw = firstNewline >= 0 ? str.slice(firstNewline + 1) : str;
-        }
-      } catch {
+      const raw = readFileOrTail(markerSourceFile, TAIL_BYTES);
+      if (!raw) {
         continue;
       }
 
-      const starts = new Set<string>();
-      const ends = new Set<string>();
+      const { starts, ends } = parseMarkers(raw);
 
-      // Fast scan: only JSON.parse lines that contain the marker keyword
-      for (const line of raw.split("\n")) {
-        if (!line.includes(MARKER_KEYWORD)) {
-          continue;
-        }
-        try {
-          const parsed = JSON.parse(line);
-          if (parsed?.type === "custom" && parsed?.data?.traceId) {
-            if (parsed.customType === "langfuse-trace-start") {
-              starts.add(String(parsed.data.traceId));
-            } else if (parsed.customType === "langfuse-trace-end") {
-              ends.add(String(parsed.data.traceId));
-            }
-          }
-        } catch {
-          /* ignore malformed lines */
-        }
-      }
-
-      // Find traces that started but never ended
-      const sessionId = file.replace(/\.jsonl$/, "");
+      // If using sidecar but no markers found, skip (don't fallback for empty sidecars)
+      // If using session JSONL fallback, markers were already parsed from it
       for (const traceId of starts) {
         if (!ends.has(traceId)) {
-          results.push({ traceId, agentId, sessionId, jsonlPath: filePath });
+          results.push({ traceId, agentId, sessionId, jsonlPath: sessionJsonlPath });
         }
       }
     }
@@ -131,10 +161,44 @@ export async function recoverTrace(
     return 0;
   }
 
-  // Find entries belonging to this trace: everything after the trace-start marker
-  // We need to re-read the raw file to find the trace-start marker timestamp,
-  // then filter entries that come after it.
+  // Find entries belonging to this trace: everything after the trace-start marker.
+  // First try to read trace-start timestamp from sidecar marker file,
+  // then fall back to scanning the session JSONL for old embedded markers.
   let traceStartIdx = -1;
+  let traceStartTimestamp: number | undefined;
+
+  // Try sidecar file first
+  const sidecarPath = resolveMarkerFilePath(stateDir ?? "", agentId, sessionId);
+  let foundInSidecar = false;
+  try {
+    const sidecarRaw = fs.readFileSync(sidecarPath, "utf-8");
+    for (const line of sidecarRaw.split(/\r?\n/)) {
+      if (!line.trim()) {
+        continue;
+      }
+      try {
+        const parsed = JSON.parse(line);
+        if (
+          parsed?.type === "custom" &&
+          parsed?.customType === "langfuse-trace-start" &&
+          parsed?.data?.traceId === traceId
+        ) {
+          if (typeof parsed.timestamp === "string") {
+            traceStartTimestamp = Date.parse(parsed.timestamp);
+          } else if (typeof parsed.timestamp === "number") {
+            traceStartTimestamp = parsed.timestamp;
+          }
+          foundInSidecar = true;
+          break;
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+  } catch {
+    /* sidecar not found — fall through to JSONL scan */
+  }
+
   // Re-read raw JSONL to find trace-start position relative to message entries
   let raw: string;
   try {
@@ -143,10 +207,8 @@ export async function recoverTrace(
     return 0;
   }
 
-  // Find the line index of the trace-start marker to determine which entries belong to this trace
   const lines = raw.split(/\r?\n/);
   let messageLineIdx = 0;
-  let traceStartTimestamp: number | undefined;
   for (const line of lines) {
     if (!line.trim()) {
       continue;
@@ -158,11 +220,13 @@ export async function recoverTrace(
         parsed?.customType === "langfuse-trace-start" &&
         parsed?.data?.traceId === traceId
       ) {
-        // Record timestamp of trace-start marker
-        if (typeof parsed.timestamp === "string") {
-          traceStartTimestamp = Date.parse(parsed.timestamp);
-        } else if (typeof parsed.timestamp === "number") {
-          traceStartTimestamp = parsed.timestamp;
+        // Found old embedded marker — use its timestamp if sidecar didn't have one
+        if (!foundInSidecar) {
+          if (typeof parsed.timestamp === "string") {
+            traceStartTimestamp = Date.parse(parsed.timestamp);
+          } else if (typeof parsed.timestamp === "number") {
+            traceStartTimestamp = parsed.timestamp;
+          }
         }
         traceStartIdx = messageLineIdx;
       } else if (parsed?.message) {
@@ -170,6 +234,21 @@ export async function recoverTrace(
       }
     } catch {
       /* ignore */
+    }
+  }
+
+  // If marker was in sidecar but not in JSONL, use timestamp to find position
+  if (foundInSidecar && traceStartIdx < 0 && traceStartTimestamp) {
+    // Find the first message entry at or after the trace-start timestamp
+    for (let i = 0; i < allEntries.length; i++) {
+      if (allEntries[i].timestamp >= traceStartTimestamp) {
+        traceStartIdx = i;
+        break;
+      }
+    }
+    // If no message after timestamp, use all entries
+    if (traceStartIdx < 0) {
+      traceStartIdx = 0;
     }
   }
 

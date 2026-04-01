@@ -57,7 +57,7 @@ export type LangfuseServiceHookHandlers = {
   llmOutput: (event: LlmOutputEvent, ctx: AgentCtx) => void;
   beforeToolCall: (event: BeforeToolCallEvent, ctx: ToolCtx) => void;
   afterToolCall: (event: AfterToolCallEvent, ctx: ToolCtx) => void;
-  agentEnd: (event: AgentEndEvent, ctx: AgentCtx) => void;
+  agentEnd: (event: AgentEndEvent, ctx: AgentCtx) => void | Promise<void>;
   sessionEnd: (event: SessionEndEvent, ctx: SessionCtx) => void;
 };
 
@@ -363,7 +363,7 @@ export function createLangfuseService(
     afterToolCall(): void {},
 
     // agent_end: create per-LLM-call generations from JSONL and finalize the trace
-    agentEnd(event: AgentEndEvent, ctx: AgentCtx): void {
+    async agentEnd(event: AgentEndEvent, ctx: AgentCtx): Promise<void> {
       if (disabled || !langfuse || !contextMap) {
         return;
       }
@@ -523,6 +523,10 @@ export function createLangfuseService(
               ? { provider: obsResult.lastProvider, model: obsResult.lastModel }
               : undefined,
           prompt: entry.promptMatch,
+          // Store system prompt once at trace level (not in each generation)
+          system_prompt: entry.systemPrompt
+            ? redactText(entry.systemPrompt, redactEnabled)
+            : undefined,
         },
         ...(event.error
           ? {
@@ -535,7 +539,18 @@ export function createLangfuseService(
       // Mark as finalized instead of deleting — diagnostic events may still arrive
       // but should not overwrite our clean metadata structure.
       entry.finalized = true;
-      writeTraceMarker(serviceStateDir, agentId, sessionId, "end", entry.traceId, serviceLogger);
+
+      // Flush observations to Langfuse before writing end marker.
+      // End marker means "data confirmed delivered" — if flush fails,
+      // skip the marker so startup recovery can rebuild the trace.
+      try {
+        await langfuse.flushAsync();
+        writeTraceMarker(serviceStateDir, agentId, sessionId, "end", entry.traceId, serviceLogger);
+      } catch (flushErr: unknown) {
+        serviceLogger?.warn?.(
+          `Langfuse: flushAsync failed in agentEnd (traceId=${entry.traceId}), skipping end marker — ${String(flushErr)}`,
+        );
+      }
     },
 
     // session_end: log session metadata
