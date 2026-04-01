@@ -63,7 +63,22 @@ export function readSessionMessages(
 }
 
 /**
- * Append a langfuse trace lifecycle marker to the session JSONL file.
+ * Resolve the path to the sidecar marker file for a session.
+ * Markers are stored separately from the session JSONL to avoid breaking
+ * SessionManager's parentId DAG chain.
+ */
+export function resolveMarkerFilePath(
+  stateDir: string,
+  agentId: string,
+  sessionId: string,
+): string {
+  return path.join(stateDir, "agents", agentId, "sessions", `${sessionId}.langfuse-markers.jsonl`);
+}
+
+/**
+ * Append a langfuse trace lifecycle marker to a sidecar file.
+ * Written to `{sessionId}.langfuse-markers.jsonl` (NOT the session JSONL)
+ * so the SessionManager parentId DAG chain stays intact.
  * Used by startup recovery to detect incomplete traces.
  * Non-fatal: errors are logged as warnings only.
  */
@@ -78,13 +93,17 @@ export function writeTraceMarker(
   if (!stateDir || !sessionId) {
     return;
   }
-  const sessionFile = path.join(stateDir, "agents", agentId, "sessions", `${sessionId}.jsonl`);
+  const markerFile = resolveMarkerFilePath(stateDir, agentId, sessionId);
   const line = `{"type":"custom","customType":"langfuse-trace-${type}","data":{"traceId":"${traceId}"},"timestamp":"${new Date().toISOString()}"}\n`;
   try {
-    fs.appendFileSync(sessionFile, line);
+    const dir = path.dirname(markerFile);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    fs.appendFileSync(markerFile, line);
   } catch (err: unknown) {
     logger?.warn?.(
-      `Langfuse: failed to write trace marker (${type}) to ${sessionFile} — ${String(err)}`,
+      `Langfuse: failed to write trace marker (${type}) to ${markerFile} — ${String(err)}`,
     );
   }
 }
