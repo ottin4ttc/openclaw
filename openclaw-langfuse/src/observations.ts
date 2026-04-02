@@ -10,6 +10,7 @@ import {
   extractTextContent,
   generateObservationId,
   hasNonZeroUsage,
+  isToolCallBlock,
   qualifiedModel,
   truncatePayload,
 } from "./utils.js";
@@ -27,7 +28,7 @@ export function createToolSpansFromMessages(
     if (m.role === "assistant" && Array.isArray(m.content)) {
       for (const block of m.content) {
         const b = block as Record<string, unknown> | null;
-        if (!b || b.type !== "toolCall") {
+        if (!isToolCallBlock(b)) {
           continue;
         }
 
@@ -39,7 +40,7 @@ export function createToolSpansFromMessages(
           return rm.role === "toolResult" && rm.toolCallId === b.id;
         }) as Record<string, unknown> | undefined;
 
-        const toolInput = truncatePayload(b.input ?? b.args);
+        const toolInput = truncatePayload(b.input ?? b.args ?? b.arguments);
         const toolOutput = toolResultMsg ? extractTextContent(toolResultMsg.content) : undefined;
 
         entry.trace.span({
@@ -185,15 +186,24 @@ export function buildObservationsFromEntries(
         input: truncatePayload(genInput),
         output: truncatePayload(output),
         usageDetails: genUsage as Record<string, number> | undefined,
-        ...(msgUsage?.cost && typeof msgUsage.cost === "object"
-          ? {
-              costDetails: {
-                input: (msgUsage.cost as Record<string, number>).input ?? 0,
-                output: (msgUsage.cost as Record<string, number>).output ?? 0,
-                total: (msgUsage.cost as Record<string, number>).total ?? 0,
-              },
-            }
-          : {}),
+        ...(() => {
+          const batchCostObj = msgUsage?.cost as Record<string, number> | undefined;
+          const batchHasRealCost =
+            batchCostObj &&
+            typeof batchCostObj === "object" &&
+            ((batchCostObj.input ?? 0) > 0 ||
+              (batchCostObj.output ?? 0) > 0 ||
+              (batchCostObj.total ?? 0) > 0);
+          return batchHasRealCost
+            ? {
+                costDetails: {
+                  input: batchCostObj.input ?? 0,
+                  output: batchCostObj.output ?? 0,
+                  total: batchCostObj.total ?? 0,
+                },
+              }
+            : {};
+        })(),
         metadata: {
           provider,
           model: msg.model,
@@ -251,7 +261,7 @@ export function buildObservationsFromEntries(
       const msg = te.message;
       if (msg.role === "assistant" && Array.isArray(msg.content)) {
         for (const block of msg.content as Record<string, unknown>[]) {
-          if (block?.type === "toolCall" && block.id) {
+          if (isToolCallBlock(block) && block.id) {
             const id = String(block.id);
             const existing = toolMap.get(id) ?? {};
             existing.callTs = te.timestamp;

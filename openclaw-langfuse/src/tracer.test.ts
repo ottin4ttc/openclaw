@@ -1,7 +1,9 @@
 import type { PluginLogger, OpenClawPluginServiceContext } from "openclaw/plugin-sdk";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import type { LangfusePluginConfig } from "./config.js";
+import { computeCorrectedStartTimes } from "./finalize.js";
 import { createLangfuseService, generateTraceId } from "./service.js";
+import type { SessionEntry } from "./types.js";
 
 // ---------------------------------------------------------------------------
 // Mock the langfuse SDK — use vi.hoisted so refs are available inside factory
@@ -110,7 +112,7 @@ describe("LangfuseService tracer", () => {
     expect(traceArgs.metadata.agentId).toBe(agentCtx.agentId);
   });
 
-  it("llmInput stores data without creating generation", async () => {
+  it("llmInput creates generation incrementally", async () => {
     const service = await startService();
     const { beforeAgentStart, llmInput } = service.getHookHandlers();
 
@@ -129,15 +131,19 @@ describe("LangfuseService tracer", () => {
       agentCtx,
     );
 
-    // llmInput no longer creates generations directly — they are created in agentEnd
-    expect(mockTrace.generation).not.toHaveBeenCalled();
+    // llmInput now creates generation immediately for real-time Langfuse display
+    expect(mockTrace.generation).toHaveBeenCalledOnce();
+    const genArgs = mockTrace.generation.mock.calls[0][0];
+    expect(genArgs.name).toBe("llm-call-1");
+    expect(genArgs.model).toBe("anthropic/claude-3-5-sonnet");
   });
 
-  it("agentEnd creates generation from event.messages", async () => {
+  it("llmInput creates and llmOutput updates generation incrementally", async () => {
     const service = await startService();
     const { beforeAgentStart, llmInput, llmOutput, agentEnd } = service.getHookHandlers();
+    const ctx2 = { ...agentCtx, sessionKey: "session-key-incr" };
 
-    beforeAgentStart({ prompt: "hello" }, agentCtx);
+    beforeAgentStart({ prompt: "hello" }, ctx2);
     llmInput(
       {
         runId: "run-1",
@@ -149,8 +155,16 @@ describe("LangfuseService tracer", () => {
         historyMessages: [],
         imagesCount: 0,
       },
-      agentCtx,
+      ctx2,
     );
+
+    // Generation created in llmInput
+    expect(mockTrace.generation).toHaveBeenCalled();
+    const lastGenCall =
+      mockTrace.generation.mock.calls[mockTrace.generation.mock.calls.length - 1][0];
+    expect(lastGenCall.name).toBe("llm-call-1");
+    expect(lastGenCall.model).toBe("anthropic/claude-3-5-sonnet");
+
     llmOutput(
       {
         runId: "run-1",
@@ -160,9 +174,17 @@ describe("LangfuseService tracer", () => {
         assistantTexts: ["The answer is 4."],
         usage: { input: 10, output: 8, total: 18 },
       },
-      agentCtx,
+      ctx2,
     );
-    agentEnd(
+
+    // Generation updated in llmOutput (output deferred to agentEnd/finalize)
+    const genClient =
+      mockTrace.generation.mock.results[mockTrace.generation.mock.results.length - 1].value;
+    expect(genClient.update).toHaveBeenCalledOnce();
+    const updateArgs = genClient.update.mock.calls[0][0];
+    expect(updateArgs.output).toBeUndefined(); // output set by finalize from JSONL, not llmOutput
+
+    await agentEnd(
       {
         messages: [
           { role: "user", content: "What is 2+2?" },
@@ -177,22 +199,17 @@ describe("LangfuseService tracer", () => {
         success: true,
         durationMs: 1234,
       },
-      agentCtx,
+      ctx2,
     );
-
-    // Generation created from event.messages in agentEnd
-    expect(mockTrace.generation).toHaveBeenCalledOnce();
-    const genArgs = mockTrace.generation.mock.calls[0][0];
-    expect(genArgs.name).toBe("llm-call-1");
-    expect(genArgs.model).toBe("anthropic/claude-3-5-sonnet");
   });
 
   it("agentEnd creates tool spans from event.messages", async () => {
     const service = await startService();
     const { beforeAgentStart, agentEnd } = service.getHookHandlers();
+    const ctx3 = { ...agentCtx, sessionKey: "session-key-toolspan" };
 
-    beforeAgentStart({ prompt: "hello" }, agentCtx);
-    agentEnd(
+    beforeAgentStart({ prompt: "hello" }, ctx3);
+    await agentEnd(
       {
         messages: [
           { role: "user", content: "Read the file" },
@@ -229,14 +246,20 @@ describe("LangfuseService tracer", () => {
         success: true,
         durationMs: 2000,
       },
-      agentCtx,
+      ctx3,
     );
 
-    // 2 generations (2 assistant messages) + 1 tool span
-    expect(mockTrace.generation).toHaveBeenCalledTimes(2);
-    expect(mockTrace.span).toHaveBeenCalledOnce();
-    const spanArgs = mockTrace.span.mock.calls[0][0];
-    expect(spanArgs.name).toBe("tool:readFile");
+    // 2 generations (2 assistant messages) + 1 tool span (via useBatchCreation path)
+    const genCalls = mockTrace.generation.mock.calls.filter((c: unknown[]) =>
+      (c[0] as Record<string, unknown>).name?.toString().startsWith("llm-call-"),
+    );
+    expect(genCalls.length).toBeGreaterThanOrEqual(2);
+    expect(mockTrace.span).toHaveBeenCalled();
+    const spanCalls = mockTrace.span.mock.calls;
+    const readSpan = spanCalls.find(
+      (c: unknown[]) => (c[0] as Record<string, unknown>).name === "tool:readFile",
+    );
+    expect(readSpan).toBeDefined();
   });
 
   it("finalizes trace on agent_end with structured metadata", async () => {
@@ -244,7 +267,7 @@ describe("LangfuseService tracer", () => {
     const { beforeAgentStart, agentEnd } = service.getHookHandlers();
 
     beforeAgentStart({ prompt: "hello" }, agentCtx);
-    agentEnd(
+    await agentEnd(
       {
         messages: [
           { role: "user", content: "What is 2+2?" },
@@ -333,7 +356,7 @@ describe("LangfuseService tracer", () => {
     );
 
     // agentEnd with full message history creates all observations
-    agentEnd(
+    await agentEnd(
       {
         messages: [
           { role: "user", content: "Do some work" },
@@ -412,7 +435,7 @@ describe("LangfuseService tracer", () => {
     );
     beforeToolCall({ toolName: "t", params: {}, toolCallId: "tc-1" }, toolCtx);
     afterToolCall({ toolName: "t", params: {}, toolCallId: "tc-1" }, toolCtx);
-    agentEnd({ messages: [], success: true }, agentCtx);
+    await agentEnd({ messages: [], success: true }, agentCtx);
 
     expect(mockLangfuseInstance.trace).not.toHaveBeenCalled();
     expect(mockTrace.generation).not.toHaveBeenCalled();
@@ -447,7 +470,7 @@ describe("LangfuseService tracer", () => {
 
     // Simulate: gateway restarted, so no beforeAgentStart/llmInput/llmOutput was called.
     // agentEnd fires with event.messages containing the full conversation.
-    agentEnd(
+    await agentEnd(
       {
         messages: [
           { role: "user", content: "我换了一个模型，你在试试吧" },
@@ -534,5 +557,228 @@ describe("LangfuseService tracer", () => {
     expect(updateArgs.output).toBe("搜索成功！找到了3位候选人。");
     expect(updateArgs.metadata.stats.llmCallCount).toBe(3);
     expect(updateArgs.metadata.stats.success).toBe(true);
+  });
+
+  it("finalize rebuilds tool_use output from JSONL (not null)", async () => {
+    const service = await startService();
+    const { beforeAgentStart, llmInput, llmOutput, agentEnd } = service.getHookHandlers();
+    const ctx = { ...agentCtx, sessionKey: "session-key-tooluse-output" };
+
+    beforeAgentStart({ prompt: "search" }, ctx);
+    llmInput(
+      {
+        runId: "run-tu",
+        sessionId: "s1",
+        provider: "anthropic",
+        model: "claude-sonnet-4.6",
+        prompt: "search",
+        historyMessages: [],
+        imagesCount: 0,
+      },
+      ctx,
+    );
+    // llmOutput with no lastAssistant (simulates tool_use where assistantTexts is empty)
+    llmOutput(
+      {
+        runId: "run-tu",
+        sessionId: "s1",
+        provider: "anthropic",
+        model: "claude-sonnet-4.6",
+        assistantTexts: [],
+        usage: { input: 3, output: 114, total: 96563 },
+      },
+      ctx,
+    );
+
+    await agentEnd(
+      {
+        messages: [
+          { role: "user", content: "search something" },
+          {
+            role: "assistant",
+            content: [
+              {
+                type: "toolCall",
+                id: "tc-ws",
+                name: "omb_web_search",
+                arguments: { query: "test query", max_results: 5 },
+              },
+            ],
+            model: "claude-sonnet-4.6",
+            provider: "anthropic",
+            usage: { input: 3, output: 114, totalTokens: 96563 },
+            stopReason: "toolUse",
+            timestamp: Date.now(),
+          },
+          {
+            role: "toolResult",
+            toolCallId: "tc-ws",
+            toolName: "omb_web_search",
+            content: [{ type: "text", text: "search results" }],
+            timestamp: Date.now() + 5000,
+          },
+          {
+            role: "assistant",
+            content: [{ type: "text", text: "Here are the results." }],
+            model: "claude-sonnet-4.6",
+            provider: "anthropic",
+            usage: { input: 1, output: 50, totalTokens: 51 },
+            timestamp: Date.now() + 10000,
+          },
+        ],
+        success: true,
+        durationMs: 15000,
+      },
+      ctx,
+    );
+
+    // The first generation (tool_use) should have its output rebuilt from JSONL
+    const genClient = mockTrace.generation.mock.results[0].value;
+    const updateCalls = genClient.update.mock.calls;
+    // Find the finalize update that sets output with tool_calls (not the llmOutput string update)
+    const outputUpdate = updateCalls.find((c: unknown[]) => {
+      const out = (c[0] as Record<string, unknown>).output;
+      return out && typeof out === "object" && (out as Record<string, unknown>).tool_calls;
+    });
+    expect(outputUpdate).toBeDefined();
+    const output = (outputUpdate![0] as Record<string, unknown>).output as Record<string, unknown>;
+    expect(output.tool_calls).toBeDefined();
+    expect((output.tool_calls as unknown[]).length).toBe(1);
+  });
+
+  it("finalize does not send zero costDetails", async () => {
+    const service = await startService();
+    const { beforeAgentStart, llmInput, llmOutput, agentEnd } = service.getHookHandlers();
+    const ctx = { ...agentCtx, sessionKey: "session-key-zero-cost" };
+
+    beforeAgentStart({ prompt: "hello" }, ctx);
+    llmInput(
+      {
+        runId: "run-zc",
+        sessionId: "s1",
+        provider: "zenmux",
+        model: "claude-sonnet-4.6",
+        prompt: "hello",
+        historyMessages: [],
+        imagesCount: 0,
+      },
+      ctx,
+    );
+    llmOutput(
+      {
+        runId: "run-zc",
+        sessionId: "s1",
+        provider: "zenmux",
+        model: "claude-sonnet-4.6",
+        assistantTexts: ["Hi there"],
+        usage: { input: 10, output: 5, total: 15 },
+      },
+      ctx,
+    );
+
+    await agentEnd(
+      {
+        messages: [
+          { role: "user", content: "hello" },
+          {
+            role: "assistant",
+            content: [{ type: "text", text: "Hi there" }],
+            model: "claude-sonnet-4.6",
+            provider: "zenmux",
+            usage: {
+              input: 10,
+              output: 5,
+              totalTokens: 15,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+            },
+            timestamp: Date.now(),
+          },
+        ],
+        success: true,
+        durationMs: 1000,
+      },
+      ctx,
+    );
+
+    // The generation update from finalize should NOT include costDetails
+    const genClient = mockTrace.generation.mock.results[0].value;
+    const updateCalls = genClient.update.mock.calls;
+    for (const call of updateCalls) {
+      const args = call[0] as Record<string, unknown>;
+      if (args.costDetails) {
+        // If costDetails is present, it must have non-zero values
+        const cd = args.costDetails as Record<string, number>;
+        expect(cd.input > 0 || cd.output > 0 || cd.total > 0).toBe(true);
+      }
+    }
+  });
+
+  it("computeCorrectedStartTimes places gen-2 after tool results", () => {
+    const entryTimestamp = 1000;
+    const turnEntries = [
+      { timestamp: 1000, message: { role: "user", content: "hello" } },
+      {
+        timestamp: 1100,
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "ok" }],
+          stopReason: "toolUse",
+        },
+      },
+      {
+        timestamp: 1200,
+        message: { role: "toolResult", toolCallId: "tc-1", content: "result1", timestamp: 1200 },
+      },
+      {
+        timestamp: 1500,
+        message: { role: "toolResult", toolCallId: "tc-2", content: "result2", timestamp: 1500 },
+      },
+      {
+        timestamp: 2000,
+        message: { role: "assistant", content: [{ type: "text", text: "done" }] },
+      },
+    ] as unknown as SessionEntry[];
+    const assistantMsgs = turnEntries.filter((e: SessionEntry) => e.message.role === "assistant");
+
+    const startTimes = computeCorrectedStartTimes(assistantMsgs, turnEntries, entryTimestamp);
+
+    // gen-1 starts at entry timestamp
+    expect(startTimes[0]).toBe(entryTimestamp);
+    // gen-2 starts after the last toolResult (1500), not before it
+    expect(startTimes[1]).toBe(1500);
+    expect(startTimes[1]!).toBeGreaterThan(1200);
+  });
+
+  it("beforeToolCall sets parentObservationId from currentGenerationId", async () => {
+    const service = await startService();
+    const { beforeAgentStart, llmInput, beforeToolCall } = service.getHookHandlers();
+    const ctx = { ...agentCtx, sessionKey: "session-key-parent-obs" };
+
+    beforeAgentStart({ prompt: "hello" }, ctx);
+    llmInput(
+      {
+        runId: "run-po",
+        sessionId: "s1",
+        provider: "anthropic",
+        model: "claude-sonnet-4.6",
+        prompt: "hello",
+        historyMessages: [],
+        imagesCount: 0,
+      },
+      ctx,
+    );
+
+    // Get the generation ID that was created
+    const genArgs = mockTrace.generation.mock.calls[0][0] as Record<string, unknown>;
+    const genId = genArgs.id;
+
+    beforeToolCall(
+      { toolName: "web_search", params: { query: "test" }, toolCallId: "tc-parent" },
+      { ...toolCtx, agentId: ctx.agentId, sessionKey: ctx.sessionKey, toolCallId: "tc-parent" },
+    );
+
+    // The span should have parentObservationId matching the generation
+    const spanArgs = mockTrace.span.mock.calls[0][0] as Record<string, unknown>;
+    expect(spanArgs.parentObservationId).toBe(genId);
   });
 });

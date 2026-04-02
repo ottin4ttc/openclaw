@@ -73,6 +73,17 @@ export function truncatePayload(obj: unknown): unknown {
 }
 
 /**
+ * Check if a content block is a tool call (OpenClaw `toolCall` or Anthropic API `tool_use`).
+ */
+export function isToolCallBlock(block: unknown): block is Record<string, unknown> {
+  if (!block || typeof block !== "object") {
+    return false;
+  }
+  const b = block as Record<string, unknown>;
+  return b.type === "toolCall" || b.type === "tool_use";
+}
+
+/**
  * Extract text content from a message content field.
  * Handles both plain string content and content-block arrays.
  */
@@ -133,7 +144,7 @@ export function extractConversation(messages: unknown[]): {
     // For assistant with toolCall, show tool calls
     if (role === "assistant" && Array.isArray(m.content)) {
       const toolCalls = (m.content as Record<string, unknown>[])
-        .filter((b) => b?.type === "toolCall")
+        .filter((b) => isToolCallBlock(b))
         .map((b) => ({ name: b.name, id: b.id }));
       if (toolCalls.length > 0) {
         return { role, toolCalls, text: text.length > 500 ? text.slice(0, 500) + "..." : text };
@@ -160,7 +171,7 @@ export function buildApiMessage(msg: SessionEntry["message"]): unknown {
     const textContent = extractTextContent(msg.content);
     if (Array.isArray(msg.content)) {
       const toolCalls = (msg.content as Record<string, unknown>[])
-        .filter((b) => b?.type === "toolCall")
+        .filter((b) => isToolCallBlock(b))
         .map((b) => ({
           id: b.id,
           type: "function",
@@ -212,11 +223,11 @@ export function extractLLMTurns(messages: unknown[]): Array<{
       const toolCalls: Array<{ name: string; id: string; input: unknown }> = [];
       if (Array.isArray(m.content)) {
         for (const block of m.content as Record<string, unknown>[]) {
-          if (block?.type === "toolCall") {
+          if (isToolCallBlock(block)) {
             toolCalls.push({
               name: String(block.name ?? "unknown"),
               id: String(block.id ?? ""),
-              input: block.input ?? block.args,
+              input: block.input ?? block.args ?? block.arguments,
             });
           }
         }
@@ -283,7 +294,7 @@ export function buildGenerationOutput(content: unknown, redactEnabled: boolean):
 
   if (Array.isArray(content)) {
     for (const block of content as Record<string, unknown>[]) {
-      if (block?.type === "toolCall") {
+      if (isToolCallBlock(block)) {
         toolCalls.push({
           id: block.id,
           type: "function",

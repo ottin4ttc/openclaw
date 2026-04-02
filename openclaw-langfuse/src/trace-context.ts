@@ -20,7 +20,10 @@ export type TraceContextEntry = {
   promptInjection?: { prepend?: string; append?: string }; // from Langfuse prompt injection
   promptClient?: unknown; // fetched Langfuse prompt client for generation linking
   pendingGenerations: Map<string, LangfuseGenerationClient>; // keyed by runId
+  pendingGenIds: Map<string, string>; // runId → deterministic genId (for sidecar events)
+  completedGenerations: Map<number, LangfuseGenerationClient>; // genIdx → client for usage correction
   pendingSpans: Map<string, LangfuseSpanClient>; // keyed by toolCallId
+  completedSpanToolCallIds: Set<string>; // toolCallIds completed by afterToolCall
   createdAt: number;
   timestamp: number; // agent turn start timestamp
   sessionId?: string; // needed to read JSONL in agent_end
@@ -37,6 +40,7 @@ export type TraceContextEntry = {
   lastProvider?: string;
   initialMessages?: unknown[]; // historyMessages from first llm_input call
   finalized?: boolean; // set by agent_end; prevents diagnostic handler from overwriting metadata
+  currentGenerationId?: string; // ID of the most recent generation, for parentObservationId on tool spans
 };
 
 const MAX_ENTRIES = 1000;

@@ -2,6 +2,16 @@ import fs from "node:fs";
 import path from "node:path";
 import type { SessionEntry, MinimalLogger } from "./types.js";
 
+// ---------------------------------------------------------------------------
+// Observation lifecycle event types for the sidecar ledger
+// ---------------------------------------------------------------------------
+
+export type ObservationEvent =
+  | { e: "gen-start"; traceId: string; id: string; llmCall: number; model: string; ts: string }
+  | { e: "gen-end"; traceId: string; id: string; ts: string }
+  | { e: "span-start"; traceId: string; id: string; tool: string; toolCallId: string; ts: string }
+  | { e: "span-end"; traceId: string; id: string; ts: string };
+
 /**
  * Read messages from a session JSONL file on disk.
  * Returns entries with timestamps so callers can derive accurate startTime/endTime.
@@ -106,4 +116,83 @@ export function writeTraceMarker(
       `Langfuse: failed to write trace marker (${type}) to ${markerFile} — ${String(err)}`,
     );
   }
+}
+
+/**
+ * Append an observation lifecycle event to the sidecar file.
+ * Used to track which observations have been created/completed for
+ * incremental display and crash recovery.
+ * Non-fatal: errors are logged as warnings only.
+ */
+export function writeObservationEvent(
+  stateDir: string | null,
+  agentId: string,
+  sessionId: string,
+  event: ObservationEvent,
+  logger?: MinimalLogger | null,
+): void {
+  if (!stateDir || !sessionId) {
+    return;
+  }
+  const markerFile = resolveMarkerFilePath(stateDir, agentId, sessionId);
+  try {
+    const dir = path.dirname(markerFile);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    fs.appendFileSync(markerFile, JSON.stringify(event) + "\n");
+  } catch (err: unknown) {
+    logger?.warn?.(
+      `Langfuse: failed to write observation event (${event.e}) to ${markerFile} — ${String(err)}`,
+    );
+  }
+}
+
+/**
+ * Read observation lifecycle events from the sidecar file for a specific trace.
+ * Returns the set of observation IDs that have been created (gen-start or span-start).
+ */
+export function readObservationEvents(
+  stateDir: string | null,
+  agentId: string,
+  sessionId: string,
+  traceId: string,
+  _logger?: MinimalLogger | null,
+): { createdIds: Set<string>; completedIds: Set<string> } {
+  const createdIds = new Set<string>();
+  const completedIds = new Set<string>();
+  if (!stateDir || !sessionId) {
+    return { createdIds, completedIds };
+  }
+  const markerFile = resolveMarkerFilePath(stateDir, agentId, sessionId);
+  let raw: string;
+  try {
+    raw = fs.readFileSync(markerFile, "utf-8");
+  } catch {
+    return { createdIds, completedIds };
+  }
+  for (const line of raw.split(/\r?\n/)) {
+    if (!line.trim()) {
+      continue;
+    }
+    try {
+      const parsed = JSON.parse(line) as Record<string, unknown>;
+      if (parsed.traceId !== traceId) {
+        continue;
+      }
+      const id = parsed.id as string | undefined;
+      if (!id) {
+        continue;
+      }
+      if (parsed.e === "gen-start" || parsed.e === "span-start") {
+        createdIds.add(id);
+      }
+      if (parsed.e === "gen-end" || parsed.e === "span-end") {
+        completedIds.add(id);
+      }
+    } catch {
+      /* ignore malformed lines */
+    }
+  }
+  return { createdIds, completedIds };
 }
