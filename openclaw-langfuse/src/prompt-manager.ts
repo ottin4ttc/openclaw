@@ -44,7 +44,7 @@ export class PromptManager {
   constructor(langfuse: Langfuse, config: LangfusePluginConfig) {
     this.langfuse = langfuse;
     this.rules = config.prompts ?? [];
-    this.cacheTtlMs = config.promptCacheTtlMs ?? 300000; // 5 minutes default
+    this.cacheTtlMs = config.promptCacheTtlMs ?? 60000; // 1 minute default
   }
 
   /**
