@@ -8,6 +8,7 @@ const startGatewayServer = vi.fn(async (_port: number, _opts?: unknown) => ({
 }));
 const setGatewayWsLogStyle = vi.fn((_style: string) => undefined);
 const setVerbose = vi.fn((_enabled: boolean) => undefined);
+const setConsoleSubsystemFilter = vi.fn((_filters: string[]) => undefined);
 const forceFreePortAndWait = vi.fn(async (_port: number, _opts: unknown) => ({
   killed: [],
   waitedMs: 0,
@@ -81,7 +82,7 @@ vi.mock("../../infra/ports.js", () => ({
 }));
 
 vi.mock("../../logging/console.js", () => ({
-  setConsoleSubsystemFilter: () => undefined,
+  setConsoleSubsystemFilter: (filters: string[]) => setConsoleSubsystemFilter(filters),
   setConsoleTimestampPrefix: () => undefined,
 }));
 
@@ -133,6 +134,7 @@ describe("gateway run option collisions", () => {
     startGatewayServer.mockClear();
     setGatewayWsLogStyle.mockClear();
     setVerbose.mockClear();
+    setConsoleSubsystemFilter.mockClear();
     forceFreePortAndWait.mockClear();
     waitForPortBindable.mockClear();
     ensureDevGatewayConfig.mockClear();
@@ -182,6 +184,18 @@ describe("gateway run option collisions", () => {
     );
   });
 
+  it.each([
+    ["--cli-backend-logs", "generic flag"],
+    ["--claude-cli-logs", "deprecated alias"],
+  ])("enables CLI backend log filtering via %s (%s)", async (flag) => {
+    delete process.env.OPENCLAW_CLI_BACKEND_LOG_OUTPUT;
+
+    await runGatewayCli(["gateway", "run", flag, "--allow-unconfigured"]);
+
+    expect(setConsoleSubsystemFilter).toHaveBeenCalledWith(["agent/cli-backend"]);
+    expect(process.env.OPENCLAW_CLI_BACKEND_LOG_OUTPUT).toBe("1");
+  });
+
   it("starts gateway when token mode has no configured token (startup bootstrap path)", async () => {
     await runGatewayCli(["gateway", "run", "--allow-unconfigured"]);
 
@@ -191,6 +205,29 @@ describe("gateway run option collisions", () => {
         bind: "loopback",
       }),
     );
+  });
+
+  it("defaults to local when snapshot is valid but has no gateway.mode", async () => {
+    configState.cfg = {
+      gateway: {
+        mode: "local",
+      },
+    };
+    configState.snapshot = {
+      exists: true,
+      valid: true,
+      config: {
+        update: { channel: "beta" },
+      },
+      parsed: {
+        update: { channel: "beta" },
+      },
+    };
+
+    // Should NOT block — gateway.mode defaults to "local" when unset (#54801)
+    await runGatewayCli(["gateway", "run"]);
+
+    expect(startGatewayServer).toHaveBeenCalled();
   });
 
   it.each(["none", "trusted-proxy"] as const)("accepts --auth %s override", async (mode) => {
