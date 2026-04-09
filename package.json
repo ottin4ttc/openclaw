@@ -449,7 +449,6 @@
       "authenticate-pam",
       "esbuild",
       "koffi",
-      "node-llama-cpp",
       "protobufjs",
       "sharp"
     ],

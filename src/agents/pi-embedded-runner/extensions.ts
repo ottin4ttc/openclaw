@@ -1,6 +1,7 @@
 import type { Api, Model } from "@mariozechner/pi-ai";
 import type { ExtensionFactory, SessionManager } from "@mariozechner/pi-coding-agent";
 import type { OpenClawConfig } from "../../config/config.js";
+import { createSubsystemLogger } from "../../logging/subsystem.js";
 import { resolveContextWindowInfo } from "../context-window-guard.js";
 import { DEFAULT_CONTEXT_TOKENS } from "../defaults.js";
 import { setCompactionSafeguardRuntime } from "../pi-extensions/compaction-safeguard-runtime.js";
@@ -11,6 +12,8 @@ import { computeEffectiveSettings } from "../pi-extensions/context-pruning/setti
 import { makeToolPrunablePredicate } from "../pi-extensions/context-pruning/tools.js";
 import { ensurePiCompactionReserveTokens } from "../pi-settings.js";
 import { isCacheTtlEligibleProvider, readLastCacheTtlTimestamp } from "./cache-ttl.js";
+
+const log = createSubsystemLogger("context-pruning");
 
 function resolveContextWindowTokens(params: {
   cfg: OpenClawConfig | undefined;
@@ -39,20 +42,29 @@ function buildContextPruningFactory(params: {
     return undefined;
   }
   if (!isCacheTtlEligibleProvider(params.provider, params.modelId)) {
+    log.debug(
+      `skipped: provider=${params.provider} model=${params.modelId} not cache-ttl eligible`,
+    );
     return undefined;
   }
 
   const settings = computeEffectiveSettings(raw);
   if (!settings) {
+    log.debug(`skipped: no effective settings provider=${params.provider} model=${params.modelId}`);
     return undefined;
   }
 
+  const lastTouch = readLastCacheTtlTimestamp(params.sessionManager);
   setContextPruningRuntime(params.sessionManager, {
     settings,
     contextWindowTokens: resolveContextWindowTokens(params),
     isToolPrunable: makeToolPrunablePredicate(settings.tools),
-    lastCacheTouchAt: readLastCacheTtlTimestamp(params.sessionManager),
+    lastCacheTouchAt: lastTouch,
   });
+
+  log.info(
+    `registered: provider=${params.provider} model=${params.modelId} mode=${settings.mode} ttlMs=${settings.ttlMs} minPrunableToolChars=${settings.minPrunableToolChars} lastTouch=${lastTouch ?? "null"}`,
+  );
 
   return contextPruningExtension;
 }

@@ -1,6 +1,9 @@
 import type { ContextEvent, ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { createSubsystemLogger } from "../../../logging/subsystem.js";
 import { pruneContextMessages } from "./pruner.js";
 import { getContextPruningRuntime } from "./runtime.js";
+
+const log = createSubsystemLogger("context-pruning");
 
 export default function contextPruningExtension(api: ExtensionAPI): void {
   api.on("context", (event: ContextEvent, ctx: ExtensionContext) => {
@@ -31,6 +34,10 @@ export default function contextPruningExtension(api: ExtensionAPI): void {
     if (next === event.messages) {
       return undefined;
     }
+
+    log.info(
+      `applied: mode=${runtime.settings.mode} msgs ${event.messages.length}->${next.length}`,
+    );
 
     if (runtime.settings.mode === "cache-ttl") {
       runtime.lastCacheTouchAt = Date.now();

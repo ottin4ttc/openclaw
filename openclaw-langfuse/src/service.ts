@@ -673,6 +673,9 @@ export function createLangfuseService(
         `Langfuse: agentEnd path — useBatchCreation=${useBatchCreation} isRecovery=${isRecoveryEntry} llmCallCount=${entry.llmCallCount} completedGens=${entry.completedGenerations.size} turnEntries=${turnEntries.length}`,
       );
 
+      let batchTotalUsage:
+        | { input: number; output: number; cacheRead: number; cacheWrite: number; total: number }
+        | undefined;
       if (useBatchCreation) {
         const obsResult = buildObservationsFromEntries(
           entry.trace,
@@ -701,6 +704,7 @@ export function createLangfuseService(
         if (obsResult.lastProvider) {
           entry.lastProvider = obsResult.lastProvider;
         }
+        batchTotalUsage = obsResult.totalUsage;
       } else {
         finalizeIncrementalObservations(
           entry,
@@ -732,13 +736,55 @@ export function createLangfuseService(
         }
       }
 
-      const finalUsage = entry.storedUsage
+      // Aggregate usage directly from turnEntries (JSONL assistant messages). JSONL
+      // is the single source of truth — it's written independently of the llm_output
+      // hook, so this path works even when agent_end fires before llm_output
+      // (observed hook ordering in pi-coding-agent). Falls back to batchTotalUsage
+      // (recovery path) and entry.storedUsage (legacy single-call path) when JSONL
+      // is empty.
+      let aggregatedUsage:
+        | { input: number; output: number; cacheRead: number; cacheWrite: number; total: number }
+        | undefined;
+      if (turnEntries.length > 0) {
+        const acc = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
+        for (const te of turnEntries) {
+          const msg = te.message;
+          if (msg.role !== "assistant") {
+            continue;
+          }
+          const u = msg.usage as Record<string, unknown> | undefined;
+          if (!u) {
+            continue;
+          }
+          acc.input += (u.input as number) || 0;
+          acc.output += (u.output as number) || 0;
+          acc.cacheRead += (u.cacheRead as number) || 0;
+          acc.cacheWrite += (u.cacheWrite as number) || 0;
+          acc.total +=
+            (u.totalTokens as number) ||
+            (u.total as number) ||
+            ((u.input as number) || 0) + ((u.output as number) || 0);
+        }
+        if (acc.input > 0 || acc.output > 0 || acc.total > 0) {
+          aggregatedUsage = acc;
+        }
+        serviceLogger?.info?.(
+          `Langfuse: usage from turnEntries — input=${acc.input} output=${acc.output} total=${acc.total}`,
+        );
+      }
+      const usageSrc =
+        aggregatedUsage ??
+        (batchTotalUsage &&
+        (batchTotalUsage.input > 0 || batchTotalUsage.output > 0 || batchTotalUsage.total > 0)
+          ? batchTotalUsage
+          : entry.storedUsage);
+      const finalUsage = usageSrc
         ? {
-            inputTokens: entry.storedUsage.input,
-            outputTokens: entry.storedUsage.output,
-            cacheReadInputTokens: entry.storedUsage.cacheRead || undefined,
-            cacheWriteInputTokens: entry.storedUsage.cacheWrite || undefined,
-            totalTokens: entry.storedUsage.total,
+            inputTokens: usageSrc.input,
+            outputTokens: usageSrc.output,
+            cacheReadInputTokens: usageSrc.cacheRead || undefined,
+            cacheWriteInputTokens: usageSrc.cacheWrite || undefined,
+            totalTokens: usageSrc.total,
           }
         : undefined;
 
