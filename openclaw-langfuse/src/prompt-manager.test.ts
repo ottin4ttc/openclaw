@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/unbound-method -- vi.fn() mocks are safe to reference unbound */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import type { LangfusePluginConfig } from "./config.js";
 import { PromptManager } from "./prompt-manager.js";
@@ -41,8 +42,8 @@ describe("PromptManager", () => {
     expect(mockLangfuse.getPrompt).not.toHaveBeenCalled();
   });
 
-  // 3. Exact match returns correct prompt with prepend injection (default)
-  it("exact match returns prompt with prepend injection by default", async () => {
+  // 3. Exact match returns correct prompt with append injection (default)
+  it("exact match returns prompt with append injection by default", async () => {
     mockLangfuse = makeMockLangfuse(() => Promise.resolve({ prompt: "System guidance text" }));
     const pm = new PromptManager(
       mockLangfuse,
@@ -52,25 +53,25 @@ describe("PromptManager", () => {
     );
     const result = await pm.resolve("main", {});
     expect(result).toBeDefined();
-    expect(result!.injection.prependSystemContext).toBe("System guidance text");
+    expect(result!.injection.appendSystemContext).toBe("System guidance text");
     expect(result!.injection.systemPrompt).toBeUndefined();
-    expect(result!.injection.appendSystemContext).toBeUndefined();
+    expect(result!.injection.prependSystemContext).toBeUndefined();
     expect(result!.matchInfo.name).toBe("main-prompt");
     expect(result!.matchInfo.matchRule).toBe("main");
   });
 
-  // 4. Append injection mode works
-  it("append injection mode sets appendSystemContext", async () => {
-    mockLangfuse = makeMockLangfuse(() => Promise.resolve({ prompt: "Appended content" }));
+  // 4. Prepend injection mode works
+  it("prepend injection mode sets prependSystemContext", async () => {
+    mockLangfuse = makeMockLangfuse(() => Promise.resolve({ prompt: "Prepended content" }));
     const pm = new PromptManager(
       mockLangfuse,
       makeConfig({
-        prompts: [{ match: "main", langfusePrompt: "append-prompt", inject: "append" }],
+        prompts: [{ match: "main", langfusePrompt: "prepend-prompt", inject: "prepend" }],
       }),
     );
     const result = await pm.resolve("main", {});
-    expect(result!.injection.appendSystemContext).toBe("Appended content");
-    expect(result!.injection.prependSystemContext).toBeUndefined();
+    expect(result!.injection.prependSystemContext).toBe("Prepended content");
+    expect(result!.injection.appendSystemContext).toBeUndefined();
     expect(result!.injection.systemPrompt).toBeUndefined();
   });
 
@@ -95,8 +96,8 @@ describe("PromptManager", () => {
     expect(result!.injection.appendSystemContext).toBeUndefined();
   });
 
-  // 6. Cache hit within TTL returns cached prompt without fetching again
-  it("cache hit within TTL does not re-fetch from Langfuse", async () => {
+  // 6. Prompt TTL is forwarded to the Langfuse SDK
+  it("forwards promptCacheTtlMs to the Langfuse SDK cacheTtlSeconds option", async () => {
     mockLangfuse = makeMockLangfuse(() => Promise.resolve({ prompt: "Cached prompt text" }));
     const pm = new PromptManager(
       mockLangfuse,
@@ -105,19 +106,16 @@ describe("PromptManager", () => {
         promptCacheTtlMs: 60000,
       }),
     );
-    // First call fetches
-    const first = await pm.resolve("main", {});
-    expect(first!.injection.prependSystemContext).toBe("Cached prompt text");
-    expect(mockLangfuse.getPrompt).toHaveBeenCalledTimes(1);
-
-    // Second call uses cache
-    const second = await pm.resolve("main", {});
-    expect(second!.injection.prependSystemContext).toBe("Cached prompt text");
-    expect(mockLangfuse.getPrompt).toHaveBeenCalledTimes(1);
+    await pm.resolve("main", {});
+    expect(mockLangfuse.getPrompt).toHaveBeenCalledWith(
+      "cached-prompt",
+      undefined,
+      expect.objectContaining({ cacheTtlSeconds: 60, type: "text" }),
+    );
   });
 
-  // 7. Cache miss after TTL expiry re-fetches from Langfuse
-  it("cache miss after TTL expiry re-fetches from Langfuse", async () => {
+  // 7. Zero TTL is forwarded to the Langfuse SDK
+  it("forwards zero TTL to the Langfuse SDK", async () => {
     const pm = new PromptManager(
       mockLangfuse,
       makeConfig({
@@ -127,8 +125,63 @@ describe("PromptManager", () => {
       }),
     );
     await pm.resolve("main", {});
-    await pm.resolve("main", {});
+    expect(mockLangfuse.getPrompt).toHaveBeenCalledWith(
+      "ttl-prompt",
+      undefined,
+      expect.objectContaining({ cacheTtlSeconds: 0, type: "text" }),
+    );
+  });
+
+  it("warmCache primes prompts through the Langfuse SDK", async () => {
+    const pm = new PromptManager(
+      mockLangfuse,
+      makeConfig({
+        prompts: [
+          { match: "main", langfusePrompt: "main-prompt" },
+          { match: "*", langfusePrompt: "fallback-prompt", label: "production" },
+        ],
+      }),
+    );
+
+    await pm.warmCache();
     expect(mockLangfuse.getPrompt).toHaveBeenCalledTimes(2);
+    expect(mockLangfuse.getPrompt).toHaveBeenNthCalledWith(
+      1,
+      "main-prompt",
+      undefined,
+      expect.objectContaining({ cacheTtlSeconds: 60, type: "text" }),
+    );
+    expect(mockLangfuse.getPrompt).toHaveBeenNthCalledWith(
+      2,
+      "fallback-prompt",
+      undefined,
+      expect.objectContaining({ label: "production", cacheTtlSeconds: 60, type: "text" }),
+    );
+  });
+
+  it("uses a 2 second fetch timeout by default", async () => {
+    vi.useFakeTimers();
+    try {
+      mockLangfuse = makeMockLangfuse(
+        () =>
+          new Promise<{ prompt: string }>((resolve) =>
+            setTimeout(() => resolve({ prompt: "Late" }), 2500),
+          ),
+      );
+      const pm = new PromptManager(
+        mockLangfuse,
+        makeConfig({
+          prompts: [{ match: "main", langfusePrompt: "slow-default-prompt" }],
+        }),
+      );
+
+      const resultPromise = pm.resolve("main", {});
+      await vi.advanceTimersByTimeAsync(2000);
+
+      await expect(resultPromise).resolves.toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   // 8. Template compilation replaces {{agent_name}}, {{channel_id}}, {{session_key}}, {{trigger}}
@@ -151,7 +204,7 @@ describe("PromptManager", () => {
       sessionKey: "sess-abc",
       trigger: "voice",
     });
-    expect(result!.injection.prependSystemContext).toBe(
+    expect(result!.injection.appendSystemContext).toBe(
       "Agent: agent-42, Channel: ch-99, Session: sess-abc, Trigger: voice",
     );
   });
@@ -168,25 +221,58 @@ describe("PromptManager", () => {
       }),
     );
     const result = await pm.resolve("main", { agentId: "bot" });
-    expect(result!.injection.prependSystemContext).toBe("Agent: bot, Unknown: ");
+    expect(result!.injection.appendSystemContext).toBe("Agent: bot, Unknown: ");
   });
 
   // 10. Fetch timeout returns undefined (graceful degradation)
   it("fetch timeout returns undefined gracefully", async () => {
-    mockLangfuse = makeMockLangfuse(
-      () =>
-        new Promise<{ prompt: string }>((_, reject) =>
-          setTimeout(() => reject(new Error("timeout")), 100),
-        ),
-    );
-    const pm = new PromptManager(
-      mockLangfuse,
-      makeConfig({
-        prompts: [{ match: "main", langfusePrompt: "slow-prompt" }],
-      }),
-    );
-    const result = await pm.resolve("main", {});
-    expect(result).toBeUndefined();
+    vi.useFakeTimers();
+    try {
+      mockLangfuse = makeMockLangfuse(
+        () =>
+          new Promise<{ prompt: string }>((resolve) =>
+            setTimeout(() => resolve({ prompt: "Late" }), 100),
+          ),
+      );
+      const pm = new PromptManager(
+        mockLangfuse,
+        makeConfig({
+          prompts: [{ match: "main", langfusePrompt: "slow-prompt" }],
+          promptFetchTimeoutMs: 50,
+        }),
+      );
+      const resultPromise = pm.resolve("main", {});
+      await vi.advanceTimersByTimeAsync(50);
+      await expect(resultPromise).resolves.toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("passes through successful fetches within the configured timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      mockLangfuse = makeMockLangfuse(
+        () =>
+          new Promise<{ prompt: string }>((resolve) =>
+            setTimeout(() => resolve({ prompt: "Fetched in time" }), 100),
+          ),
+      );
+      const pm = new PromptManager(
+        mockLangfuse,
+        makeConfig({
+          prompts: [{ match: "main", langfusePrompt: "timely-prompt" }],
+          promptFetchTimeoutMs: 200,
+        }),
+      );
+      const resultPromise = pm.resolve("main", {});
+      await vi.advanceTimersByTimeAsync(100);
+      await expect(resultPromise).resolves.toMatchObject({
+        injection: { appendSystemContext: "Fetched in time" },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   // 11. Langfuse API error returns undefined (graceful degradation)

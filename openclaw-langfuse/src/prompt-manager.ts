@@ -1,15 +1,7 @@
 import Langfuse from "langfuse";
+import type { LangfusePromptClient } from "langfuse-core";
 import type { PromptRule, LangfusePluginConfig } from "./config.js";
 import { findMatchingRule } from "./matcher.js";
-
-type CacheEntry = {
-  compiledPrompt: string;
-  fetchedAt: number;
-  promptName: string;
-  version?: number;
-  label?: string;
-  promptClient: unknown;
-};
 
 type AgentContext = {
   agentId?: string;
@@ -35,38 +27,26 @@ type PromptResolveResult = {
 };
 
 export class PromptManager {
-  private cache = new Map<string, CacheEntry>();
   private cacheTtlMs: number;
   private rules: PromptRule[];
   private langfuse: Langfuse;
-  private fetchTimeoutMs = 3000;
+  private fetchTimeoutMs: number;
 
   constructor(langfuse: Langfuse, config: LangfusePluginConfig) {
     this.langfuse = langfuse;
     this.rules = config.prompts ?? [];
     this.cacheTtlMs = config.promptCacheTtlMs ?? 60000; // 1 minute default
+    this.fetchTimeoutMs = config.promptFetchTimeoutMs ?? 2000;
   }
 
   /**
-   * Pre-fetch all configured prompt rules into the cache.
-   * Fire-and-forget — errors are silently ignored per rule.
+   * Prime the Langfuse SDK cache for configured prompt rules.
+   * Errors are ignored so prompt fetching can retry on demand.
    */
   async warmCache(): Promise<void> {
     for (const rule of this.rules) {
       try {
-        const cacheKey = `${rule.langfusePrompt}:${rule.version ?? "latest"}:${rule.label ?? "default"}`;
-        if (this.cache.has(cacheKey)) {
-          continue;
-        }
-        const { promptText, promptClient } = await this.fetchWithTimeout(rule);
-        this.cache.set(cacheKey, {
-          compiledPrompt: promptText,
-          fetchedAt: Date.now(),
-          promptName: rule.langfusePrompt,
-          version: rule.version,
-          label: rule.label,
-          promptClient,
-        });
+        await this.fetchWithTimeout(rule);
       } catch {
         // Silently skip — will retry on next resolve
       }
@@ -77,60 +57,16 @@ export class PromptManager {
    * Find matching prompt rule and fetch/compile the prompt.
    * Returns { injection, matchInfo } or undefined if no match or fetch fails.
    * Degrades gracefully: fetch errors and timeouts return undefined.
+   * Caching behavior is delegated to the Langfuse SDK.
    */
   async resolve(agentId: string, ctx: AgentContext): Promise<PromptResolveResult | undefined> {
-    // 1. Find matching rule
     const rule = findMatchingRule(agentId, this.rules);
     if (!rule) {
       return undefined;
     }
 
-    // 2. Check cache
-    const cacheKey = `${rule.langfusePrompt}:${rule.version ?? "latest"}:${rule.label ?? "default"}`;
-    const cached = this.cache.get(cacheKey);
-    // If cache expired, still use stale data but trigger background refresh
-    if (cached && Date.now() - cached.fetchedAt >= this.cacheTtlMs) {
-      this.fetchWithTimeout(rule)
-        .then(({ promptText, promptClient }) =>
-          this.cache.set(cacheKey, {
-            compiledPrompt: promptText,
-            fetchedAt: Date.now(),
-            promptName: rule.langfusePrompt,
-            version: rule.version,
-            label: rule.label,
-            promptClient,
-          }),
-        )
-        .catch(() => {}); // silently ignore refresh failures
-    }
-    if (cached) {
-      // compile with context vars
-      const compiled = this.compileTemplate(cached.compiledPrompt, ctx);
-      return {
-        injection: this.buildInjection(compiled, rule.inject),
-        matchInfo: {
-          name: rule.langfusePrompt,
-          version: rule.version,
-          label: rule.label,
-          inject: rule.inject,
-          matchRule: rule.match,
-        },
-        promptClient: cached.promptClient,
-      };
-    }
-
-    // 3. Fetch from Langfuse with timeout
     try {
       const { promptText, promptClient } = await this.fetchWithTimeout(rule);
-      // Cache the raw template (before variable compilation)
-      this.cache.set(cacheKey, {
-        compiledPrompt: promptText,
-        fetchedAt: Date.now(),
-        promptName: rule.langfusePrompt,
-        version: rule.version,
-        label: rule.label,
-        promptClient,
-      });
       const compiled = this.compileTemplate(promptText, ctx);
       return {
         injection: this.buildInjection(compiled, rule.inject),
@@ -144,73 +80,36 @@ export class PromptManager {
         promptClient,
       };
     } catch {
-      // Graceful degradation - return undefined, don't throw
       return undefined;
     }
   }
 
   /**
-   * Synchronous resolve — returns cached prompt injection if available.
-   * Does NOT fetch from Langfuse. Use warmCache() or resolve() to populate cache first.
-   * Used by before_prompt_build hook which must return synchronously.
+   * Synchronous resolve is intentionally unsupported.
+   * The plugin now relies on the async Langfuse SDK prompt cache behavior.
    */
-  resolveSync(agentId: string, ctx: AgentContext): PromptResolveResult | undefined {
-    const rule = findMatchingRule(agentId, this.rules);
-    if (!rule) {
-      return undefined;
-    }
-
-    const cacheKey = `${rule.langfusePrompt}:${rule.version ?? "latest"}:${rule.label ?? "default"}`;
-    const cached = this.cache.get(cacheKey);
-    if (!cached) {
-      return undefined;
-    }
-
-    // If cache expired, trigger background refresh but still return stale data
-    if (Date.now() - cached.fetchedAt >= this.cacheTtlMs) {
-      this.fetchWithTimeout(rule)
-        .then(({ promptText, promptClient }) =>
-          this.cache.set(cacheKey, {
-            compiledPrompt: promptText,
-            fetchedAt: Date.now(),
-            promptName: rule.langfusePrompt,
-            version: rule.version,
-            label: rule.label,
-            promptClient,
-          }),
-        )
-        .catch(() => {});
-    }
-
-    const compiled = this.compileTemplate(cached.compiledPrompt, ctx);
-    return {
-      injection: this.buildInjection(compiled, rule.inject),
-      matchInfo: {
-        name: rule.langfusePrompt,
-        version: rule.version,
-        label: rule.label,
-        inject: rule.inject,
-        matchRule: rule.match,
-      },
-      promptClient: cached.promptClient,
-    };
+  resolveSync(_agentId: string, _ctx: AgentContext): PromptResolveResult | undefined {
+    return undefined;
   }
 
   private async fetchWithTimeout(
     rule: PromptRule,
   ): Promise<{ promptText: string; promptClient: unknown }> {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), this.fetchTimeoutMs);
-    try {
-      const promptClient = await this.langfuse.getPrompt(rule.langfusePrompt, rule.version, {
+    const promptClient = (await Promise.race([
+      this.langfuse.getPrompt(rule.langfusePrompt, rule.version, {
         label: rule.label,
+        cacheTtlSeconds: Math.max(0, Math.ceil(this.cacheTtlMs / 1000)),
         type: "text",
-      });
-      // .prompt is the raw template string on TextPromptClient
-      return { promptText: promptClient.prompt, promptClient };
-    } finally {
-      clearTimeout(timeout);
+      }),
+      new Promise<undefined>((resolve) => {
+        setTimeout(() => resolve(undefined), this.fetchTimeoutMs);
+      }),
+    ])) as LangfusePromptClient | undefined;
+    if (!promptClient) {
+      throw new Error(`Prompt fetch timed out after ${this.fetchTimeoutMs}ms`);
     }
+    // .prompt is the raw template string on TextPromptClient
+    return { promptText: promptClient.prompt, promptClient };
   }
 
   private compileTemplate(template: string, ctx: AgentContext): string {
