@@ -1,0 +1,52 @@
+diff --git a/dist/providers/anthropic.js b/dist/providers/anthropic.js
+index 6abaaa94b90c31fb3c5fa87c3b9634926b4c4887..91410e8f88b7647181a353c322d91737a63e0422 100644
+--- a/dist/providers/anthropic.js
++++ b/dist/providers/anthropic.js
+@@ -668,25 +668,39 @@ function convertMessages(messages, model, isOAuthToken, cacheControl) {
+             });
+         }
+     }
+-    // Add cache_control to the last user message to cache conversation history
++    // Add cache_control breakpoints to the last 3 user messages (not just the last one).
++    // Anthropic supports up to 4 breakpoints total (1 on system prompt + 3 on messages).
++    // Placing breakpoints on the last 3 user messages creates stable cache segments:
++    //   segment 1: system prompt (always stable)
++    //   segment 2: history up to 3rd-to-last user msg (stable within a turn)
++    //   segment 3: 3rd-to-last to 2nd-to-last (often stable)
++    //   segment 4: 2nd-to-last to last (small, cheap to rewrite)
++    // Without this, every tool call shifts the single breakpoint, causing the entire
++    // message history (~400k tokens) to be rewritten as cache_creation.
+     if (cacheControl && params.length > 0) {
+-        const lastMessage = params[params.length - 1];
+-        if (lastMessage.role === "user") {
+-            if (Array.isArray(lastMessage.content)) {
+-                const lastBlock = lastMessage.content[lastMessage.content.length - 1];
++        let breakpointsPlaced = 0;
++        const maxBreakpoints = 3; // 4 total minus 1 on system prompt
++        for (let idx = params.length - 1; idx >= 0 && breakpointsPlaced < maxBreakpoints; idx--) {
++            const msg = params[idx];
++            if (msg.role !== "user")
++                continue;
++            if (Array.isArray(msg.content)) {
++                const lastBlock = msg.content[msg.content.length - 1];
+                 if (lastBlock &&
+                     (lastBlock.type === "text" || lastBlock.type === "image" || lastBlock.type === "tool_result")) {
+                     lastBlock.cache_control = cacheControl;
++                    breakpointsPlaced++;
+                 }
+             }
+-            else if (typeof lastMessage.content === "string") {
+-                lastMessage.content = [
++            else if (typeof msg.content === "string") {
++                msg.content = [
+                     {
+                         type: "text",
+-                        text: lastMessage.content,
++                        text: msg.content,
+                         cache_control: cacheControl,
+                     },
+                 ];
++                breakpointsPlaced++;
+             }
+         }
+     }
