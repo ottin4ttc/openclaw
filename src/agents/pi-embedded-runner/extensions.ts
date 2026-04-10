@@ -11,7 +11,7 @@ import { setContextPruningRuntime } from "../pi-extensions/context-pruning/runti
 import { computeEffectiveSettings } from "../pi-extensions/context-pruning/settings.js";
 import { makeToolPrunablePredicate } from "../pi-extensions/context-pruning/tools.js";
 import { ensurePiCompactionReserveTokens } from "../pi-settings.js";
-import { isCacheTtlEligibleProvider, readLastCacheTtlTimestamp } from "./cache-ttl.js";
+import { readLastCacheTtlTimestamp } from "./cache-ttl.js";
 
 const log = createSubsystemLogger("context-pruning");
 
@@ -41,12 +41,10 @@ function buildContextPruningFactory(params: {
   if (raw?.mode !== "cache-ttl") {
     return undefined;
   }
-  if (!isCacheTtlEligibleProvider(params.provider, params.modelId)) {
-    log.debug(
-      `skipped: provider=${params.provider} model=${params.modelId} not cache-ttl eligible`,
-    );
-    return undefined;
-  }
+  // Provider eligibility check removed — if the user explicitly configured
+  // mode: "cache-ttl", honor it for all providers (Anthropic, OpenAI, Kimi, GLM, etc.).
+  // Context pruning reduces input tokens regardless of whether the provider
+  // exposes prompt cache metrics.
 
   const settings = computeEffectiveSettings(raw);
   if (!settings) {
