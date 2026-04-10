@@ -18,8 +18,15 @@ export default function contextPruningExtension(api: ExtensionAPI): void {
       if (!lastTouch || ttlMs <= 0) {
         return undefined;
       }
-      if (ttlMs > 0 && Date.now() - lastTouch < ttlMs) {
-        return undefined;
+      const withinTtl = ttlMs > 0 && Date.now() - lastTouch < ttlMs;
+      if (withinTtl) {
+        // Within TTL window: still prune if new messages arrived since last pruning
+        // (e.g. tool results added between LLM calls in the same turn).
+        const lastCount = runtime.lastPrunedMessageCount ?? 0;
+        if (lastCount > 0 && event.messages.length <= lastCount) {
+          return undefined;
+        }
+        // Fall through to prune with new messages
       }
     }
 
@@ -41,6 +48,7 @@ export default function contextPruningExtension(api: ExtensionAPI): void {
 
     if (runtime.settings.mode === "cache-ttl") {
       runtime.lastCacheTouchAt = Date.now();
+      runtime.lastPrunedMessageCount = next.length;
     }
 
     return { messages: next };

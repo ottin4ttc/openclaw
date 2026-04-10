@@ -6,6 +6,8 @@ export type ContextPruningRuntimeValue = {
   contextWindowTokens?: number | null;
   isToolPrunable: (toolName: string) => boolean;
   lastCacheTouchAt?: number | null;
+  /** Cached pruned message count so we can re-apply pruning within the same TTL window. */
+  lastPrunedMessageCount?: number | null;
 };
 
 // Important: this relies on Pi passing the same SessionManager object instance into
