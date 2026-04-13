@@ -8,7 +8,7 @@ import {
   DEFAULT_CONTEXT_PRUNING_SETTINGS,
   pruneContextMessages,
 } from "./context-pruning.js";
-import { getContextPruningRuntime, setContextPruningRuntime } from "./context-pruning/runtime.js";
+import { setContextPruningRuntime } from "./context-pruning/runtime.js";
 
 function isToolResultMessage(msg: AgentMessage): msg is ToolResultMessage {
   return msg.role === "toolResult";
@@ -81,6 +81,21 @@ function makeAssistant(text: string): AgentMessage {
 
 function makeUser(text: string): AgentMessage {
   return { role: "user", content: text, timestamp: Date.now() };
+}
+
+/** Create a mock sessionManager whose getEntries() returns a single cache-ttl custom entry. */
+function makeMockSessionManager(cacheTtlTimestamp: number | null) {
+  const entries =
+    cacheTtlTimestamp != null
+      ? [
+          {
+            type: "custom",
+            customType: "openclaw.cache-ttl",
+            data: { timestamp: cacheTtlTimestamp },
+          },
+        ]
+      : [];
+  return { getEntries: () => entries };
 }
 
 type ContextPruningSettings = NonNullable<ReturnType<typeof computeEffectiveSettings>>;
@@ -283,13 +298,13 @@ describe("context-pruning", () => {
   });
 
   it("reads per-session settings from registry", async () => {
-    const sessionManager = {};
+    const expiredTimestamp = Date.now() - DEFAULT_CONTEXT_PRUNING_SETTINGS.ttlMs - 1000;
+    const sessionManager = makeMockSessionManager(expiredTimestamp);
 
     setContextPruningRuntime(sessionManager, {
       settings: makeAggressiveSettings(),
       contextWindowTokens: 1000,
       isToolPrunable: () => true,
-      lastCacheTouchAt: Date.now() - DEFAULT_CONTEXT_PRUNING_SETTINGS.ttlMs - 1000,
     });
 
     const messages = makeSimpleToolPruningMessages(true);
@@ -303,15 +318,14 @@ describe("context-pruning", () => {
     expect(toolText(findToolResult(result.messages, "t1"))).toBe("[cleared]");
   });
 
-  it("cache-ttl prunes once and resets the ttl window", () => {
-    const sessionManager = {};
-    const lastTouch = Date.now() - DEFAULT_CONTEXT_PRUNING_SETTINGS.ttlMs - 1000;
+  it("cache-ttl: all LLM calls within a turn prune consistently", () => {
+    const expiredTimestamp = Date.now() - DEFAULT_CONTEXT_PRUNING_SETTINGS.ttlMs - 1000;
+    const sessionManager = makeMockSessionManager(expiredTimestamp);
 
     setContextPruningRuntime(sessionManager, {
       settings: makeAggressiveSettings(),
       contextWindowTokens: 1000,
       isToolPrunable: () => true,
-      lastCacheTouchAt: lastTouch,
     });
 
     const messages = makeSimpleToolPruningMessages();
@@ -323,14 +337,11 @@ describe("context-pruning", () => {
     }
     expect(toolText(findToolResult(first.messages, "t1"))).toBe("[cleared]");
 
-    const runtime = getContextPruningRuntime(sessionManager);
-    if (!runtime?.lastCacheTouchAt) {
-      throw new Error("expected lastCacheTouchAt");
-    }
-    expect(runtime.lastCacheTouchAt).toBeGreaterThan(lastTouch);
-
+    // Second call within the same turn should also prune (persisted timestamp
+    // is not updated mid-turn, only at turn end by appendCacheTtlTimestamp).
     const second = runContextHandler(handler, messages, sessionManager);
-    expect(second).toBeUndefined();
+    expect(second).toBeDefined();
+    expect(toolText(findToolResult(second!.messages, "t1"))).toBe("[cleared]");
   });
 
   it("respects tools allow/deny (deny wins; wildcards supported)", () => {

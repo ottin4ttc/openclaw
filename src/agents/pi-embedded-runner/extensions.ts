@@ -11,7 +11,6 @@ import { setContextPruningRuntime } from "../pi-extensions/context-pruning/runti
 import { computeEffectiveSettings } from "../pi-extensions/context-pruning/settings.js";
 import { makeToolPrunablePredicate } from "../pi-extensions/context-pruning/tools.js";
 import { ensurePiCompactionReserveTokens } from "../pi-settings.js";
-import { readLastCacheTtlTimestamp } from "./cache-ttl.js";
 
 const log = createSubsystemLogger("context-pruning");
 
@@ -52,16 +51,14 @@ function buildContextPruningFactory(params: {
     return undefined;
   }
 
-  const lastTouch = readLastCacheTtlTimestamp(params.sessionManager);
   setContextPruningRuntime(params.sessionManager, {
     settings,
     contextWindowTokens: resolveContextWindowTokens(params),
     isToolPrunable: makeToolPrunablePredicate(settings.tools),
-    lastCacheTouchAt: lastTouch,
   });
 
   log.info(
-    `registered: provider=${params.provider} model=${params.modelId} mode=${settings.mode} ttlMs=${settings.ttlMs} minPrunableToolChars=${settings.minPrunableToolChars} lastTouch=${lastTouch ?? "null"}`,
+    `registered: provider=${params.provider} model=${params.modelId} mode=${settings.mode} ttlMs=${settings.ttlMs} minPrunableToolChars=${settings.minPrunableToolChars}`,
   );
 
   return contextPruningExtension;

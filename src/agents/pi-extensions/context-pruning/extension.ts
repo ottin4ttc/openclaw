@@ -1,5 +1,6 @@
 import type { ContextEvent, ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { createSubsystemLogger } from "../../../logging/subsystem.js";
+import { readLastCacheTtlTimestamp } from "../../pi-embedded-runner/cache-ttl.js";
 import { pruneContextMessages } from "./pruner.js";
 import { getContextPruningRuntime } from "./runtime.js";
 
@@ -14,19 +15,16 @@ export default function contextPruningExtension(api: ExtensionAPI): void {
 
     if (runtime.settings.mode === "cache-ttl") {
       const ttlMs = runtime.settings.ttlMs;
-      const lastTouch = runtime.lastCacheTouchAt ?? null;
+      // Always read the persisted timestamp from session history rather than
+      // the in-memory cache.  appendCacheTtlTimestamp() (attempt.ts) writes
+      // this once at turn end, so every LLM call within the same turn reads
+      // the same value and makes a consistent TTL decision.
+      const lastTouch = readLastCacheTtlTimestamp(ctx.sessionManager) ?? null;
       if (!lastTouch || ttlMs <= 0) {
         return undefined;
       }
-      const withinTtl = ttlMs > 0 && Date.now() - lastTouch < ttlMs;
-      if (withinTtl) {
-        // Within TTL window: still prune if new messages arrived since last pruning
-        // (e.g. tool results added between LLM calls in the same turn).
-        const lastCount = runtime.lastPrunedMessageCount ?? 0;
-        if (lastCount > 0 && event.messages.length <= lastCount) {
-          return undefined;
-        }
-        // Fall through to prune with new messages
+      if (ttlMs > 0 && Date.now() - lastTouch < ttlMs) {
+        return undefined;
       }
     }
 
@@ -45,11 +43,6 @@ export default function contextPruningExtension(api: ExtensionAPI): void {
     log.info(
       `applied: mode=${runtime.settings.mode} msgs ${event.messages.length}->${next.length}`,
     );
-
-    if (runtime.settings.mode === "cache-ttl") {
-      runtime.lastCacheTouchAt = Date.now();
-      runtime.lastPrunedMessageCount = next.length;
-    }
 
     return { messages: next };
   });
