@@ -410,6 +410,7 @@ export function createLangfuseService(
             ? truncatePayload(output)
             : undefined;
         const eu = event.usage;
+        entry.lastGenerationEndTime = endTime;
         pendingGen.update({
           endTime,
           ...(truncatedOutput !== undefined ? { output: truncatedOutput } : {}),
@@ -476,7 +477,10 @@ export function createLangfuseService(
       }
 
       const spanId = generateObservationId(entry.traceId, "span", toolCallId);
-      const startTime = new Date();
+      // Use the previous generation's endTime as the tool span startTime.
+      // This ensures correct ordering in Langfuse UI when tool validation
+      // fails instantly and the next llmInput fires within the same millisecond.
+      const startTime = entry.lastGenerationEndTime ?? new Date();
       const span = entry.trace.span({
         id: spanId,
         name: `tool:${event.toolName ?? "unknown"}`,
@@ -548,6 +552,8 @@ export function createLangfuseService(
       });
       entry.pendingSpans.delete(toolCallId);
       entry.completedSpanToolCallIds.add(toolCallId);
+      // Update so the next sequential tool span starts after this one ends
+      entry.lastGenerationEndTime = endTime;
 
       const spanId = generateObservationId(entry.traceId, "span", toolCallId);
       writeObservationEvent(
