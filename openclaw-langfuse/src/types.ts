@@ -38,6 +38,8 @@ export type BeforePromptBuildResult = {
   appendSystemContext?: string;
 };
 
+export type MaybePromise<T> = T | Promise<T>;
+
 export type BeforeAgentStartEvent = {
   prompt: string;
   messages?: unknown[];

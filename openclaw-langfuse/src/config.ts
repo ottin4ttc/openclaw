@@ -21,6 +21,8 @@ export type LangfusePluginConfig = {
   prompts?: PromptRule[];
   /** How long to cache fetched prompts in milliseconds. Default: 60000 */
   promptCacheTtlMs?: number;
+  /** How long to wait for prompt fetches before skipping injection. Default: 2000 */
+  promptFetchTimeoutMs?: number;
   tracing?: TracingConfig;
 };
 

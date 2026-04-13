@@ -32,6 +32,14 @@ export function isCacheTtlEligibleProvider(provider: string, modelId: string): b
   if (normalizedProvider === "kilocode" && normalizedModelId.startsWith("anthropic/")) {
     return true;
   }
+  // 三方 Anthropic 代理兜底：provider 名字包含 "anthropic" 或 modelId 以 anthropic/ 开头
+  // 覆盖 zenmux-anthropic / cloubic-anthropic / dmxapi-anthropic / yaoxin-anthropic 等
+  if (normalizedProvider.includes("anthropic")) {
+    return true;
+  }
+  if (normalizedModelId.startsWith("anthropic/")) {
+    return true;
+  }
   return false;
 }
 

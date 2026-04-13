@@ -1,6 +1,7 @@
 import type { Api, Model } from "@mariozechner/pi-ai";
 import type { ExtensionFactory, SessionManager } from "@mariozechner/pi-coding-agent";
 import type { OpenClawConfig } from "../../config/config.js";
+import { createSubsystemLogger } from "../../logging/subsystem.js";
 import { resolveContextWindowInfo } from "../context-window-guard.js";
 import { DEFAULT_CONTEXT_TOKENS } from "../defaults.js";
 import { setCompactionSafeguardRuntime } from "../pi-extensions/compaction-safeguard-runtime.js";
@@ -10,7 +11,8 @@ import { setContextPruningRuntime } from "../pi-extensions/context-pruning/runti
 import { computeEffectiveSettings } from "../pi-extensions/context-pruning/settings.js";
 import { makeToolPrunablePredicate } from "../pi-extensions/context-pruning/tools.js";
 import { ensurePiCompactionReserveTokens } from "../pi-settings.js";
-import { isCacheTtlEligibleProvider, readLastCacheTtlTimestamp } from "./cache-ttl.js";
+
+const log = createSubsystemLogger("context-pruning");
 
 function resolveContextWindowTokens(params: {
   cfg: OpenClawConfig | undefined;
@@ -38,12 +40,14 @@ function buildContextPruningFactory(params: {
   if (raw?.mode !== "cache-ttl") {
     return undefined;
   }
-  if (!isCacheTtlEligibleProvider(params.provider, params.modelId)) {
-    return undefined;
-  }
+  // Provider eligibility check removed — if the user explicitly configured
+  // mode: "cache-ttl", honor it for all providers (Anthropic, OpenAI, Kimi, GLM, etc.).
+  // Context pruning reduces input tokens regardless of whether the provider
+  // exposes prompt cache metrics.
 
   const settings = computeEffectiveSettings(raw);
   if (!settings) {
+    log.debug(`skipped: no effective settings provider=${params.provider} model=${params.modelId}`);
     return undefined;
   }
 
@@ -51,8 +55,11 @@ function buildContextPruningFactory(params: {
     settings,
     contextWindowTokens: resolveContextWindowTokens(params),
     isToolPrunable: makeToolPrunablePredicate(settings.tools),
-    lastCacheTouchAt: readLastCacheTtlTimestamp(params.sessionManager),
   });
+
+  log.info(
+    `registered: provider=${params.provider} model=${params.modelId} mode=${settings.mode} ttlMs=${settings.ttlMs} minPrunableToolChars=${settings.minPrunableToolChars}`,
+  );
 
   return contextPruningExtension;
 }

@@ -22,6 +22,7 @@ import type {
   AgentCtx,
   ToolCtx,
   SessionCtx,
+  MaybePromise,
   BeforePromptBuildEvent,
   BeforePromptBuildResult,
   BeforeAgentStartEvent,
@@ -53,7 +54,7 @@ export type LangfuseServiceHookHandlers = {
   beforePromptBuild: (
     event: BeforePromptBuildEvent,
     ctx: AgentCtx,
-  ) => BeforePromptBuildResult | void;
+  ) => MaybePromise<BeforePromptBuildResult | void>;
   beforeAgentStart: (event: BeforeAgentStartEvent, ctx: AgentCtx) => BeforeAgentStartResult | void;
   llmInput: (event: LlmInputEvent, ctx: AgentCtx) => void;
   llmOutput: (event: LlmOutputEvent, ctx: AgentCtx) => void;
@@ -100,10 +101,10 @@ export function createLangfuseService(
 
   const handlers: LangfuseServiceHookHandlers = {
     // before_prompt_build: capture system prompt and record prompt match info
-    beforePromptBuild(
+    async beforePromptBuild(
       event: BeforePromptBuildEvent,
       ctx: AgentCtx,
-    ): BeforePromptBuildResult | void {
+    ): Promise<BeforePromptBuildResult | void> {
       if (disabled || !langfuse) {
         return;
       }
@@ -116,27 +117,27 @@ export function createLangfuseService(
       );
 
       // Prompt injection MUST work even before entry exists (beforePromptBuild fires before beforeAgentStart).
-      // Use resolveSync for synchronous injection, fall back to async resolve for cache population.
+      // Await PromptManager.resolve(); prompt freshness semantics are delegated to the Langfuse SDK cache.
       if (promptManager) {
         const agentId = ctx.agentId ?? "unknown";
-        const syncResult = promptManager.resolveSync(agentId, {
+        const result = await promptManager.resolve(agentId, {
           agentId: ctx.agentId,
           channelId: ctx.channelId,
           sessionKey: ctx.sessionKey,
           trigger: ctx.trigger,
         });
         serviceLogger?.debug?.(
-          `Langfuse: resolveSync(${agentId}) → ${syncResult ? `hit: ${syncResult.matchInfo.name}` : "miss"}`,
+          `Langfuse: resolve(${agentId}) → ${result ? `hit: ${result.matchInfo.name}` : "miss"}`,
         );
-        if (syncResult) {
+        if (result) {
           serviceLogger?.info?.(
-            `Langfuse: prompt injection → ${JSON.stringify(syncResult.injection).slice(0, 100)}`,
+            `Langfuse: prompt injection → ${JSON.stringify(result.injection).slice(0, 100)}`,
           );
           if (entry) {
-            entry.promptMatch = syncResult.matchInfo;
-            entry.promptClient = syncResult.promptClient;
+            entry.promptMatch = result.matchInfo;
+            entry.promptClient = result.promptClient;
             // Store injection text for merging into systemPrompt in generation input
-            const injection = syncResult.injection as Record<string, unknown> | undefined;
+            const injection = result.injection as Record<string, unknown> | undefined;
             if (injection) {
               entry.promptInjection = {
                 prepend:
@@ -150,23 +151,8 @@ export function createLangfuseService(
               };
             }
           }
-          return syncResult.injection;
+          return result.injection;
         }
-        // Cache miss — fire async resolve to populate cache for next time
-        promptManager
-          .resolve(agentId, {
-            agentId: ctx.agentId,
-            channelId: ctx.channelId,
-            sessionKey: ctx.sessionKey,
-            trigger: ctx.trigger,
-          })
-          .then((result) => {
-            if (result && entry) {
-              entry.promptMatch = result.matchInfo;
-              entry.promptClient = result.promptClient;
-            }
-          })
-          .catch(() => {});
       } else if (entry && config.prompts?.length) {
         // Fallback: record match info without prompt client
         const agentId = ctx.agentId ?? "unknown";
@@ -332,9 +318,14 @@ export function createLangfuseService(
       const model = qualifiedModel(event.provider, event.model);
       const startTime = new Date();
 
-      // Build generation input from historyMessages (excluding system messages)
+      // Build generation input from historyMessages + current user prompt (excluding system messages)
       const historyMsgs = Array.isArray(event.historyMessages) ? event.historyMessages : [];
-      const nonSystemMessages = historyMsgs
+      // Append current user prompt so llm-call-1 input is never empty
+      const allMessages = [
+        ...historyMsgs,
+        ...(event.prompt ? [{ role: "user", content: event.prompt }] : []),
+      ];
+      const nonSystemMessages = allMessages
         .map((m) => buildApiMessage(m as Record<string, unknown>))
         .filter((m) => (m as Record<string, unknown>).role !== "system");
       const genInput = redactObject(
@@ -419,6 +410,7 @@ export function createLangfuseService(
             ? truncatePayload(output)
             : undefined;
         const eu = event.usage;
+        entry.lastGenerationEndTime = endTime;
         pendingGen.update({
           endTime,
           ...(truncatedOutput !== undefined ? { output: truncatedOutput } : {}),
@@ -485,7 +477,10 @@ export function createLangfuseService(
       }
 
       const spanId = generateObservationId(entry.traceId, "span", toolCallId);
-      const startTime = new Date();
+      // Use the previous generation's endTime as the tool span startTime.
+      // This ensures correct ordering in Langfuse UI when tool validation
+      // fails instantly and the next llmInput fires within the same millisecond.
+      const startTime = entry.lastGenerationEndTime ?? new Date();
       const span = entry.trace.span({
         id: spanId,
         name: `tool:${event.toolName ?? "unknown"}`,
@@ -557,6 +552,8 @@ export function createLangfuseService(
       });
       entry.pendingSpans.delete(toolCallId);
       entry.completedSpanToolCallIds.add(toolCallId);
+      // Update so the next sequential tool span starts after this one ends
+      entry.lastGenerationEndTime = endTime;
 
       const spanId = generateObservationId(entry.traceId, "span", toolCallId);
       writeObservationEvent(
@@ -673,6 +670,9 @@ export function createLangfuseService(
         `Langfuse: agentEnd path — useBatchCreation=${useBatchCreation} isRecovery=${isRecoveryEntry} llmCallCount=${entry.llmCallCount} completedGens=${entry.completedGenerations.size} turnEntries=${turnEntries.length}`,
       );
 
+      let batchTotalUsage:
+        | { input: number; output: number; cacheRead: number; cacheWrite: number; total: number }
+        | undefined;
       if (useBatchCreation) {
         const obsResult = buildObservationsFromEntries(
           entry.trace,
@@ -701,6 +701,7 @@ export function createLangfuseService(
         if (obsResult.lastProvider) {
           entry.lastProvider = obsResult.lastProvider;
         }
+        batchTotalUsage = obsResult.totalUsage;
       } else {
         finalizeIncrementalObservations(
           entry,
@@ -732,13 +733,55 @@ export function createLangfuseService(
         }
       }
 
-      const finalUsage = entry.storedUsage
+      // Aggregate usage directly from turnEntries (JSONL assistant messages). JSONL
+      // is the single source of truth — it's written independently of the llm_output
+      // hook, so this path works even when agent_end fires before llm_output
+      // (observed hook ordering in pi-coding-agent). Falls back to batchTotalUsage
+      // (recovery path) and entry.storedUsage (legacy single-call path) when JSONL
+      // is empty.
+      let aggregatedUsage:
+        | { input: number; output: number; cacheRead: number; cacheWrite: number; total: number }
+        | undefined;
+      if (turnEntries.length > 0) {
+        const acc = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
+        for (const te of turnEntries) {
+          const msg = te.message;
+          if (msg.role !== "assistant") {
+            continue;
+          }
+          const u = msg.usage as Record<string, unknown> | undefined;
+          if (!u) {
+            continue;
+          }
+          acc.input += (u.input as number) || 0;
+          acc.output += (u.output as number) || 0;
+          acc.cacheRead += (u.cacheRead as number) || 0;
+          acc.cacheWrite += (u.cacheWrite as number) || 0;
+          acc.total +=
+            (u.totalTokens as number) ||
+            (u.total as number) ||
+            ((u.input as number) || 0) + ((u.output as number) || 0);
+        }
+        if (acc.input > 0 || acc.output > 0 || acc.total > 0) {
+          aggregatedUsage = acc;
+        }
+        serviceLogger?.info?.(
+          `Langfuse: usage from turnEntries — input=${acc.input} output=${acc.output} total=${acc.total}`,
+        );
+      }
+      const usageSrc =
+        aggregatedUsage ??
+        (batchTotalUsage &&
+        (batchTotalUsage.input > 0 || batchTotalUsage.output > 0 || batchTotalUsage.total > 0)
+          ? batchTotalUsage
+          : entry.storedUsage);
+      const finalUsage = usageSrc
         ? {
-            inputTokens: entry.storedUsage.input,
-            outputTokens: entry.storedUsage.output,
-            cacheReadInputTokens: entry.storedUsage.cacheRead || undefined,
-            cacheWriteInputTokens: entry.storedUsage.cacheWrite || undefined,
-            totalTokens: entry.storedUsage.total,
+            inputTokens: usageSrc.input,
+            outputTokens: usageSrc.output,
+            cacheReadInputTokens: usageSrc.cacheRead || undefined,
+            cacheWriteInputTokens: usageSrc.cacheWrite || undefined,
+            totalTokens: usageSrc.total,
           }
         : undefined;
 
@@ -884,12 +927,12 @@ export function createLangfuseService(
       }
       disabled = false;
       promptManager = config.prompts?.length ? new PromptManager(langfuse, config) : null;
-      // Pre-warm prompt cache so resolveSync() works on the first message
+      // Prime the Langfuse SDK prompt cache so the first turn can reuse the fetched prompt.
       if (promptManager) {
         promptManager
           .warmCache()
           .then(() => {
-            ctx.logger.info(`Langfuse: prompt cache warmed (${config.prompts?.length ?? 0} rules)`);
+            ctx.logger.info(`Langfuse: prompt cache primed (${config.prompts?.length ?? 0} rules)`);
           })
           .catch((err: unknown) => {
             ctx.logger.warn(`Langfuse: warmCache failed: ${err}`);

@@ -45,8 +45,11 @@ openclaw config set plugins.entries.openclaw-langfuse.config.tracing '{"enabled"
 # Prompt management (optional) -- inject Langfuse prompts into agents
 openclaw config set plugins.entries.openclaw-langfuse.config.prompts '[{"match":"main","langfusePrompt":"oh-my-langfuse-prompt","label":"latest","inject":"replace"},{"match":"support-*","langfusePrompt":"oh-my-langfuse-support","label":"production","inject":"append"},{"match":"*","langfusePrompt":"oh-my-langfuse-fallback","label":"latest","inject":"append"}]'
 
-# Prompt cache TTL (default: 60 seconds)
+# Langfuse SDK prompt cache TTL (default: 60 seconds)
 openclaw config set plugins.entries.openclaw-langfuse.config.promptCacheTtlMs 60000
+
+# Prompt fetch timeout (default: 2 seconds)
+openclaw config set plugins.entries.openclaw-langfuse.config.promptFetchTimeoutMs 2000
 ```
 
 Then restart the gateway:
@@ -57,16 +60,17 @@ openclaw gateway restart
 
 ### Configuration Reference
 
-| Field              | Type         | Default                      | Description                                            |
-| ------------------ | ------------ | ---------------------------- | ------------------------------------------------------ |
-| `baseUrl`          | string       | `https://cloud.langfuse.com` | Langfuse API base URL                                  |
-| `publicKey`        | string       | --                           | Langfuse public key (or `LANGFUSE_PUBLIC_KEY` env var) |
-| `secretKey`        | string       | --                           | Langfuse secret key (or `LANGFUSE_SECRET_KEY` env var) |
-| `tracing.enabled`  | boolean      | `true`                       | Enable/disable LLM tracing                             |
-| `tracing.tags`     | string[]     | `[]`                         | Custom tags attached to every trace                    |
-| `tracing.redact`   | boolean      | `true`                       | Redact prompt/completion content                       |
-| `prompts`          | PromptRule[] | `[]`                         | Prompt injection rules (see below)                     |
-| `promptCacheTtlMs` | number       | `60000`                      | Prompt cache TTL in milliseconds                       |
+| Field                  | Type         | Default                      | Description                                            |
+| ---------------------- | ------------ | ---------------------------- | ------------------------------------------------------ |
+| `baseUrl`              | string       | `https://cloud.langfuse.com` | Langfuse API base URL                                  |
+| `publicKey`            | string       | --                           | Langfuse public key (or `LANGFUSE_PUBLIC_KEY` env var) |
+| `secretKey`            | string       | --                           | Langfuse secret key (or `LANGFUSE_SECRET_KEY` env var) |
+| `tracing.enabled`      | boolean      | `true`                       | Enable/disable LLM tracing                             |
+| `tracing.tags`         | string[]     | `[]`                         | Custom tags attached to every trace                    |
+| `tracing.redact`       | boolean      | `true`                       | Redact prompt/completion content                       |
+| `prompts`              | PromptRule[] | `[]`                         | Prompt injection rules (see below)                     |
+| `promptCacheTtlMs`     | number       | `60000`                      | Langfuse SDK prompt cache TTL in milliseconds          |
+| `promptFetchTimeoutMs` | number       | `2000`                       | Max wait for prompt fetch before skipping injection    |
 
 ### Prompt Rules
 
@@ -84,6 +88,11 @@ Each rule supports:
 - `version` -- Specific prompt version (omit for latest)
 - `label` -- Prompt label (e.g. `"production"`, `"staging"`)
 - `inject` -- How to inject: `"append"` (default), `"prepend"`, or `"replace"`
+
+Prompt freshness follows the Langfuse SDK cache behavior. When a cached prompt entry is expired,
+the SDK may return the stale value for the current request and refresh it in the background.
+If a prompt fetch exceeds `promptFetchTimeoutMs`, the plugin skips injection for that turn and
+continues without blocking the agent reply.
 
 ### Template Variables
 
