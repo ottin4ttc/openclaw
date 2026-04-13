@@ -161,8 +161,20 @@ function findAssistantCutoffIndex(
     return messages.length;
   }
 
-  let remaining = keepLastAssistants;
+  // Find the last real user message (non-toolResult). Everything after it
+  // belongs to the current turn and is automatically protected. This ensures
+  // keepLastAssistants only counts pre-turn assistants, so the cutoff stays
+  // stable as new assistant/tool_result messages accumulate within a turn.
+  let searchFrom = messages.length - 1;
   for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]?.role === "user") {
+      searchFrom = i;
+      break;
+    }
+  }
+
+  let remaining = keepLastAssistants;
+  for (let i = searchFrom; i >= 0; i--) {
     if (messages[i]?.role !== "assistant") {
       continue;
     }

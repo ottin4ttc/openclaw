@@ -192,6 +192,9 @@ describe("context-pruning", () => {
   });
 
   it("does not touch tool results after the last N assistants", () => {
+    // keepLastAssistants counts from the last real user message, not from array end.
+    // Current-turn assistants (after u4) are auto-protected.
+    // keepLastAssistants=2 protects a3, a2 (pre-turn), leaving a1 + t1 prunable.
     const messages: AgentMessage[] = [
       makeUser("u1"),
       makeAssistant("a1"),
@@ -223,7 +226,7 @@ describe("context-pruning", () => {
       }),
     ];
 
-    const next = pruneWithAggressiveDefaults(messages, { keepLastAssistants: 3 });
+    const next = pruneWithAggressiveDefaults(messages, { keepLastAssistants: 2 });
 
     expect(toolText(findToolResult(next, "t2"))).toContain("y".repeat(20_000));
     expect(toolText(findToolResult(next, "t3"))).toContain("z".repeat(20_000));
@@ -262,11 +265,14 @@ describe("context-pruning", () => {
   });
 
   it("hard-clear removes eligible tool results before cutoff", () => {
+    // keepLastAssistants=1 counts from the last real user message (u2).
+    // a1 is the 1 protected pre-turn assistant. a0 + t1 + t2 are before cutoff.
     const messages: AgentMessage[] = [
       makeUser("u1"),
-      makeAssistant("a1"),
+      makeAssistant("a0"),
       makeLargeExecToolResult("t1", "x"),
       makeLargeExecToolResult("t2", "y"),
+      makeAssistant("a1"),
       makeUser("u2"),
       makeAssistant("a2"),
       makeLargeExecToolResult("t3", "z"),
