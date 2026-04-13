@@ -2,7 +2,7 @@ diff --git a/dist/providers/anthropic.js b/dist/providers/anthropic.js
 index 6abaaa94b90c31fb3c5fa87c3b9634926b4c4887..91410e8f88b7647181a353c322d91737a63e0422 100644
 --- a/dist/providers/anthropic.js
 +++ b/dist/providers/anthropic.js
-@@ -668,25 +668,39 @@ function convertMessages(messages, model, isOAuthToken, cacheControl) {
+@@ -668,25 +668,44 @@ function convertMessages(messages, model, isOAuthToken, cacheControl) {
              });
          }
      }
@@ -26,6 +26,11 @@ index 6abaaa94b90c31fb3c5fa87c3b9634926b4c4887..91410e8f88b7647181a353c322d91737
 +        for (let idx = params.length - 1; idx >= 0 && breakpointsPlaced < maxBreakpoints; idx--) {
 +            const msg = params[idx];
 +            if (msg.role !== "user")
++                continue;
++            // Skip tool_result messages — their role is "user" in Anthropic format,
++            // but placing breakpoints on them causes position shifts within a turn
++            // (each tool call adds a new tool_result, displacing earlier breakpoints).
++            if (Array.isArray(msg.content) && msg.content[0] && msg.content[0].type === "tool_result")
 +                continue;
 +            if (Array.isArray(msg.content)) {
 +                const lastBlock = msg.content[msg.content.length - 1];
