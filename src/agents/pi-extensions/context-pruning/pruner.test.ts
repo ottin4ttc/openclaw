@@ -59,6 +59,7 @@ describe("pruneContextMessages", () => {
         messages,
         settings: DEFAULT_CONTEXT_PRUNING_SETTINGS,
         ctx: CONTEXT_WINDOW_1M,
+        referenceTime: Date.now(),
       }),
     ).not.toThrow();
   });
@@ -73,6 +74,7 @@ describe("pruneContextMessages", () => {
         messages,
         settings: DEFAULT_CONTEXT_PRUNING_SETTINGS,
         ctx: CONTEXT_WINDOW_1M,
+        referenceTime: Date.now(),
       }),
     ).not.toThrow();
   });
@@ -90,6 +92,7 @@ describe("pruneContextMessages", () => {
         messages,
         settings: DEFAULT_CONTEXT_PRUNING_SETTINGS,
         ctx: CONTEXT_WINDOW_1M,
+        referenceTime: Date.now(),
       }),
     ).not.toThrow();
   });
@@ -106,6 +109,7 @@ describe("pruneContextMessages", () => {
       messages,
       settings: DEFAULT_CONTEXT_PRUNING_SETTINGS,
       ctx: CONTEXT_WINDOW_1M,
+      referenceTime: Date.now(),
     });
     expect(result).toHaveLength(2);
   });

@@ -232,14 +232,37 @@ ${tail}`;
   return { ...msg, content: [asText(trimmed + note)] };
 }
 
+function getMessageTimestamp(msg: AgentMessage): number | null {
+  const ts = (msg as unknown as { timestamp?: unknown }).timestamp;
+  return typeof ts === "number" && Number.isFinite(ts) ? ts : null;
+}
+
+function isAgeEligible(msg: AgentMessage, referenceTime: number, ttlMs: number): boolean {
+  if (ttlMs <= 0) {
+    return false;
+  }
+  const ts = getMessageTimestamp(msg);
+  if (ts === null) {
+    return false;
+  }
+  return referenceTime - ts >= ttlMs;
+}
+
 export function pruneContextMessages(params: {
   messages: AgentMessage[];
   settings: EffectiveContextPruningSettings;
   ctx: Pick<ExtensionContext, "model">;
   isToolPrunable?: (toolName: string) => boolean;
   contextWindowTokensOverride?: number;
+  /**
+   * Reference time used to compute each tool result's age. Should be the current
+   * turn's start time so decisions remain stable across all LLM calls in that turn
+   * and monotonic across turns.
+   */
+  referenceTime: number;
 }): AgentMessage[] {
-  const { messages, settings, ctx } = params;
+  const { messages, settings, ctx, referenceTime } = params;
+
   const contextWindowTokens =
     typeof params.contextWindowTokensOverride === "number" &&
     Number.isFinite(params.contextWindowTokensOverride) &&
@@ -267,15 +290,11 @@ export function pruneContextMessages(params: {
   const pruneStartIndex = firstUserIndex === null ? messages.length : firstUserIndex;
 
   const isToolPrunable = params.isToolPrunable ?? makeToolPrunablePredicate(settings.tools);
+  const ttlMs = settings.ttlMs;
 
-  const totalCharsBefore = estimateContextChars(messages);
-  let totalChars = totalCharsBefore;
-  let ratio = totalChars / charWindow;
-  if (ratio < settings.softTrimRatio) {
-    return messages;
-  }
-
-  const prunableToolIndexes: number[] = [];
+  // First pass: collect age-eligible prunable tool results and apply soft-trim.
+  const ageEligibleIndexes: number[] = [];
+  let totalChars = estimateContextChars(messages);
   let next: AgentMessage[] | null = null;
 
   for (let i = pruneStartIndex; i < cutoffIndex; i++) {
@@ -289,7 +308,10 @@ export function pruneContextMessages(params: {
     if (hasImageBlocks(msg.content)) {
       continue;
     }
-    prunableToolIndexes.push(i);
+    if (!isAgeEligible(msg, referenceTime, ttlMs)) {
+      continue;
+    }
+    ageEligibleIndexes.push(i);
 
     const updated = softTrimToolResultMessage({
       msg: msg as unknown as ToolResultMessage,
@@ -309,7 +331,10 @@ export function pruneContextMessages(params: {
   }
 
   const outputAfterSoftTrim = next ?? messages;
-  ratio = totalChars / charWindow;
+
+  // Second pass: ratio-based hard-clear as an overflow safety net. Only operates
+  // on the age-eligible subset — fresh tool results are never hard-cleared.
+  let ratio = totalChars / charWindow;
   if (ratio < settings.hardClearRatio) {
     return outputAfterSoftTrim;
   }
@@ -318,7 +343,7 @@ export function pruneContextMessages(params: {
   }
 
   let prunableToolChars = 0;
-  for (const i of prunableToolIndexes) {
+  for (const i of ageEligibleIndexes) {
     const msg = outputAfterSoftTrim[i];
     if (!msg || msg.role !== "toolResult") {
       continue;
@@ -329,7 +354,7 @@ export function pruneContextMessages(params: {
     return outputAfterSoftTrim;
   }
 
-  for (const i of prunableToolIndexes) {
+  for (const i of ageEligibleIndexes) {
     if (ratio < settings.hardClearRatio) {
       break;
     }
@@ -339,9 +364,10 @@ export function pruneContextMessages(params: {
     }
 
     const beforeChars = estimateMessageChars(msg);
+    const clearedContent: TextContent[] = [asText(settings.hardClear.placeholder)];
     const cleared: ToolResultMessage = {
       ...msg,
-      content: [asText(settings.hardClear.placeholder)],
+      content: clearedContent,
     };
     if (!next) {
       next = messages.slice();
