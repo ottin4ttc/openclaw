@@ -100,7 +100,14 @@ function makeMockSessionManager(cacheTtlTimestamp: number | null) {
 
 type ContextPruningSettings = NonNullable<ReturnType<typeof computeEffectiveSettings>>;
 type PruneArgs = Parameters<typeof pruneContextMessages>[0];
-type PruneOverrides = Omit<PruneArgs, "messages" | "settings" | "ctx">;
+type PruneOverrides = Partial<Omit<PruneArgs, "messages" | "settings" | "ctx">>;
+
+/**
+ * A `referenceTime` far in the future so tool results created via `Date.now()`
+ * in the test helpers appear older than the default 5-minute TTL. Tests that
+ * want to verify age-based filtering pass a custom `referenceTime`.
+ */
+const FUTURE_REFERENCE_TIME = Date.now() + 10 * 60 * 1000;
 
 const CONTEXT_WINDOW_1000 = {
   model: { contextWindow: 1000 },
@@ -130,6 +137,7 @@ function pruneWithAggressiveDefaults(
     messages,
     settings: makeAggressiveSettings(settingsOverrides),
     ctx: CONTEXT_WINDOW_1000,
+    referenceTime: FUTURE_REFERENCE_TIME,
     ...extra,
   });
 }
@@ -293,14 +301,15 @@ describe("context-pruning", () => {
   it("uses contextWindow override when ctx.model is missing", () => {
     const messages = makeSimpleToolPruningMessages(true);
 
-    const next = pruneContextMessages({
+    const result = pruneContextMessages({
       messages,
       settings: makeAggressiveSettings(),
       ctx: { model: undefined } as unknown as ExtensionContext,
       contextWindowTokensOverride: 1000,
+      referenceTime: FUTURE_REFERENCE_TIME,
     });
 
-    expect(toolText(findToolResult(next, "t1"))).toBe("[cleared]");
+    expect(toolText(findToolResult(result, "t1"))).toBe("[cleared]");
   });
 
   it("reads per-session settings from registry", async () => {
@@ -313,7 +322,21 @@ describe("context-pruning", () => {
       isToolPrunable: () => true,
     });
 
-    const messages = makeSimpleToolPruningMessages(true);
+    // Tool result created in the past so its age exceeds TTL.
+    const oldToolResult: ToolResultMessage = {
+      role: "toolResult",
+      toolCallId: "t1",
+      toolName: "exec",
+      content: [{ type: "text", text: "x".repeat(20_000) }],
+      isError: false,
+      timestamp: Date.now() - DEFAULT_CONTEXT_PRUNING_SETTINGS.ttlMs - 60_000,
+    };
+    const messages: AgentMessage[] = [
+      makeUser("u1"),
+      makeAssistant("a1"),
+      oldToolResult,
+      makeAssistant("a2"),
+    ];
 
     const handler = createContextHandler();
     const result = runContextHandler(handler, messages, sessionManager);
@@ -334,7 +357,15 @@ describe("context-pruning", () => {
       isToolPrunable: () => true,
     });
 
-    const messages = makeSimpleToolPruningMessages();
+    const oldToolResult: ToolResultMessage = {
+      role: "toolResult",
+      toolCallId: "t1",
+      toolName: "exec",
+      content: [{ type: "text", text: "x".repeat(20_000) }],
+      isError: false,
+      timestamp: Date.now() - DEFAULT_CONTEXT_PRUNING_SETTINGS.ttlMs - 60_000,
+    };
+    const messages: AgentMessage[] = [makeUser("u1"), makeAssistant("a1"), oldToolResult];
 
     const handler = createContextHandler();
     const first = runContextHandler(handler, messages, sessionManager);
@@ -343,8 +374,9 @@ describe("context-pruning", () => {
     }
     expect(toolText(findToolResult(first.messages, "t1"))).toBe("[cleared]");
 
-    // Second call within the same turn should also prune (persisted timestamp
-    // is not updated mid-turn, only at turn end by appendCacheTtlTimestamp).
+    // Second call within the same turn should produce identical output: same
+    // turnKey (cache-ttl timestamp unchanged) → same turnStartTime anchor →
+    // same per-tool-result age → same pruning decision.
     const second = runContextHandler(handler, messages, sessionManager);
     expect(second).toBeDefined();
     expect(toolText(findToolResult(second!.messages, "t1"))).toBe("[cleared]");
@@ -439,5 +471,232 @@ describe("context-pruning", () => {
     expect(text).toContain("abcdef");
     expect(text).toContain("efghij");
     expect(text).toContain("[Tool result trimmed:");
+  });
+
+  describe("time-anchored pruning", () => {
+    /**
+     * Make a tool result whose timestamp is `ageMs` milliseconds before T.
+     * Used to set up known-age messages for age-gate tests.
+     */
+    function makeDatedToolResult(params: {
+      toolCallId: string;
+      text: string;
+      timestamp: number;
+    }): ToolResultMessage {
+      return {
+        role: "toolResult",
+        toolCallId: params.toolCallId,
+        toolName: "exec",
+        content: [{ type: "text", text: params.text }],
+        isError: false,
+        timestamp: params.timestamp,
+      };
+    }
+
+    const TTL = DEFAULT_CONTEXT_PRUNING_SETTINGS.ttlMs;
+
+    it("fresh tool result is not pruned even when old ones are", () => {
+      const T = 10_000_000;
+      const oldMsg = makeDatedToolResult({
+        toolCallId: "t-old",
+        text: "x".repeat(20_000),
+        timestamp: T - TTL - 1_000,
+      });
+      const freshMsg = makeDatedToolResult({
+        toolCallId: "t-fresh",
+        text: "y".repeat(20_000),
+        timestamp: T - 1_000,
+      });
+      const messages: AgentMessage[] = [makeUser("u1"), makeAssistant("a1"), oldMsg, freshMsg];
+
+      const next = pruneContextMessages({
+        messages,
+        settings: makeAggressiveSettings(),
+        ctx: CONTEXT_WINDOW_1000,
+        referenceTime: T,
+      });
+
+      expect(toolText(findToolResult(next, "t-old"))).toBe("[cleared]");
+      expect(toolText(findToolResult(next, "t-fresh"))).toContain("y".repeat(20_000));
+    });
+
+    it("tool result without timestamp is not pruned", () => {
+      const noTimestamp: AgentMessage = {
+        role: "toolResult",
+        toolCallId: "t-no-ts",
+        toolName: "exec",
+        content: [{ type: "text", text: "z".repeat(20_000) }],
+        isError: false,
+      } as unknown as AgentMessage;
+      const messages: AgentMessage[] = [makeUser("u1"), makeAssistant("a1"), noTimestamp];
+
+      const next = pruneContextMessages({
+        messages,
+        settings: makeAggressiveSettings(),
+        ctx: CONTEXT_WINDOW_1000,
+        referenceTime: FUTURE_REFERENCE_TIME,
+      });
+
+      const tool = next.find((m) => m.role === "toolResult") as ToolResultMessage;
+      expect(toolText(tool)).toContain("z".repeat(20_000));
+    });
+
+    it("same referenceTime across calls produces identical output (within-turn stability)", () => {
+      const T = 10_000_000;
+      const msg = makeDatedToolResult({
+        toolCallId: "t1",
+        text: "x".repeat(20_000),
+        timestamp: T - TTL - 1_000,
+      });
+      const messages: AgentMessage[] = [makeUser("u1"), makeAssistant("a1"), msg];
+
+      const a = pruneContextMessages({
+        messages,
+        settings: makeAggressiveSettings(),
+        ctx: CONTEXT_WINDOW_1000,
+        referenceTime: T,
+      });
+      const b = pruneContextMessages({
+        messages,
+        settings: makeAggressiveSettings(),
+        ctx: CONTEXT_WINDOW_1000,
+        referenceTime: T,
+      });
+
+      expect(toolText(findToolResult(a, "t1"))).toBe(toolText(findToolResult(b, "t1")));
+      expect(toolText(findToolResult(a, "t1"))).toBe("[cleared]");
+    });
+
+    it("cross-turn monotonicity: short gap does not un-prune", () => {
+      // Turn N starts at T0; tool result is old enough to be pruned.
+      // Turn N+1 starts at T1 (only 2 minutes later, well within TTL).
+      // The tool result must still be pruned in Turn N+1.
+      const T0 = 10_000_000;
+      const T1 = T0 + 2 * 60 * 1000; // 2 minutes later
+      const oldMsg = makeDatedToolResult({
+        toolCallId: "t-old",
+        text: "x".repeat(20_000),
+        timestamp: T0 - TTL - 1_000,
+      });
+      const messages: AgentMessage[] = [makeUser("u1"), makeAssistant("a1"), oldMsg];
+
+      const turnN = pruneContextMessages({
+        messages,
+        settings: makeAggressiveSettings(),
+        ctx: CONTEXT_WINDOW_1000,
+        referenceTime: T0,
+      });
+      const turnNPlus1 = pruneContextMessages({
+        messages,
+        settings: makeAggressiveSettings(),
+        ctx: CONTEXT_WINDOW_1000,
+        referenceTime: T1,
+      });
+
+      expect(toolText(findToolResult(turnN, "t-old"))).toBe("[cleared]");
+      expect(toolText(findToolResult(turnNPlus1, "t-old"))).toBe("[cleared]");
+    });
+
+    it("long turn: multiple LLM calls spread across time use same anchor", () => {
+      // Simulate a long turn: turnStartTime is fixed at T, even though LLM calls
+      // happen at T+90s and T+240s. The pruning decision must be identical across
+      // all three simulated calls.
+      const T = 10_000_000;
+      const msg = makeDatedToolResult({
+        toolCallId: "t1",
+        text: "x".repeat(20_000),
+        timestamp: T - 4 * 60 * 1000, // 4 minutes before turn start, < 5min TTL
+      });
+      const messages: AgentMessage[] = [makeUser("u1"), makeAssistant("a1"), msg];
+
+      // All three calls anchored to T (not Date.now() + 90s / 240s).
+      const call1 = pruneContextMessages({
+        messages,
+        settings: makeAggressiveSettings(),
+        ctx: CONTEXT_WINDOW_1000,
+        referenceTime: T,
+      });
+      const call2 = pruneContextMessages({
+        messages,
+        settings: makeAggressiveSettings(),
+        ctx: CONTEXT_WINDOW_1000,
+        referenceTime: T,
+      });
+      const call3 = pruneContextMessages({
+        messages,
+        settings: makeAggressiveSettings(),
+        ctx: CONTEXT_WINDOW_1000,
+        referenceTime: T,
+      });
+
+      // All three see age = 4min < 5min TTL → not pruned.
+      const expected = "x".repeat(20_000);
+      expect(toolText(findToolResult(call1, "t1"))).toContain(expected);
+      expect(toolText(findToolResult(call2, "t1"))).toContain(expected);
+      expect(toolText(findToolResult(call3, "t1"))).toContain(expected);
+    });
+
+    it("ratio-based hard-clear only affects age-eligible tool results", () => {
+      // Two tool results, one old (eligible), one fresh (not eligible).
+      // Even if ratio is over threshold, the fresh one must NOT be hard-cleared.
+      const T = 10_000_000;
+      const oldMsg = makeDatedToolResult({
+        toolCallId: "t-old",
+        text: "x".repeat(20_000),
+        timestamp: T - TTL - 1_000,
+      });
+      const freshMsg = makeDatedToolResult({
+        toolCallId: "t-fresh",
+        text: "y".repeat(20_000),
+        timestamp: T - 1_000,
+      });
+      const messages: AgentMessage[] = [makeUser("u1"), makeAssistant("a1"), oldMsg, freshMsg];
+
+      const next = pruneContextMessages({
+        messages,
+        settings: makeAggressiveSettings({
+          // Force hard-clear regardless of context size by setting ratio to 0.
+          hardClearRatio: 0,
+          minPrunableToolChars: 0,
+        }),
+        ctx: CONTEXT_WINDOW_1000,
+        referenceTime: T,
+      });
+
+      expect(toolText(findToolResult(next, "t-old"))).toBe("[cleared]");
+      // Fresh tool result must not be touched by hard-clear.
+      expect(toolText(findToolResult(next, "t-fresh"))).toContain("y".repeat(20_000));
+    });
+
+    it("extension: short inter-turn gap still runs the pruner (no global skip gate)", () => {
+      // Previous turn end timestamp is only 30s ago (well within TTL).
+      // Old-style logic would skip pruning entirely. New logic must still invoke
+      // the pruner and let per-tool-result age checks decide.
+      const recentTimestamp = Date.now() - 30 * 1000;
+      const sessionManager = makeMockSessionManager(recentTimestamp);
+
+      setContextPruningRuntime(sessionManager, {
+        settings: makeAggressiveSettings(),
+        contextWindowTokens: 1000,
+        isToolPrunable: () => true,
+      });
+
+      // Tool result is old enough to be prunable regardless.
+      const oldMsg: ToolResultMessage = {
+        role: "toolResult",
+        toolCallId: "t1",
+        toolName: "exec",
+        content: [{ type: "text", text: "x".repeat(20_000) }],
+        isError: false,
+        timestamp: Date.now() - DEFAULT_CONTEXT_PRUNING_SETTINGS.ttlMs - 60_000,
+      };
+      const messages: AgentMessage[] = [makeUser("u1"), makeAssistant("a1"), oldMsg];
+
+      const handler = createContextHandler();
+      const result = runContextHandler(handler, messages, sessionManager);
+
+      expect(result).toBeDefined();
+      expect(toolText(findToolResult(result!.messages, "t1"))).toBe("[cleared]");
+    });
   });
 });

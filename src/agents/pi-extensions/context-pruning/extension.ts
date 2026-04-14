@@ -2,7 +2,7 @@ import type { ContextEvent, ExtensionAPI, ExtensionContext } from "@mariozechner
 import { createSubsystemLogger } from "../../../logging/subsystem.js";
 import { readLastCacheTtlTimestamp } from "../../pi-embedded-runner/cache-ttl.js";
 import { pruneContextMessages } from "./pruner.js";
-import { getContextPruningRuntime } from "./runtime.js";
+import { getContextPruningRuntime, getOrInitCurrentTurn } from "./runtime.js";
 
 const log = createSubsystemLogger("context-pruning");
 
@@ -12,20 +12,18 @@ export default function contextPruningExtension(api: ExtensionAPI): void {
     if (!runtime) {
       return undefined;
     }
+    if (runtime.settings.mode !== "cache-ttl") {
+      return undefined;
+    }
 
-    if (runtime.settings.mode === "cache-ttl") {
-      const ttlMs = runtime.settings.ttlMs;
-      // Always read the persisted timestamp from session history rather than
-      // the in-memory cache.  appendCacheTtlTimestamp() (attempt.ts) writes
-      // this once at turn end, so every LLM call within the same turn reads
-      // the same value and makes a consistent TTL decision.
-      const lastTouch = readLastCacheTtlTimestamp(ctx.sessionManager) ?? null;
-      if (!lastTouch || ttlMs <= 0) {
-        return undefined;
-      }
-      if (ttlMs > 0 && Date.now() - lastTouch < ttlMs) {
-        return undefined;
-      }
+    // Turn boundary is detected via the session's last cache-ttl timestamp.
+    // This value is stable within a turn (written once at turn end by
+    // appendCacheTtlTimestamp) and changes when a new turn begins. We use it
+    // as `turnKey` to anchor the current turn's start time.
+    const turnKey = readLastCacheTtlTimestamp(ctx.sessionManager) ?? 0;
+    const anchor = getOrInitCurrentTurn(ctx.sessionManager, turnKey, Date.now());
+    if (!anchor) {
+      return undefined;
     }
 
     const next = pruneContextMessages({
@@ -34,6 +32,7 @@ export default function contextPruningExtension(api: ExtensionAPI): void {
       ctx,
       isToolPrunable: runtime.isToolPrunable,
       contextWindowTokensOverride: runtime.contextWindowTokens ?? undefined,
+      referenceTime: anchor.turnStartTime,
     });
 
     if (next === event.messages) {
