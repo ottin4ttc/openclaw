@@ -39,6 +39,7 @@ export type TraceContextEntry = {
   lastModel?: string;
   lastProvider?: string;
   initialMessages?: unknown[]; // historyMessages from first llm_input call
+  lastHistoryLength?: number; // message count after last llmInput, for delta input computation
   finalized?: boolean; // set by agent_end; prevents diagnostic handler from overwriting metadata
   currentGenerationId?: string; // ID of the most recent generation, for parentObservationId on tool spans
   lastGenerationEndTime?: Date; // endTime of most recent generation; used as tool span startTime for correct ordering

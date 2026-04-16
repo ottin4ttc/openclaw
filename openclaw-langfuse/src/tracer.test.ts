@@ -117,7 +117,7 @@ describe("LangfuseService tracer", () => {
     const { beforeAgentStart, llmInput } = service.getHookHandlers();
 
     beforeAgentStart({ prompt: "hello" }, agentCtx);
-    llmInput(
+    await llmInput(
       {
         runId: "run-1",
         sessionId: "session-id-1",
@@ -144,7 +144,7 @@ describe("LangfuseService tracer", () => {
     const ctx2 = { ...agentCtx, sessionKey: "session-key-incr" };
 
     beforeAgentStart({ prompt: "hello" }, ctx2);
-    llmInput(
+    await llmInput(
       {
         runId: "run-1",
         sessionId: "session-id-1",
@@ -298,7 +298,7 @@ describe("LangfuseService tracer", () => {
     beforeAgentStart({ prompt: "Do some work" }, agentCtx);
 
     // LLM call 1
-    llmInput(
+    await llmInput(
       {
         runId: "run-1",
         sessionId: "s1",
@@ -332,7 +332,7 @@ describe("LangfuseService tracer", () => {
     );
 
     // LLM call 2
-    llmInput(
+    await llmInput(
       {
         runId: "run-2",
         sessionId: "s1",
@@ -417,7 +417,7 @@ describe("LangfuseService tracer", () => {
 
     // None of these should throw, and none should call langfuse
     beforeAgentStart({ prompt: "hello" }, agentCtx);
-    llmInput(
+    await llmInput(
       {
         runId: "r1",
         sessionId: "s1",
@@ -565,7 +565,7 @@ describe("LangfuseService tracer", () => {
     const ctx = { ...agentCtx, sessionKey: "session-key-tooluse-output" };
 
     beforeAgentStart({ prompt: "search" }, ctx);
-    llmInput(
+    await llmInput(
       {
         runId: "run-tu",
         sessionId: "s1",
@@ -652,7 +652,7 @@ describe("LangfuseService tracer", () => {
     const ctx = { ...agentCtx, sessionKey: "session-key-zero-cost" };
 
     beforeAgentStart({ prompt: "hello" }, ctx);
-    llmInput(
+    await llmInput(
       {
         runId: "run-zc",
         sessionId: "s1",
@@ -755,7 +755,7 @@ describe("LangfuseService tracer", () => {
     const ctx = { ...agentCtx, sessionKey: "session-key-parent-obs" };
 
     beforeAgentStart({ prompt: "hello" }, ctx);
-    llmInput(
+    await llmInput(
       {
         runId: "run-po",
         sessionId: "s1",
@@ -780,5 +780,312 @@ describe("LangfuseService tracer", () => {
     // The span should have parentObservationId matching the generation
     const spanArgs = mockTrace.span.mock.calls[0][0] as Record<string, unknown>;
     expect(spanArgs.parentObservationId).toBe(genId);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Regression test: simulate the real 15-call agentic trace that exposed the
+  // cumulative-payload + fire-and-forget flush bug.
+  // ---------------------------------------------------------------------------
+  it("15-call agentic trace: each generation uses delta input, flush is awaited", async () => {
+    const service = await startService();
+    const { beforeAgentStart, llmInput, llmOutput } = service.getHookHandlers();
+    const ctx = { ...agentCtx, sessionKey: "session-key-15call" };
+
+    beforeAgentStart({ prompt: "hello" }, ctx);
+
+    // Simulate 15 LLM calls with tool use, mimicking the real JSONL data.
+    // Each call: llmInput → llmOutput, with growing historyMessages.
+    const history: Array<Record<string, unknown>> = [];
+    const flushCallsBefore = mockLangfuseInstance.flushAsync.mock.calls.length;
+
+    for (let i = 0; i < 15; i++) {
+      const userPrompt = i === 0 ? "What can you find about this?" : "";
+      // Build historyMessages: accumulates all prior user/assistant/toolResult messages
+      const historySnapshot = [...history];
+
+      await llmInput(
+        {
+          runId: `run-15c-${i}`,
+          sessionId: "session-id-1",
+          provider: "anthropic",
+          model: "claude-opus-4.6",
+          prompt: userPrompt,
+          historyMessages: historySnapshot,
+          imagesCount: 0,
+        },
+        ctx,
+      );
+
+      // Verify generation input is delta, not cumulative
+      const genCall =
+        mockTrace.generation.mock.calls[mockTrace.generation.mock.calls.length - 1][0];
+      const input = genCall.input as { messages: unknown[] };
+
+      if (i === 0) {
+        // gen-1: only user prompt
+        expect(input.messages).toHaveLength(1);
+      } else {
+        // gen-N: delta only (assistant + toolResult from previous call = 2 messages)
+        // Should NOT contain all accumulated history
+        expect(input.messages.length).toBeLessThanOrEqual(2);
+        expect(input.messages.length).toBeGreaterThan(0);
+      }
+
+      // Add the user prompt to history (only for first call)
+      if (i === 0) {
+        history.push({ role: "user", content: userPrompt });
+      }
+
+      // Simulate assistant response with tool call
+      const assistantContent =
+        i < 14
+          ? [
+              {
+                type: "toolCall",
+                id: `tc-${i}`,
+                name: "openmai_internal_api_call",
+                arguments: "{}",
+              },
+            ]
+          : [{ type: "text", text: "Here is the final answer." }];
+      llmOutput(
+        {
+          runId: `run-15c-${i}`,
+          sessionId: "session-id-1",
+          provider: "anthropic",
+          model: "claude-opus-4.6",
+          assistantTexts: i < 14 ? [] : ["Here is the final answer."],
+          usage: { input: 50000, output: 200, total: 50200, cacheRead: 45000, cacheWrite: 5000 },
+        },
+        ctx,
+      );
+
+      // Add assistant to history
+      history.push({ role: "assistant", content: assistantContent });
+
+      // Add tool result to history (except last call which is text-only)
+      if (i < 14) {
+        const toolResultContent = "x".repeat(i < 5 ? 1000 : 5000); // simulate growing results
+        history.push({ role: "toolResult", toolCallId: `tc-${i}`, content: toolResultContent });
+      }
+    }
+
+    // Verify: flushAsync was called and awaited for each of the 15 llmInput calls
+    const flushCallsAfter = mockLangfuseInstance.flushAsync.mock.calls.length;
+    expect(flushCallsAfter - flushCallsBefore).toBe(15);
+
+    // Verify: 15 generations were created
+    const genCalls = mockTrace.generation.mock.calls;
+    const our15 = genCalls.slice(-15);
+    for (let i = 0; i < 15; i++) {
+      expect(our15[i][0].name).toBe(`llm-call-${i + 1}`);
+    }
+
+    // Verify: total input payload is much smaller than cumulative approach.
+    // Cumulative would grow as O(n^2), delta stays O(n).
+    let totalInputSize = 0;
+    for (let i = 0; i < 15; i++) {
+      const input = our15[i][0].input;
+      totalInputSize += JSON.stringify(input).length;
+    }
+    // With cumulative approach on this data, total would be ~500KB+.
+    // With delta, it should be well under 200KB.
+    expect(totalInputSize).toBeLessThan(200_000);
+  });
+
+  it("llmInput gen-1 input contains only user prompt (delta), not full history", async () => {
+    const service = await startService();
+    const { beforeAgentStart, llmInput } = service.getHookHandlers();
+    const ctx = { ...agentCtx, sessionKey: "session-key-delta-1" };
+
+    beforeAgentStart({ prompt: "hello" }, ctx);
+    await llmInput(
+      {
+        runId: "run-delta-1",
+        sessionId: "session-id-1",
+        provider: "anthropic",
+        model: "claude-3-5-sonnet",
+        prompt: "What is 2+2?",
+        historyMessages: [
+          { role: "user", content: "prior question" },
+          { role: "assistant", content: "prior answer" },
+        ],
+        imagesCount: 0,
+      },
+      ctx,
+    );
+
+    const genArgs = mockTrace.generation.mock.calls[mockTrace.generation.mock.calls.length - 1][0];
+    const input = genArgs.input as { messages: Array<{ role: string; content: unknown }> };
+    // gen-1 input should only contain the user prompt, not prior history
+    expect(input.messages).toHaveLength(1);
+    expect(input.messages[0].role).toBe("user");
+  });
+
+  it("llmInput gen-2 input contains only delta messages since gen-1", async () => {
+    const service = await startService();
+    const { beforeAgentStart, llmInput, llmOutput } = service.getHookHandlers();
+    const ctx = { ...agentCtx, sessionKey: "session-key-delta-2" };
+
+    beforeAgentStart({ prompt: "hello" }, ctx);
+
+    // gen-1
+    await llmInput(
+      {
+        runId: "run-d2-1",
+        sessionId: "session-id-1",
+        provider: "anthropic",
+        model: "claude-3-5-sonnet",
+        prompt: "What is 2+2?",
+        historyMessages: [],
+        imagesCount: 0,
+      },
+      ctx,
+    );
+    llmOutput(
+      {
+        runId: "run-d2-1",
+        sessionId: "session-id-1",
+        provider: "anthropic",
+        model: "claude-3-5-sonnet",
+        assistantTexts: ["4"],
+        usage: { input: 10, output: 5, total: 15 },
+      },
+      ctx,
+    );
+
+    // gen-2: historyMessages now includes user + assistant + toolResult
+    await llmInput(
+      {
+        runId: "run-d2-2",
+        sessionId: "session-id-1",
+        provider: "anthropic",
+        model: "claude-3-5-sonnet",
+        prompt: "",
+        historyMessages: [
+          { role: "user", content: "What is 2+2?" },
+          {
+            role: "assistant",
+            content: [{ type: "tool_use", id: "tc1", name: "calc", input: {} }],
+          },
+          { role: "toolResult", toolCallId: "tc1", content: "4" },
+        ],
+        imagesCount: 0,
+      },
+      ctx,
+    );
+
+    // gen-2's input should be delta only: assistant + toolResult (messages after gen-1's input)
+    const gen2Args = mockTrace.generation.mock.calls[mockTrace.generation.mock.calls.length - 1][0];
+    const input = gen2Args.input as { messages: Array<{ role: string }> };
+    // gen-1 consumed index 0 (user prompt, length=1), so gen-2 delta = slice(1) = assistant + toolResult
+    expect(input.messages.length).toBe(2);
+    expect(input.messages[0].role).toBe("assistant");
+  });
+
+  it("llmInput stores pre-turn history in trace metadata as prior_conversation", async () => {
+    const service = await startService();
+    const { beforeAgentStart, llmInput } = service.getHookHandlers();
+    const ctx = { ...agentCtx, sessionKey: "session-key-prior-conv" };
+
+    beforeAgentStart({ prompt: "hello" }, ctx);
+    await llmInput(
+      {
+        runId: "run-prior-1",
+        sessionId: "session-id-1",
+        provider: "anthropic",
+        model: "claude-3-5-sonnet",
+        prompt: "New question",
+        historyMessages: [
+          { role: "user", content: "old question" },
+          { role: "assistant", content: "old answer" },
+        ],
+        imagesCount: 0,
+      },
+      ctx,
+    );
+
+    // trace.update should have been called with prior_conversation metadata
+    const updateCalls = mockTrace.update.mock.calls;
+    const priorConvUpdate = updateCalls.find(
+      (call: unknown[]) =>
+        (call[0] as Record<string, unknown>)?.metadata &&
+        (call[0] as Record<string, Record<string, unknown>>).metadata.prior_conversation,
+    );
+    expect(priorConvUpdate).toBeDefined();
+    const priorConv = (priorConvUpdate![0] as Record<string, Record<string, unknown>>).metadata
+      .prior_conversation as Array<{ role: string }>;
+    expect(priorConv).toHaveLength(2);
+    expect(priorConv[0].role).toBe("user");
+    expect(priorConv[1].role).toBe("assistant");
+  });
+
+  it("llmInput does not set prior_conversation on subsequent calls", async () => {
+    const service = await startService();
+    const { beforeAgentStart, llmInput, llmOutput } = service.getHookHandlers();
+    const ctx = { ...agentCtx, sessionKey: "session-key-no-dup-prior" };
+
+    beforeAgentStart({ prompt: "hello" }, ctx);
+
+    // gen-1 with prior history
+    await llmInput(
+      {
+        runId: "run-nodup-1",
+        sessionId: "session-id-1",
+        provider: "anthropic",
+        model: "claude-3-5-sonnet",
+        prompt: "Q1",
+        historyMessages: [
+          { role: "user", content: "old" },
+          { role: "assistant", content: "old ans" },
+        ],
+        imagesCount: 0,
+      },
+      ctx,
+    );
+    llmOutput(
+      {
+        runId: "run-nodup-1",
+        sessionId: "session-id-1",
+        provider: "anthropic",
+        model: "claude-3-5-sonnet",
+        assistantTexts: ["A1"],
+        usage: { input: 10, output: 5, total: 15 },
+      },
+      ctx,
+    );
+
+    // Count update calls with prior_conversation before gen-2
+    const priorConvCountBefore = mockTrace.update.mock.calls.filter(
+      (call: unknown[]) =>
+        (call[0] as Record<string, Record<string, unknown>>)?.metadata?.prior_conversation,
+    ).length;
+
+    // gen-2
+    await llmInput(
+      {
+        runId: "run-nodup-2",
+        sessionId: "session-id-1",
+        provider: "anthropic",
+        model: "claude-3-5-sonnet",
+        prompt: "",
+        historyMessages: [
+          { role: "user", content: "old" },
+          { role: "assistant", content: "old ans" },
+          { role: "user", content: "Q1" },
+          { role: "assistant", content: "A1" },
+        ],
+        imagesCount: 0,
+      },
+      ctx,
+    );
+
+    const priorConvCountAfter = mockTrace.update.mock.calls.filter(
+      (call: unknown[]) =>
+        (call[0] as Record<string, Record<string, unknown>>)?.metadata?.prior_conversation,
+    ).length;
+
+    // prior_conversation should only have been set once (gen-1), not again in gen-2
+    expect(priorConvCountAfter).toBe(priorConvCountBefore);
   });
 });

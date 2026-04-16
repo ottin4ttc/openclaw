@@ -56,7 +56,7 @@ export type LangfuseServiceHookHandlers = {
     ctx: AgentCtx,
   ) => MaybePromise<BeforePromptBuildResult | void>;
   beforeAgentStart: (event: BeforeAgentStartEvent, ctx: AgentCtx) => BeforeAgentStartResult | void;
-  llmInput: (event: LlmInputEvent, ctx: AgentCtx) => void;
+  llmInput: (event: LlmInputEvent, ctx: AgentCtx) => void | Promise<void>;
   llmOutput: (event: LlmOutputEvent, ctx: AgentCtx) => void;
   beforeToolCall: (event: BeforeToolCallEvent, ctx: ToolCtx) => void;
   afterToolCall: (event: AfterToolCallEvent, ctx: ToolCtx) => void;
@@ -239,7 +239,7 @@ export function createLangfuseService(
     },
 
     // llm_input: store model/provider/systemPrompt on entry (generation created in agent_end)
-    llmInput(event: LlmInputEvent, ctx: AgentCtx): void {
+    async llmInput(event: LlmInputEvent, ctx: AgentCtx): Promise<void> {
       if (disabled || !langfuse || !contextMap) {
         return;
       }
@@ -318,18 +318,54 @@ export function createLangfuseService(
       const model = qualifiedModel(event.provider, event.model);
       const startTime = new Date();
 
-      // Build generation input from historyMessages + current user prompt (excluding system messages)
+      // Build generation input as DELTA (only new messages since last llmInput call).
+      // Pre-turn history is stored once in trace metadata, not repeated per generation.
       const historyMsgs = Array.isArray(event.historyMessages) ? event.historyMessages : [];
-      // Append current user prompt so llm-call-1 input is never empty
       const allMessages = [
         ...historyMsgs,
         ...(event.prompt ? [{ role: "user", content: event.prompt }] : []),
       ];
-      const nonSystemMessages = allMessages
+
+      let deltaMessages: unknown[];
+      if (entry.llmCallCount === 1) {
+        // First call: extract pre-turn messages (before user prompt) into trace metadata.
+        // The generation input contains only the user prompt.
+        const userPromptIdx = allMessages.findLastIndex(
+          (m) => (m as Record<string, unknown>).role === "user",
+        );
+        const preTurnMessages = userPromptIdx > 0 ? allMessages.slice(0, userPromptIdx) : [];
+        deltaMessages = userPromptIdx >= 0 ? allMessages.slice(userPromptIdx) : allMessages;
+
+        // Store pre-turn conversation history in trace metadata (once)
+        if (preTurnMessages.length > 0) {
+          const preTurnApiMessages = preTurnMessages
+            .map((m) => buildApiMessage(m as Record<string, unknown>))
+            .filter((m) => (m as Record<string, unknown>).role !== "system");
+          if (preTurnApiMessages.length > 0) {
+            entry.trace.update({
+              metadata: {
+                prior_conversation: redactObject(
+                  truncatePayload(preTurnApiMessages),
+                  redactEnabled,
+                ),
+              },
+            });
+          }
+        }
+      } else {
+        // Subsequent calls: delta = messages added since last call.
+        // If history shrank (compaction/retry), fall back to all messages to avoid empty input.
+        const lastLen = entry.lastHistoryLength ?? 0;
+        deltaMessages = lastLen <= allMessages.length ? allMessages.slice(lastLen) : allMessages;
+      }
+      // Track current message count for next delta computation
+      entry.lastHistoryLength = allMessages.length;
+
+      const deltaNonSystem = deltaMessages
         .map((m) => buildApiMessage(m as Record<string, unknown>))
         .filter((m) => (m as Record<string, unknown>).role !== "system");
       const genInput = redactObject(
-        truncatePayload({ model: event.model, messages: nonSystemMessages }),
+        truncatePayload({ model: event.model, messages: deltaNonSystem }),
         redactEnabled,
       );
 
@@ -364,10 +400,12 @@ export function createLangfuseService(
       serviceLogger?.debug?.(
         `Langfuse: created generation ${genId} (llm-call-${entry.llmCallCount}) at llmInput`,
       );
-      // Flush so generation appears in Langfuse UI in real-time
-      langfuse?.flushAsync().catch((e: unknown) => {
-        serviceLogger?.debug?.(`Langfuse: flushAsync failed: ${String(e)}`);
-      });
+      // Await flush to ensure generation creation is delivered before tool execution begins
+      try {
+        await langfuse?.flushAsync();
+      } catch (e: unknown) {
+        serviceLogger?.warn?.(`Langfuse: flushAsync failed in llmInput: ${String(e)}`);
+      }
     },
 
     // llm_output: update pending generation with endTime, usage, output
@@ -883,6 +921,7 @@ export function createLangfuseService(
         requestTimeout: 30000,
         fetchRetryCount: 2,
         fetchRetryDelay: 2000,
+        flushAt: 5,
       });
       // Diagnostic: log generation events to trace output issues.
       // Track unsubscribe functions to avoid listener accumulation on re-init.

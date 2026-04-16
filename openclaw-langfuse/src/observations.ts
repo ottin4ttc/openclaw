@@ -127,16 +127,23 @@ export function buildObservationsFromEntries(
       // Build output (D3 format)
       const output = buildGenerationOutput(msg.content, redactEnabled);
 
-      // Build generation input matching LLM API structure: {model, messages}
-      // Use ALL session entries up to this assistant message as input.
+      // Build generation input as DELTA: previous assistant response + toolResults since then.
       // System prompt is recorded once at trace level (metadata.system_prompt),
       // not duplicated in each generation input.
-      const allPriorEntries = allEntries.slice(0, allEntries.indexOf(te));
-      const accumulatedMessages = allPriorEntries.map((e) => buildApiMessage(e.message));
+      const currentIdx = allEntries.indexOf(te);
+      const prevAssistantEntry =
+        llmCallCount > 1
+          ? turnEntries.filter((e) => e.message.role === "assistant").at(llmCallCount - 2)
+          : undefined;
+      // Include the previous assistant message itself (contains tool_call blocks
+      // that are part of the model's input context for the next call).
+      const deltaStart = prevAssistantEntry ? allEntries.indexOf(prevAssistantEntry) : 0;
+      const deltaEntries = allEntries.slice(deltaStart, currentIdx);
+      const deltaMessages = deltaEntries.map((e) => buildApiMessage(e.message));
       const genInput = redactObject(
         {
           model: String(msg.model ?? options.lastModel ?? "unknown"),
-          messages: accumulatedMessages,
+          messages: deltaMessages,
         },
         redactEnabled,
       );
