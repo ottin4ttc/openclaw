@@ -252,11 +252,19 @@ export function finalizeIncrementalObservations(
 
       const output = buildGenerationOutput(msg.content, redactEnabled);
 
-      // Build input: all session entries prior to this assistant message
-      const allPriorEntries = allEntries.slice(0, allEntries.indexOf(te));
-      const accumulatedMessages = allPriorEntries.map((e) => buildApiMessage(e.message));
+      // Build input as DELTA: previous assistant response + toolResults since then.
+      // Include the previous assistant message itself (contains tool_call blocks
+      // that are part of the model's input context for the next call).
+      const currentIdx = allEntries.indexOf(te);
+      const deltaStart =
+        i > 0
+          ? allEntries.indexOf(assistantMsgs[i - 1])
+          : // For the first gap-fill gen, delta starts from turn beginning (index 0).
+            0;
+      const deltaEntries = allEntries.slice(deltaStart, currentIdx);
+      const deltaMessages = deltaEntries.map((e) => buildApiMessage(e.message));
       const genInput = redactObject(
-        { model: String(msg.model ?? entry.lastModel ?? "unknown"), messages: accumulatedMessages },
+        { model: String(msg.model ?? entry.lastModel ?? "unknown"), messages: deltaMessages },
         redactEnabled,
       );
 
