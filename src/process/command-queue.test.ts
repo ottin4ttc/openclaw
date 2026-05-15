@@ -1,8 +1,9 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const diagnosticMocks = vi.hoisted(() => ({
   logLaneEnqueue: vi.fn(),
   logLaneDequeue: vi.fn(),
+  logLaneSnapshot: vi.fn(),
   diag: {
     debug: vi.fn(),
     warn: vi.fn(),
@@ -13,6 +14,7 @@ const diagnosticMocks = vi.hoisted(() => ({
 vi.mock("../logging/diagnostic.js", () => ({
   logLaneEnqueue: diagnosticMocks.logLaneEnqueue,
   logLaneDequeue: diagnosticMocks.logLaneDequeue,
+  logLaneSnapshot: diagnosticMocks.logLaneSnapshot,
   diagnosticLogger: diagnosticMocks.diag,
 }));
 
@@ -26,6 +28,7 @@ import {
   getQueueSize,
   markGatewayDraining,
   resetAllLanes,
+  resetCommandQueueStateForTest,
   setCommandLaneConcurrency,
   waitForActiveTasks,
 } from "./command-queue.js";
@@ -54,12 +57,17 @@ function enqueueBlockedMainTask<T = void>(
 
 describe("command queue", () => {
   beforeEach(() => {
-    resetAllLanes();
+    resetCommandQueueStateForTest();
     diagnosticMocks.logLaneEnqueue.mockClear();
     diagnosticMocks.logLaneDequeue.mockClear();
+    diagnosticMocks.logLaneSnapshot.mockClear();
     diagnosticMocks.diag.debug.mockClear();
     diagnosticMocks.diag.warn.mockClear();
     diagnosticMocks.diag.error.mockClear();
+  });
+
+  afterEach(() => {
+    resetCommandQueueStateForTest();
   });
 
   it("resetAllLanes is safe when no lanes have been created", () => {
@@ -101,6 +109,129 @@ describe("command queue", () => {
     expect(diagnosticMocks.logLaneEnqueue.mock.calls[0]?.[1]).toBe(1);
 
     await task;
+  });
+
+  it("emits periodic lane snapshots with active and queued counts", async () => {
+    vi.useFakeTimers();
+    try {
+      setCommandLaneConcurrency("main", 2);
+
+      const first = createDeferred();
+      const second = createDeferred();
+      const third = createDeferred();
+
+      const firstTask = enqueueCommand(async () => {
+        await first.promise;
+      });
+      const secondTask = enqueueCommand(async () => {
+        await second.promise;
+      });
+      const thirdTask = enqueueCommand(async () => {
+        await third.promise;
+      });
+
+      await vi.waitFor(() => {
+        expect(getQueueSize()).toBe(3);
+      });
+
+      await vi.advanceTimersByTimeAsync(30_000);
+
+      first.resolve();
+      second.resolve();
+      third.resolve();
+      await Promise.all([firstTask, secondTask, thirdTask]);
+
+      expect(diagnosticMocks.logLaneSnapshot).toHaveBeenCalledWith("main", {
+        active: 2,
+        queued: 1,
+        peakActiveLast30s: 2,
+        maxConcurrent: 2,
+        depth: 3,
+        oldestQueuedMs: expect.any(Number),
+      });
+      const snapshot = diagnosticMocks.logLaneSnapshot.mock.calls[0]?.[1];
+      expect(snapshot.oldestQueuedMs).toBeGreaterThanOrEqual(30_000);
+    } finally {
+      resetCommandQueueStateForTest();
+      vi.useRealTimers();
+    }
+  });
+
+  it("restarts the lane snapshot timer after test reset", async () => {
+    vi.useFakeTimers();
+    try {
+      setCommandLaneConcurrency("main", 1);
+      resetCommandQueueStateForTest();
+      diagnosticMocks.logLaneSnapshot.mockClear();
+      setCommandLaneConcurrency("main", 1);
+
+      const blocker = createDeferred();
+      const task = enqueueCommand(async () => {
+        await blocker.promise;
+      });
+
+      await vi.advanceTimersByTimeAsync(30_000);
+
+      expect(diagnosticMocks.logLaneSnapshot).toHaveBeenCalledWith("main", {
+        active: 1,
+        queued: 0,
+        peakActiveLast30s: 1,
+        maxConcurrent: 1,
+        depth: 1,
+        oldestQueuedMs: 0,
+      });
+
+      blocker.resolve();
+      await task;
+    } finally {
+      resetCommandQueueStateForTest();
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps the peak active count even when work finishes before snapshot", async () => {
+    vi.useFakeTimers();
+    try {
+      setCommandLaneConcurrency("main", 3);
+
+      const first = createDeferred();
+      const second = createDeferred();
+      const third = createDeferred();
+
+      const firstTask = enqueueCommand(async () => {
+        await first.promise;
+      });
+      const secondTask = enqueueCommand(async () => {
+        await second.promise;
+      });
+      const thirdTask = enqueueCommand(async () => {
+        await third.promise;
+      });
+
+      await vi.waitFor(() => {
+        expect(getActiveTaskCount()).toBe(3);
+      });
+
+      first.resolve();
+      second.resolve();
+      third.resolve();
+      await Promise.all([firstTask, secondTask, thirdTask]);
+      expect(getActiveTaskCount()).toBe(0);
+
+      await vi.advanceTimersByTimeAsync(30_000);
+
+      expect(diagnosticMocks.logLaneSnapshot).toHaveBeenCalledWith("main", {
+        active: 0,
+        queued: 0,
+        peakActiveLast30s: 3,
+        maxConcurrent: 3,
+        depth: 0,
+        oldestQueuedMs: 0,
+      });
+    } finally {
+      resetCommandQueueStateForTest();
+      vi.useRealTimers();
+    }
   });
 
   it("invokes onWait callback when a task waits past the threshold", async () => {

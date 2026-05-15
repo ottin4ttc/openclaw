@@ -114,6 +114,17 @@ export type DiagnosticLaneDequeueEvent = DiagnosticBaseEvent & {
   waitMs: number;
 };
 
+export type DiagnosticLaneSnapshotEvent = DiagnosticBaseEvent & {
+  type: "queue.lane.snapshot";
+  lane: string;
+  active: number;
+  queued: number;
+  peakActiveLast30s: number;
+  maxConcurrent: number;
+  depth: number;
+  oldestQueuedMs: number;
+};
+
 export type DiagnosticRunAttemptEvent = DiagnosticBaseEvent & {
   type: "run.attempt";
   sessionKey?: string;
@@ -158,6 +169,7 @@ export type DiagnosticEventPayload =
   | DiagnosticSessionStuckEvent
   | DiagnosticLaneEnqueueEvent
   | DiagnosticLaneDequeueEvent
+  | DiagnosticLaneSnapshotEvent
   | DiagnosticRunAttemptEvent
   | DiagnosticHeartbeatEvent
   | DiagnosticToolLoopEvent;

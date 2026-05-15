@@ -1,4 +1,9 @@
-import { diagnosticLogger as diag, logLaneDequeue, logLaneEnqueue } from "../logging/diagnostic.js";
+import {
+  diagnosticLogger as diag,
+  logLaneDequeue,
+  logLaneEnqueue,
+  logLaneSnapshot,
+} from "../logging/diagnostic.js";
 import { CommandLane } from "./lanes.js";
 /**
  * Dedicated error type thrown when a queued command is rejected because
@@ -47,10 +52,45 @@ type LaneState = {
   maxConcurrent: number;
   draining: boolean;
   generation: number;
+  peakActiveSinceLastSnapshot: number;
 };
 
 const lanes = new Map<string, LaneState>();
 let nextTaskId = 1;
+let laneStatsTimer: ReturnType<typeof setInterval> | undefined;
+
+function getOldestQueuedMs(state: LaneState): number {
+  const oldest = state.queue[0];
+  return oldest ? Date.now() - oldest.enqueuedAt : 0;
+}
+
+function startLaneStatsLogger(): void {
+  if (laneStatsTimer) {
+    return;
+  }
+  laneStatsTimer = setInterval(() => {
+    const state = lanes.get(CommandLane.Main);
+    if (!state) {
+      return;
+    }
+    const active = state.activeTaskIds.size;
+    const queued = state.queue.length;
+    const peakActiveLast30s = Math.max(state.peakActiveSinceLastSnapshot, active);
+    if (active === 0 && queued === 0 && peakActiveLast30s === 0) {
+      return;
+    }
+    logLaneSnapshot(state.lane, {
+      active,
+      queued,
+      peakActiveLast30s,
+      maxConcurrent: state.maxConcurrent,
+      depth: active + queued,
+      oldestQueuedMs: getOldestQueuedMs(state),
+    });
+    state.peakActiveSinceLastSnapshot = active;
+  }, 30_000);
+  laneStatsTimer.unref?.();
+}
 
 function getLaneState(lane: string): LaneState {
   const existing = lanes.get(lane);
@@ -64,6 +104,7 @@ function getLaneState(lane: string): LaneState {
     maxConcurrent: 1,
     draining: false,
     generation: 0,
+    peakActiveSinceLastSnapshot: 0,
   };
   lanes.set(lane, created);
   return created;
@@ -108,6 +149,10 @@ function drainLane(lane: string) {
         const taskId = nextTaskId++;
         const taskGeneration = state.generation;
         state.activeTaskIds.add(taskId);
+        state.peakActiveSinceLastSnapshot = Math.max(
+          state.peakActiveSinceLastSnapshot,
+          state.activeTaskIds.size,
+        );
         void (async () => {
           const startTime = Date.now();
           try {
@@ -152,6 +197,7 @@ export function markGatewayDraining(): void {
 }
 
 export function setCommandLaneConcurrency(lane: string, maxConcurrent: number) {
+  startLaneStatsLogger();
   const cleaned = lane.trim() || CommandLane.Main;
   const state = getLaneState(cleaned);
   state.maxConcurrent = Math.max(1, Math.floor(maxConcurrent));
@@ -247,6 +293,7 @@ export function resetAllLanes(): void {
   for (const state of lanes.values()) {
     state.generation += 1;
     state.activeTaskIds.clear();
+    state.peakActiveSinceLastSnapshot = 0;
     state.draining = false;
     if (state.queue.length > 0) {
       lanesToDrain.push(state.lane);
@@ -256,6 +303,30 @@ export function resetAllLanes(): void {
   for (const lane of lanesToDrain) {
     drainLane(lane);
   }
+}
+
+/**
+ * Test-only hard reset that discards all queue state and stops periodic
+ * diagnostics. Production restart paths should use resetAllLanes() so queued
+ * user work is preserved across an in-process restart.
+ */
+export function resetCommandQueueStateForTest(): void {
+  gatewayDraining = false;
+  nextTaskId = 1;
+  if (laneStatsTimer) {
+    clearInterval(laneStatsTimer);
+    laneStatsTimer = undefined;
+  }
+  for (const state of lanes.values()) {
+    const pending = state.queue.splice(0);
+    for (const entry of pending) {
+      entry.reject(new CommandLaneClearedError(state.lane));
+    }
+    state.activeTaskIds.clear();
+    state.peakActiveSinceLastSnapshot = 0;
+    state.draining = false;
+  }
+  lanes.clear();
 }
 
 /**
