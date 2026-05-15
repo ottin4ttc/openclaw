@@ -1,9 +1,11 @@
+import { SessionManager } from "@mariozechner/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../../../config/config.js";
 import { resolveOllamaBaseUrlForRun } from "../../ollama-stream.js";
 import {
   buildAfterTurnRuntimeContext,
   composeSystemPromptWithHookContext,
+  discardAbortedTurnFromSessionHistory,
   isOllamaCompatProvider,
   prependSystemPromptAddition,
   resolveAttemptFsWorkspaceOnly,
@@ -144,6 +146,64 @@ describe("resolvePromptModeForSession", () => {
     expect(resolvePromptModeForSession(undefined)).toBe("full");
     expect(resolvePromptModeForSession("agent:main")).toBe("full");
     expect(resolvePromptModeForSession("agent:main:thread:abc")).toBe("full");
+  });
+});
+
+describe("discardAbortedTurnFromSessionHistory", () => {
+  it("branches future context before the aborted user and assistant partial", () => {
+    const sessionManager = SessionManager.inMemory();
+    sessionManager.appendMessage({ role: "user", content: "previous question" });
+    sessionManager.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "previous answer" }],
+    });
+    const prePromptLeafId = sessionManager.getLeafId();
+    sessionManager.appendMessage({ role: "user", content: "count to 10000" });
+    sessionManager.appendMessage({
+      role: "assistant",
+      content: [
+        { type: "toolCall", id: "write:0", name: "write", arguments: { content: "1 2 3" } },
+      ],
+    } as never);
+
+    const replaceMessages = vi.fn();
+    const messages = discardAbortedTurnFromSessionHistory({
+      sessionManager,
+      activeSession: { agent: { replaceMessages } },
+      prePromptLeafId,
+      runId: "run-abort",
+      sessionId: "session-abort",
+      error: new Error("aborted"),
+    });
+
+    expect(messages.map((message) => message.role)).toEqual(["user", "assistant"]);
+    expect(JSON.stringify(messages)).toContain("previous question");
+    expect(JSON.stringify(messages)).not.toContain("count to 10000");
+    expect(JSON.stringify(messages)).not.toContain("1 2 3");
+    expect(replaceMessages).toHaveBeenCalledWith(messages);
+    expect(sessionManager.getLeafEntry()?.type).toBe("custom");
+  });
+
+  it("can discard the first aborted turn from an otherwise empty session", () => {
+    const sessionManager = SessionManager.inMemory();
+    sessionManager.appendMessage({ role: "user", content: "first prompt" });
+    sessionManager.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "partial answer" }],
+    });
+
+    const replaceMessages = vi.fn();
+    const messages = discardAbortedTurnFromSessionHistory({
+      sessionManager,
+      activeSession: { agent: { replaceMessages } },
+      prePromptLeafId: null,
+      runId: "run-root-abort",
+      sessionId: "session-root-abort",
+    });
+
+    expect(messages).toEqual([]);
+    expect(replaceMessages).toHaveBeenCalledWith([]);
+    expect(sessionManager.getLeafEntry()?.type).toBe("custom");
   });
 });
 

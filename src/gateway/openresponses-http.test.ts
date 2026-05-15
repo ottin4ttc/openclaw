@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { HISTORY_CONTEXT_MARKER } from "../auto-reply/reply/history.js";
 import { CURRENT_MESSAGE_MARKER } from "../auto-reply/reply/mentions.js";
 import { emitAgentEvent } from "../infra/agent-events.js";
@@ -501,13 +501,16 @@ describe("OpenResponses HTTP API (e2e)", () => {
     const port = enabledPort;
     try {
       agentCommand.mockClear();
-      agentCommand.mockImplementationOnce((async (opts: unknown) =>
-        buildAssistantDeltaResult({
+      let normalCompletionSignal: AbortSignal | undefined;
+      agentCommand.mockImplementationOnce((async (opts: unknown) => {
+        normalCompletionSignal = (opts as { abortSignal?: AbortSignal }).abortSignal;
+        return buildAssistantDeltaResult({
           opts,
           emit: emitAgentEvent,
           deltas: ["he", "llo"],
           text: "hello",
-        })) as never);
+        });
+      }) as never);
 
       const resDelta = await postResponses(port, {
         stream: true,
@@ -518,6 +521,8 @@ describe("OpenResponses HTTP API (e2e)", () => {
       expect(resDelta.headers.get("content-type") ?? "").toContain("text/event-stream");
 
       const deltaText = await resDelta.text();
+      expect(normalCompletionSignal).toBeDefined();
+      expect(normalCompletionSignal?.aborted).toBe(false);
       const deltaEvents = parseSseEvents(deltaText);
 
       const eventTypes = deltaEvents.map((e) => e.event).filter(Boolean);
@@ -578,6 +583,48 @@ describe("OpenResponses HTTP API (e2e)", () => {
       }
     } finally {
       // shared server
+    }
+  });
+
+  it("aborts agent run when streaming client disconnects", async () => {
+    const port = enabledPort;
+    agentCommand.mockClear();
+
+    let capturedSignal: AbortSignal | undefined;
+    let releaseAgent: (() => void) | undefined;
+    const agentStarted = new Promise<void>((resolve) => {
+      agentCommand.mockImplementationOnce((async (opts: unknown) => {
+        capturedSignal = (opts as { abortSignal?: AbortSignal }).abortSignal;
+        resolve();
+        await new Promise<void>((innerResolve) => {
+          releaseAgent = innerResolve;
+          capturedSignal?.addEventListener("abort", innerResolve, { once: true });
+        });
+        return { payloads: [{ text: "late" }] };
+      }) as never);
+    });
+
+    const res = await postResponses(port, {
+      stream: true,
+      model: "openclaw",
+      input: "hi",
+    });
+    try {
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type") ?? "").toContain("text/event-stream");
+
+      await agentStarted;
+      expect(capturedSignal).toBeDefined();
+      expect(capturedSignal?.aborted).toBe(false);
+
+      await res.body?.cancel();
+
+      await vi.waitFor(() => {
+        expect(capturedSignal?.aborted).toBe(true);
+      });
+    } finally {
+      releaseAgent?.();
+      await ensureResponseConsumed(res);
     }
   });
 

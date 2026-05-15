@@ -97,6 +97,11 @@ export type RunEmbeddedPiAgentParams = {
   timeoutMs: number;
   runId: string;
   abortSignal?: AbortSignal;
+  /**
+   * For stateless HTTP streaming clients, a caller abort means the visible turn
+   * is owned by the client and should not become future session context.
+   */
+  discardAbortedTurn?: boolean;
   shouldEmitToolResult?: () => boolean;
   shouldEmitToolOutput?: () => boolean;
   onPartialReply?: (payload: { text?: string; mediaUrls?: string[] }) => void | Promise<void>;

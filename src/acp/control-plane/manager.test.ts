@@ -674,6 +674,56 @@ describe("AcpSessionManager", () => {
     expect(states).not.toContain("error");
   });
 
+  it("cancels the runtime when the caller aborts an active turn", async () => {
+    const runtimeState = createRuntime();
+    hoisted.requireAcpRuntimeBackendMock.mockReturnValue({
+      id: "acpx",
+      runtime: runtimeState.runtime,
+    });
+    hoisted.readAcpSessionEntryMock.mockReturnValue({
+      sessionKey: "agent:codex:acp:session-1",
+      storeSessionKey: "agent:codex:acp:session-1",
+      acp: readySessionMeta(),
+    });
+
+    let enteredRun = false;
+    runtimeState.runTurn.mockImplementation(async function* (input: { signal?: AbortSignal }) {
+      enteredRun = true;
+      await new Promise<void>((resolve) => {
+        if (input.signal?.aborted) {
+          resolve();
+          return;
+        }
+        input.signal?.addEventListener("abort", () => resolve(), { once: true });
+      });
+      yield { type: "done" as const, stopReason: "cancel" };
+    });
+
+    const controller = new AbortController();
+    const manager = new AcpSessionManager();
+    const runPromise = manager.runTurn({
+      cfg: baseCfg,
+      sessionKey: "agent:codex:acp:session-1",
+      text: "long task",
+      mode: "prompt",
+      requestId: "run-1",
+      signal: controller.signal,
+    });
+    await vi.waitFor(() => {
+      expect(enteredRun).toBe(true);
+    });
+
+    controller.abort();
+    await runPromise;
+
+    expect(runtimeState.cancel).toHaveBeenCalledTimes(1);
+    expect(runtimeState.cancel).toHaveBeenCalledWith(
+      expect.objectContaining({
+        reason: "caller-abort",
+      }),
+    );
+  });
+
   it("cleans actor-tail bookkeeping after session turns complete", async () => {
     const runtimeState = createRuntime();
     hoisted.requireAcpRuntimeBackendMock.mockReturnValue({

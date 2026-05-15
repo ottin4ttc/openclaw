@@ -241,6 +241,7 @@ async function runResponsesAgentCommand(params: {
   runId: string;
   messageChannel: string;
   deps: ReturnType<typeof createDefaultDeps>;
+  abortSignal?: AbortSignal;
 }) {
   return agentCommandFromIngress(
     {
@@ -256,6 +257,8 @@ async function runResponsesAgentCommand(params: {
       bestEffortDeliver: false,
       // HTTP API callers are authenticated operator clients for this gateway context.
       senderIsOwner: true,
+      abortSignal: params.abortSignal,
+      discardAbortedTurn: true,
     },
     defaultRuntime,
     params.deps,
@@ -550,12 +553,26 @@ export async function handleOpenResponsesHttpRequest(
 
   setSseHeaders(res);
 
+  const abortController = new AbortController();
   let accumulatedText = "";
   let sawAssistantDelta = false;
   let closed = false;
+  let sseCompleted = false;
   let unsubscribe = () => {};
   let finalUsage: Usage | undefined;
   let finalizeRequested: { status: ResponseResource["status"]; text: string } | null = null;
+
+  const abortStreamingRunOnResponseClose = () => {
+    if (sseCompleted) {
+      return;
+    }
+    closed = true;
+    unsubscribe();
+    if (!abortController.signal.aborted) {
+      abortController.abort();
+    }
+  };
+  res.on("close", abortStreamingRunOnResponseClose);
 
   const maybeFinalize = () => {
     if (closed) {
@@ -610,6 +627,7 @@ export async function handleOpenResponsesHttpRequest(
 
     writeSseEvent(res, { type: "response.completed", response: finalResponse });
     writeDone(res);
+    sseCompleted = true;
     res.end();
   };
 
@@ -691,11 +709,6 @@ export async function handleOpenResponsesHttpRequest(
     }
   });
 
-  req.on("close", () => {
-    closed = true;
-    unsubscribe();
-  });
-
   void (async () => {
     try {
       const result = await runResponsesAgentCommand({
@@ -708,6 +721,7 @@ export async function handleOpenResponsesHttpRequest(
         runId: responseId,
         messageChannel,
         deps,
+        abortSignal: abortController.signal,
       });
 
       finalUsage = extractUsageFromResult(result);
@@ -785,6 +799,7 @@ export async function handleOpenResponsesHttpRequest(
           unsubscribe();
           writeSseEvent(res, { type: "response.completed", response: incompleteResponse });
           writeDone(res);
+          sseCompleted = true;
           res.end();
           return;
         }

@@ -71,6 +71,7 @@ export type AgentCommandOpts = {
   deliveryTargetMode?: ChannelOutboundTargetMode;
   bestEffortDeliver?: boolean;
   abortSignal?: AbortSignal;
+  discardAbortedTurn?: boolean;
   lane?: string;
   runId?: string;
   extraSystemPrompt?: string;

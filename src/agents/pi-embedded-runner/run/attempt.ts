@@ -680,6 +680,37 @@ export function buildAfterTurnRuntimeContext(params: {
   };
 }
 
+type AbortRollbackSessionManager = Pick<
+  SessionManager,
+  "appendCustomEntry" | "branch" | "buildSessionContext" | "resetLeaf"
+>;
+
+export function discardAbortedTurnFromSessionHistory(params: {
+  sessionManager: AbortRollbackSessionManager;
+  activeSession: { agent: { replaceMessages: (messages: AgentMessage[]) => void } };
+  prePromptLeafId: string | null;
+  runId: string;
+  sessionId: string;
+  error?: unknown;
+}): AgentMessage[] {
+  if (params.prePromptLeafId) {
+    params.sessionManager.branch(params.prePromptLeafId);
+  } else {
+    params.sessionManager.resetLeaf();
+  }
+
+  params.sessionManager.appendCustomEntry("openclaw:aborted-turn-discarded", {
+    timestamp: Date.now(),
+    runId: params.runId,
+    sessionId: params.sessionId,
+    error: params.error ? describeUnknownError(params.error) : undefined,
+  });
+
+  const sessionContext = params.sessionManager.buildSessionContext();
+  params.activeSession.agent.replaceMessages(sessionContext.messages);
+  return sessionContext.messages;
+}
+
 function summarizeMessagePayload(msg: AgentMessage): { textChars: number; imageBlocks: number } {
   const content = (msg as { content?: unknown }).content;
   if (typeof content === "string") {
@@ -1626,6 +1657,7 @@ export async function runEmbeddedAttempt(
       let promptError: unknown = null;
       let promptErrorSource: "prompt" | "compaction" | null = null;
       const prePromptMessageCount = activeSession.messages.length;
+      const prePromptLeafId = sessionManager.getLeafId();
       try {
         const promptStartedAt = Date.now();
 
@@ -1789,6 +1821,23 @@ export async function runEmbeddedAttempt(
           log.debug(
             `embedded run prompt end: runId=${params.runId} sessionId=${params.sessionId} durationMs=${Date.now() - promptStartedAt}`,
           );
+        }
+
+        if (params.discardAbortedTurn && aborted && !timedOut && promptErrorSource === "prompt") {
+          try {
+            discardAbortedTurnFromSessionHistory({
+              sessionManager,
+              activeSession,
+              prePromptLeafId,
+              runId: params.runId,
+              sessionId: params.sessionId,
+              error: promptError,
+            });
+          } catch (discardErr) {
+            log.warn(
+              `failed to discard aborted turn: runId=${params.runId} sessionId=${params.sessionId} error=${String(discardErr)}`,
+            );
+          }
         }
 
         // Capture snapshot before compaction wait so we have complete messages if timeout occurs

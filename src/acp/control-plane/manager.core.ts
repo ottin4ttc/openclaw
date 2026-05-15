@@ -631,20 +631,35 @@ export class AcpSessionManager {
       });
 
       const internalAbortController = new AbortController();
-      const onCallerAbort = () => {
-        internalAbortController.abort();
-      };
-      if (input.signal?.aborted) {
-        internalAbortController.abort();
-      } else if (input.signal) {
-        input.signal.addEventListener("abort", onCallerAbort, { once: true });
-      }
-
       const activeTurn: ActiveTurnState = {
         runtime,
         handle,
         abortController: internalAbortController,
       };
+      const requestRuntimeCancel = () => {
+        internalAbortController.abort();
+        if (!activeTurn.cancelPromise) {
+          activeTurn.cancelPromise = runtime
+            .cancel({
+              handle,
+              reason: "caller-abort",
+            })
+            .catch((error) => {
+              logVerbose(
+                `acp-manager: caller abort cancel failed for ${sessionKey}: ${String(error)}`,
+              );
+            });
+        }
+      };
+      const onCallerAbort = () => {
+        requestRuntimeCancel();
+      };
+      if (input.signal?.aborted) {
+        requestRuntimeCancel();
+      } else if (input.signal) {
+        input.signal.addEventListener("abort", onCallerAbort, { once: true });
+      }
+
       this.activeTurnBySession.set(actorKey, activeTurn);
 
       let streamError: AcpRuntimeError | null = null;
