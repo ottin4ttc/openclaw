@@ -265,6 +265,33 @@ export function logLaneDequeue(lane: string, waitMs: number, queueSize: number) 
   markActivity();
 }
 
+export function logLaneSnapshot(
+  lane: string,
+  stats: {
+    active: number;
+    queued: number;
+    peakActiveLast30s: number;
+    maxConcurrent: number;
+    depth: number;
+    oldestQueuedMs: number;
+  },
+) {
+  diag.info(
+    `lane stats: lane=${lane} active=${stats.active} peakActiveLast30s=${stats.peakActiveLast30s} queued=${stats.queued} maxConcurrent=${stats.maxConcurrent} depth=${stats.depth} oldestQueuedMs=${stats.oldestQueuedMs}`,
+  );
+  emitDiagnosticEvent({
+    type: "queue.lane.snapshot",
+    lane,
+    active: stats.active,
+    queued: stats.queued,
+    peakActiveLast30s: stats.peakActiveLast30s,
+    maxConcurrent: stats.maxConcurrent,
+    depth: stats.depth,
+    oldestQueuedMs: stats.oldestQueuedMs,
+  });
+  markActivity();
+}
+
 export function logRunAttempt(params: SessionRef & { runId: string; attempt: number }) {
   diag.debug(
     `run attempt: sessionId=${params.sessionId ?? "unknown"} sessionKey=${
