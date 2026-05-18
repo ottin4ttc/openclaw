@@ -552,7 +552,6 @@ export async function acquireSessionWriteLock(params: {
       const payload = await readLockPayload(lockPath);
       const nowMs = Date.now();
       const inspected = inspectLockPayload(payload, staleMs, nowMs);
-      lastInspected = inspected;
       const orphanSelfLock = shouldTreatAsOrphanSelfLock({
         payload,
         normalizedSessionFile,
@@ -566,6 +565,7 @@ export async function acquireSessionWriteLock(params: {
               : [...inspected.staleReasons, "orphan-self-pid"],
           }
         : inspected;
+      lastInspected = reclaimDetails;
       if (await shouldReclaimContendedLockFile(lockPath, reclaimDetails, staleMs, nowMs)) {
         await fs.rm(lockPath, { force: true });
         reclaimedCount += 1;

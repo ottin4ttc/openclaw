@@ -385,6 +385,15 @@ describe("acquireSessionWriteLock", () => {
       await writeCurrentProcessLock(lockPath);
 
       await expectCurrentPidOwnsLock({ sessionFile, timeoutMs: 500 });
+      expect(diagnosticMocks.logSessionLockStats).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: "acquired_after_wait",
+          lockPath: expect.stringContaining(path.basename(lockPath)),
+          ownerStale: true,
+          ownerStaleReasons: expect.arrayContaining(["orphan-self-pid"]),
+          reclaimedCount: 1,
+        }),
+      );
     });
   });
 
