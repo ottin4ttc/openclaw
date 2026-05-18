@@ -268,6 +268,7 @@ export function logLaneDequeue(lane: string, waitMs: number, queueSize: number) 
 export function logLaneSnapshot(
   lane: string,
   stats: {
+    laneType?: "main" | "session" | "other";
     active: number;
     queued: number;
     peakActiveLast30s: number;
@@ -276,18 +277,85 @@ export function logLaneSnapshot(
     oldestQueuedMs: number;
   },
 ) {
+  const laneType = stats.laneType ? ` laneType=${stats.laneType}` : "";
   diag.info(
-    `lane stats: lane=${lane} active=${stats.active} peakActiveLast30s=${stats.peakActiveLast30s} queued=${stats.queued} maxConcurrent=${stats.maxConcurrent} depth=${stats.depth} oldestQueuedMs=${stats.oldestQueuedMs}`,
+    `lane stats: lane=${lane}${laneType} active=${stats.active} peakActiveLast30s=${stats.peakActiveLast30s} queued=${stats.queued} maxConcurrent=${stats.maxConcurrent} depth=${stats.depth} oldestQueuedMs=${stats.oldestQueuedMs}`,
   );
   emitDiagnosticEvent({
     type: "queue.lane.snapshot",
     lane,
+    laneType: stats.laneType,
     active: stats.active,
     queued: stats.queued,
     peakActiveLast30s: stats.peakActiveLast30s,
     maxConcurrent: stats.maxConcurrent,
     depth: stats.depth,
     oldestQueuedMs: stats.oldestQueuedMs,
+  });
+  markActivity();
+}
+
+export function logSessionLockStats(params: {
+  action: "acquired_after_wait" | "timeout" | "released_after_long_hold";
+  lockPath: string;
+  waitMs?: number;
+  holdMs?: number;
+  attempts?: number;
+  timeoutMs?: number;
+  ownerPid?: number | null;
+  ownerAgeMs?: number | null;
+  ownerStale?: boolean;
+  ownerStaleReasons?: string[];
+  reclaimedCount?: number;
+}) {
+  const parts = [`session lock stats: action=${params.action} lockPath=${params.lockPath}`];
+  if (params.waitMs !== undefined) {
+    parts.push(`waitMs=${params.waitMs}`);
+  }
+  if (params.holdMs !== undefined) {
+    parts.push(`holdMs=${params.holdMs}`);
+  }
+  if (params.attempts !== undefined) {
+    parts.push(`attempts=${params.attempts}`);
+  }
+  if (params.timeoutMs !== undefined) {
+    parts.push(`timeoutMs=${params.timeoutMs}`);
+  }
+  if (params.ownerPid !== undefined) {
+    parts.push(`ownerPid=${params.ownerPid ?? "unknown"}`);
+  }
+  if (params.ownerAgeMs !== undefined) {
+    parts.push(`ownerAgeMs=${params.ownerAgeMs ?? "unknown"}`);
+  }
+  if (params.ownerStale !== undefined) {
+    parts.push(`ownerStale=${params.ownerStale ? "true" : "false"}`);
+  }
+  if (params.ownerStaleReasons && params.ownerStaleReasons.length > 0) {
+    parts.push(`ownerStaleReasons=${params.ownerStaleReasons.join(",")}`);
+  }
+  if (params.reclaimedCount !== undefined) {
+    parts.push(`reclaimedCount=${params.reclaimedCount}`);
+  }
+  const message = parts.join(" ");
+
+  if (params.action === "timeout") {
+    diag.error(message);
+  } else {
+    diag.warn(message);
+  }
+  emitDiagnosticEvent({
+    type: "session.lock.stats",
+    action: params.action,
+    lockPath: params.lockPath,
+    waitMs: params.waitMs,
+    holdMs: params.holdMs,
+    attempts: params.attempts,
+    timeoutMs: params.timeoutMs,
+    ownerPid: params.ownerPid,
+    ownerAgeMs: params.ownerAgeMs,
+    ownerStale: params.ownerStale,
+    ownerStaleReasons: params.ownerStaleReasons,
+    reclaimedCount: params.reclaimedCount,
   });
   markActivity();
 }

@@ -142,6 +142,7 @@ describe("command queue", () => {
       await Promise.all([firstTask, secondTask, thirdTask]);
 
       expect(diagnosticMocks.logLaneSnapshot).toHaveBeenCalledWith("main", {
+        laneType: "main",
         active: 2,
         queued: 1,
         peakActiveLast30s: 2,
@@ -173,6 +174,7 @@ describe("command queue", () => {
       await vi.advanceTimersByTimeAsync(30_000);
 
       expect(diagnosticMocks.logLaneSnapshot).toHaveBeenCalledWith("main", {
+        laneType: "main",
         active: 1,
         queued: 0,
         peakActiveLast30s: 1,
@@ -221,6 +223,7 @@ describe("command queue", () => {
       await vi.advanceTimersByTimeAsync(30_000);
 
       expect(diagnosticMocks.logLaneSnapshot).toHaveBeenCalledWith("main", {
+        laneType: "main",
         active: 0,
         queued: 0,
         peakActiveLast30s: 3,
@@ -228,6 +231,46 @@ describe("command queue", () => {
         depth: 0,
         oldestQueuedMs: 0,
       });
+    } finally {
+      resetCommandQueueStateForTest();
+      vi.useRealTimers();
+    }
+  });
+
+  it("includes session lanes in periodic snapshots", async () => {
+    vi.useFakeTimers();
+    try {
+      setCommandLaneConcurrency("session:agent:test:sess_123", 1);
+
+      const first = createDeferred();
+      const second = createDeferred();
+
+      const firstTask = enqueueCommandInLane("session:agent:test:sess_123", async () => {
+        await first.promise;
+      });
+      const secondTask = enqueueCommandInLane("session:agent:test:sess_123", async () => {
+        await second.promise;
+      });
+
+      await vi.waitFor(() => {
+        expect(getQueueSize("session:agent:test:sess_123")).toBe(2);
+      });
+
+      await vi.advanceTimersByTimeAsync(30_000);
+
+      expect(diagnosticMocks.logLaneSnapshot).toHaveBeenCalledWith("session:agent:test:sess_123", {
+        laneType: "session",
+        active: 1,
+        queued: 1,
+        peakActiveLast30s: 1,
+        maxConcurrent: 1,
+        depth: 2,
+        oldestQueuedMs: expect.any(Number),
+      });
+
+      first.resolve();
+      second.resolve();
+      await Promise.all([firstTask, secondTask]);
     } finally {
       resetCommandQueueStateForTest();
       vi.useRealTimers();

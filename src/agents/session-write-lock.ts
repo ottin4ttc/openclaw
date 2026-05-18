@@ -1,6 +1,7 @@
 import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { logSessionLockStats } from "../logging/diagnostic.js";
 import { getProcessStartTime, isPidAlive } from "../shared/pid-alive.js";
 import { resolveProcessScopedMap } from "../shared/process-scoped-map.js";
 
@@ -45,6 +46,8 @@ const DEFAULT_STALE_MS = 30 * 60 * 1000;
 const DEFAULT_MAX_HOLD_MS = 5 * 60 * 1000;
 const DEFAULT_WATCHDOG_INTERVAL_MS = 60_000;
 const DEFAULT_TIMEOUT_GRACE_MS = 2 * 60 * 1000;
+const DEFAULT_SLOW_LOCK_WAIT_WARN_MS = 1_000;
+const DEFAULT_SLOW_LOCK_HOLD_WARN_MS = 30_000;
 const MAX_LOCK_HOLD_MS = 2_147_000_000;
 
 type CleanupState = {
@@ -162,6 +165,14 @@ async function releaseHeldLock(
 
   try {
     await held.releasePromise;
+    const holdMs = Date.now() - held.acquiredAt;
+    if (holdMs >= DEFAULT_SLOW_LOCK_HOLD_WARN_MS) {
+      logSessionLockStats({
+        action: "released_after_long_hold",
+        lockPath: held.lockPath,
+        holdMs,
+      });
+    }
     return true;
   } finally {
     held.releasePromise = undefined;
@@ -479,6 +490,8 @@ export async function acquireSessionWriteLock(params: {
 
   const startedAt = Date.now();
   let attempt = 0;
+  let reclaimedCount = 0;
+  let lastInspected: LockInspectionDetails | null = null;
   while (Date.now() - startedAt < timeoutMs) {
     attempt += 1;
     let handle: fs.FileHandle | null = null;
@@ -499,6 +512,21 @@ export async function acquireSessionWriteLock(params: {
         maxHoldMs,
       };
       HELD_LOCKS.set(normalizedSessionFile, createdHeld);
+      const waitMs = createdHeld.acquiredAt - startedAt;
+      if (waitMs >= DEFAULT_SLOW_LOCK_WAIT_WARN_MS || attempt > 1 || reclaimedCount > 0) {
+        logSessionLockStats({
+          action: "acquired_after_wait",
+          lockPath,
+          waitMs,
+          attempts: attempt,
+          timeoutMs,
+          ownerPid: lastInspected?.pid,
+          ownerAgeMs: lastInspected?.ageMs,
+          ownerStale: lastInspected?.stale,
+          ownerStaleReasons: lastInspected?.staleReasons,
+          reclaimedCount,
+        });
+      }
       return {
         release: async () => {
           await releaseHeldLock(normalizedSessionFile, createdHeld);
@@ -524,6 +552,7 @@ export async function acquireSessionWriteLock(params: {
       const payload = await readLockPayload(lockPath);
       const nowMs = Date.now();
       const inspected = inspectLockPayload(payload, staleMs, nowMs);
+      lastInspected = inspected;
       const orphanSelfLock = shouldTreatAsOrphanSelfLock({
         payload,
         normalizedSessionFile,
@@ -539,6 +568,7 @@ export async function acquireSessionWriteLock(params: {
         : inspected;
       if (await shouldReclaimContendedLockFile(lockPath, reclaimDetails, staleMs, nowMs)) {
         await fs.rm(lockPath, { force: true });
+        reclaimedCount += 1;
         continue;
       }
 
@@ -548,7 +578,20 @@ export async function acquireSessionWriteLock(params: {
   }
 
   const payload = await readLockPayload(lockPath);
+  const inspected = inspectLockPayload(payload, staleMs, Date.now());
   const owner = typeof payload?.pid === "number" ? `pid=${payload.pid}` : "unknown";
+  logSessionLockStats({
+    action: "timeout",
+    lockPath,
+    waitMs: Date.now() - startedAt,
+    attempts: attempt,
+    timeoutMs,
+    ownerPid: inspected.pid,
+    ownerAgeMs: inspected.ageMs,
+    ownerStale: inspected.stale,
+    ownerStaleReasons: inspected.staleReasons,
+    reclaimedCount,
+  });
   throw new Error(`session file locked (timeout ${timeoutMs}ms): ${owner} ${lockPath}`);
 }
 

@@ -1,7 +1,11 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const diagnosticMocks = vi.hoisted(() => ({
+  logSessionLockStats: vi.fn(),
+}));
 
 // Mock getProcessStartTime so PID-recycling detection works on non-Linux
 // (macOS, CI runners). isPidAlive is left unmocked.
@@ -11,6 +15,14 @@ vi.mock("../shared/pid-alive.js", async (importOriginal) => {
   return {
     ...original,
     getProcessStartTime: (pid: number) => (pid === process.pid ? FAKE_STARTTIME : null),
+  };
+});
+
+vi.mock("../logging/diagnostic.js", async (importOriginal) => {
+  const original = await importOriginal<typeof import("../logging/diagnostic.js")>();
+  return {
+    ...original,
+    logSessionLockStats: diagnosticMocks.logSessionLockStats,
   };
 });
 
@@ -95,6 +107,10 @@ async function expectActiveInProcessLockIsNotReclaimed(params?: {
 }
 
 describe("acquireSessionWriteLock", () => {
+  beforeEach(() => {
+    diagnosticMocks.logSessionLockStats.mockClear();
+  });
+
   it("reuses locks across symlinked session paths", async () => {
     if (process.platform === "win32") {
       expect(true).toBe(true);
@@ -161,6 +177,15 @@ describe("acquireSessionWriteLock", () => {
       await expect(
         acquireSessionWriteLock({ sessionFile, timeoutMs: 50, staleMs: 60_000 }),
       ).rejects.toThrow(/session file locked/);
+      expect(diagnosticMocks.logSessionLockStats).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: "timeout",
+          lockPath: expect.stringContaining(path.basename(lockPath)),
+          timeoutMs: 50,
+          ownerStale: true,
+          ownerStaleReasons: expect.arrayContaining(["missing-pid", "invalid-createdAt"]),
+        }),
+      );
       await expect(fs.access(lockPath)).resolves.toBeUndefined();
     } finally {
       await fs.rm(root, { recursive: true, force: true });
@@ -174,9 +199,39 @@ describe("acquireSessionWriteLock", () => {
       await fs.utimes(lockPath, staleDate, staleDate);
 
       const lock = await acquireSessionWriteLock({ sessionFile, timeoutMs: 500, staleMs: 10_000 });
+      expect(diagnosticMocks.logSessionLockStats).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: "acquired_after_wait",
+          lockPath: expect.stringContaining(path.basename(lockPath)),
+          reclaimedCount: 1,
+        }),
+      );
       await lock.release();
       await expect(fs.access(lockPath)).rejects.toThrow();
     });
+  });
+
+  it("logs long lock holds on final release", async () => {
+    vi.useFakeTimers();
+    try {
+      await withTempSessionLockFile(async ({ sessionFile, lockPath }) => {
+        vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+        const lock = await acquireSessionWriteLock({ sessionFile, timeoutMs: 500 });
+
+        vi.setSystemTime(new Date("2026-01-01T00:00:31.000Z"));
+        await lock.release();
+
+        expect(diagnosticMocks.logSessionLockStats).toHaveBeenCalledWith(
+          expect.objectContaining({
+            action: "released_after_long_hold",
+            lockPath: expect.stringContaining(path.basename(lockPath)),
+            holdMs: 31_000,
+          }),
+        );
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("watchdog releases stale in-process locks", async () => {

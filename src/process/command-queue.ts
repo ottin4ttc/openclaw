@@ -59,9 +59,26 @@ const lanes = new Map<string, LaneState>();
 let nextTaskId = 1;
 let laneStatsTimer: ReturnType<typeof setInterval> | undefined;
 
+const LANE_STATS_INTERVAL_MS = 30_000;
+const MAX_LANE_SNAPSHOT_LOGS = 40;
+
+function resolveLaneType(lane: string): "main" | "session" | "other" {
+  if (lane === "main") {
+    return "main";
+  }
+  if (lane.startsWith("session:")) {
+    return "session";
+  }
+  return "other";
+}
+
 function getOldestQueuedMs(state: LaneState): number {
   const oldest = state.queue[0];
   return oldest ? Date.now() - oldest.enqueuedAt : 0;
+}
+
+function getLaneDepth(state: LaneState): number {
+  return state.queue.length + state.activeTaskIds.size;
 }
 
 function startLaneStatsLogger(): void {
@@ -69,26 +86,58 @@ function startLaneStatsLogger(): void {
     return;
   }
   laneStatsTimer = setInterval(() => {
-    const state = lanes.get(CommandLane.Main);
-    if (!state) {
-      return;
+    const snapshots = Array.from(lanes.values())
+      .map((state) => {
+        const active = state.activeTaskIds.size;
+        const queued = state.queue.length;
+        const peakActiveLast30s = Math.max(state.peakActiveSinceLastSnapshot, active);
+        return {
+          state,
+          laneType: resolveLaneType(state.lane),
+          active,
+          queued,
+          peakActiveLast30s,
+          maxConcurrent: state.maxConcurrent,
+          depth: active + queued,
+          oldestQueuedMs: getOldestQueuedMs(state),
+        };
+      })
+      .filter(
+        (snapshot) => snapshot.active > 0 || snapshot.queued > 0 || snapshot.peakActiveLast30s > 0,
+      )
+      .toSorted((a, b) => {
+        if (b.queued !== a.queued) {
+          return b.queued - a.queued;
+        }
+        if (b.oldestQueuedMs !== a.oldestQueuedMs) {
+          return b.oldestQueuedMs - a.oldestQueuedMs;
+        }
+        if (b.peakActiveLast30s !== a.peakActiveLast30s) {
+          return b.peakActiveLast30s - a.peakActiveLast30s;
+        }
+        return a.state.lane.localeCompare(b.state.lane);
+      })
+      .slice(0, MAX_LANE_SNAPSHOT_LOGS);
+
+    for (const snapshot of snapshots) {
+      logLaneSnapshot(snapshot.state.lane, {
+        laneType: snapshot.laneType,
+        active: snapshot.active,
+        queued: snapshot.queued,
+        peakActiveLast30s: snapshot.peakActiveLast30s,
+        maxConcurrent: snapshot.maxConcurrent,
+        depth: snapshot.depth,
+        oldestQueuedMs: snapshot.oldestQueuedMs,
+      });
+      snapshot.state.peakActiveSinceLastSnapshot = snapshot.active;
     }
-    const active = state.activeTaskIds.size;
-    const queued = state.queue.length;
-    const peakActiveLast30s = Math.max(state.peakActiveSinceLastSnapshot, active);
-    if (active === 0 && queued === 0 && peakActiveLast30s === 0) {
-      return;
+
+    for (const state of lanes.values()) {
+      if (!snapshots.some((snapshot) => snapshot.state === state)) {
+        state.peakActiveSinceLastSnapshot = state.activeTaskIds.size;
+      }
     }
-    logLaneSnapshot(state.lane, {
-      active,
-      queued,
-      peakActiveLast30s,
-      maxConcurrent: state.maxConcurrent,
-      depth: active + queued,
-      oldestQueuedMs: getOldestQueuedMs(state),
-    });
-    state.peakActiveSinceLastSnapshot = active;
-  }, 30_000);
+  }, LANE_STATS_INTERVAL_MS);
   laneStatsTimer.unref?.();
 }
 
@@ -215,6 +264,7 @@ export function enqueueCommandInLane<T>(
   if (gatewayDraining) {
     return Promise.reject(new GatewayDrainingError());
   }
+  startLaneStatsLogger();
   const cleaned = lane.trim() || CommandLane.Main;
   const warnAfterMs = opts?.warnAfterMs ?? 2_000;
   const state = getLaneState(cleaned);
@@ -227,7 +277,7 @@ export function enqueueCommandInLane<T>(
       warnAfterMs,
       onWait: opts?.onWait,
     });
-    logLaneEnqueue(cleaned, state.queue.length + state.activeTaskIds.size);
+    logLaneEnqueue(cleaned, getLaneDepth(state));
     drainLane(cleaned);
   });
 }
