@@ -3,7 +3,11 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { SANDBOX_PINNED_MUTATION_PYTHON } from "./fs-bridge-mutation-helper.js";
+import {
+  SANDBOX_PINNED_MUTATION_PYTHON,
+  buildPinnedWritePlan,
+} from "./fs-bridge-mutation-helper.js";
+import type { PathSafetyCheck } from "./fs-bridge-path-safety.js";
 
 async function withTempRoot<T>(prefix: string, run: (root: string) => Promise<T>): Promise<T> {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
@@ -23,6 +27,33 @@ function runMutation(args: string[], input?: string) {
 }
 
 describe("sandbox pinned mutation helper", () => {
+  it("generated write shell plan preserves stdin payload for file contents", async () => {
+    await withTempRoot("openclaw-mutation-helper-plan-", async (root) => {
+      const workspace = path.join(root, "workspace");
+      await fs.mkdir(workspace, { recursive: true });
+      const plan = buildPinnedWritePlan({
+        check: {} as PathSafetyCheck,
+        pinned: {
+          mountRootPath: workspace,
+          relativeParentPath: "nested",
+          basename: "note.txt",
+        },
+        mkdir: true,
+      });
+
+      const result = spawnSync("sh", ["-c", plan.script, "moltbot-sandbox-fs", ...plan.args], {
+        input: "hello",
+        encoding: "utf8",
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+
+      expect(result.status).toBe(0);
+      await expect(fs.readFile(path.join(workspace, "nested", "note.txt"), "utf8")).resolves.toBe(
+        "hello",
+      );
+    });
+  });
+
   it("writes through a pinned directory fd", async () => {
     await withTempRoot("openclaw-mutation-helper-", async (root) => {
       const workspace = path.join(root, "workspace");

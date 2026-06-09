@@ -254,12 +254,17 @@ function buildPinnedMutationPlan(params: {
   args: string[];
   checks: PathSafetyCheck[];
 }): SandboxFsCommandPlan {
+  const pythonSource = shellSingleQuote(SANDBOX_PINNED_MUTATION_PYTHON);
   return {
     checks: params.checks,
     recheckBeforeCommand: true,
-    script: ["set -eu", "python3 - \"$@\" <<'PY'", SANDBOX_PINNED_MUTATION_PYTHON, "PY"].join("\n"),
+    script: ["set -eu", `python3 -c ${pythonSource} "$@"`].join("\n"),
     args: params.args,
   };
+}
+
+function shellSingleQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
 export function buildPinnedWritePlan(params: {

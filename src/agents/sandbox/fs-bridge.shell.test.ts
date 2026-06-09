@@ -134,6 +134,18 @@ describe("sandbox fs bridge shell compatibility", () => {
     expect(scripts.some((script) => script.includes("os.replace("))).toBe(true);
   });
 
+  it("keeps write payload stdin separate from the Python mutation source", async () => {
+    const bridge = createSandboxFsBridge({ sandbox: createSandbox() });
+
+    await bridge.writeFile({ filePath: "b.txt", data: "hello" });
+
+    const scripts = getScriptsFromCalls();
+    const mutationScript = scripts.find((script) => script.includes("operation = sys.argv[1]"));
+    expect(mutationScript).toBeDefined();
+    expect(mutationScript).not.toContain("python3 - \"$@\" <<'PY'");
+    expect(mutationScript).toContain("python3 -c");
+  });
+
   it("routes mkdirp, remove, and rename through the pinned mutation helper", async () => {
     await withTempDir("openclaw-fs-bridge-shell-write-", async (stateDir) => {
       const workspaceDir = path.join(stateDir, "workspace");
