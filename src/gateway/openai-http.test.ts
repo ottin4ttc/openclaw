@@ -83,6 +83,15 @@ function parseSseDataLines(text: string): string[] {
     .map((line) => line.slice("data: ".length));
 }
 
+function expectTimestampedMessage(message: string, body: string) {
+  const escapedBody = body.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  expect(message).toMatch(
+    new RegExp(
+      String.raw`^\[[A-Z][a-z]{2} \d{4}-\d{2}-\d{2} \d{2}:\d{2}(?: [^\]]+)?\] ${escapedBody}$`,
+    ),
+  );
+}
+
 describe("OpenAI-compatible HTTP API (e2e)", () => {
   it("rejects when disabled (default + config)", { timeout: 15_000 }, async () => {
     await expectChatCompletionsDisabled(startServerWithDefaultConfig);
@@ -261,7 +270,10 @@ describe("OpenAI-compatible HTTP API (e2e)", () => {
         expect(res.status).toBe(200);
 
         const opts = (agentCommand.mock.calls[0] as unknown[] | undefined)?.[0];
-        expect((opts as { message?: string } | undefined)?.message).toBe("hello\nworld");
+        expectTimestampedMessage(
+          (opts as { message?: string } | undefined)?.message ?? "",
+          "hello\nworld",
+        );
         await res.text();
       }
 
@@ -286,7 +298,7 @@ describe("OpenAI-compatible HTTP API (e2e)", () => {
         expect(res.status).toBe(200);
 
         const firstCall = getFirstAgentCall();
-        expect(firstCall?.message).toBe("describe this");
+        expectTimestampedMessage(firstCall?.message ?? "", "describe this");
         expect(firstCall?.images).toEqual([
           { type: "image", data: imageData, mimeType: "image/png" },
         ]);
@@ -487,7 +499,7 @@ describe("OpenAI-compatible HTTP API (e2e)", () => {
         const message = getFirstAgentMessage();
         expect(message).not.toContain(HISTORY_CONTEXT_MARKER);
         expect(message).not.toContain(CURRENT_MESSAGE_MARKER);
-        expect(message).toBe("Hello");
+        expectTimestampedMessage(message, "Hello");
         await res.text();
       }
 
@@ -658,6 +670,8 @@ describe("OpenAI-compatible HTTP API (e2e)", () => {
         expect(res.headers.get("content-type") ?? "").toContain("text/event-stream");
 
         const text = await res.text();
+        const opts = (agentCommand.mock.calls[0] as unknown[] | undefined)?.[0];
+        expectTimestampedMessage((opts as { message?: string } | undefined)?.message ?? "", "hi");
         const data = parseSseDataLines(text);
         expect(data[data.length - 1]).toBe("[DONE]");
 

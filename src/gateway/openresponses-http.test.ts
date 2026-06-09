@@ -90,6 +90,15 @@ async function ensureResponseConsumed(res: Response) {
   }
 }
 
+function expectTimestampedMessage(message: string, body: string) {
+  const escapedBody = body.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  expect(message).toMatch(
+    new RegExp(
+      String.raw`^\[[A-Z][a-z]{2} \d{4}-\d{2}-\d{2} \d{2}:\d{2}(?: [^\]]+)?\] ${escapedBody}$`,
+    ),
+  );
+}
+
 const WEATHER_TOOL = [
   {
     type: "function",
@@ -182,6 +191,25 @@ describe("OpenResponses HTTP API (e2e)", () => {
     }
   });
 
+  it("prepends a timestamp to OpenResponses agent messages", async () => {
+    const port = enabledPort;
+    agentCommand.mockClear();
+    agentCommand.mockResolvedValueOnce({ payloads: [{ text: "noted" }] } as never);
+
+    const res = await postResponses(port, {
+      model: "openclaw",
+      input: "remember this",
+    });
+
+    expect(res.status).toBe(200);
+    const opts = (agentCommand.mock.calls[0] as unknown[] | undefined)?.[0];
+    expectTimestampedMessage(
+      (opts as { message?: string } | undefined)?.message ?? "",
+      "remember this",
+    );
+    await ensureResponseConsumed(res);
+  });
+
   it("handles OpenResponses request parsing and validation", async () => {
     const port = enabledPort;
     const mockAgentOnce = (payloads: Array<{ text: string }>, meta?: unknown) => {
@@ -271,7 +299,10 @@ describe("OpenResponses HTTP API (e2e)", () => {
       });
       expect(resString.status).toBe(200);
       const optsString = (agentCommand.mock.calls[0] as unknown[] | undefined)?.[0];
-      expect((optsString as { message?: string } | undefined)?.message).toBe("hello world");
+      expectTimestampedMessage(
+        (optsString as { message?: string } | undefined)?.message ?? "",
+        "hello world",
+      );
       await ensureResponseConsumed(resString);
 
       mockAgentOnce([{ text: "hello" }]);
@@ -281,7 +312,10 @@ describe("OpenResponses HTTP API (e2e)", () => {
       });
       expect(resArray.status).toBe(200);
       const optsArray = (agentCommand.mock.calls[0] as unknown[] | undefined)?.[0];
-      expect((optsArray as { message?: string } | undefined)?.message).toBe("hello there");
+      expectTimestampedMessage(
+        (optsArray as { message?: string } | undefined)?.message ?? "",
+        "hello there",
+      );
       await ensureResponseConsumed(resArray);
 
       mockAgentOnce([{ text: "hello" }]);
@@ -377,7 +411,7 @@ describe("OpenResponses HTTP API (e2e)", () => {
       const inputFileMessage = (optsInputFile as { message?: string } | undefined)?.message ?? "";
       const inputFilePrompt =
         (optsInputFile as { extraSystemPrompt?: string } | undefined)?.extraSystemPrompt ?? "";
-      expect(inputFileMessage).toBe("read this");
+      expectTimestampedMessage(inputFileMessage, "read this");
       expect(inputFilePrompt).toContain('<file name="hello.txt">');
       await ensureResponseConsumed(resInputFile);
 
@@ -518,6 +552,11 @@ describe("OpenResponses HTTP API (e2e)", () => {
       expect(resDelta.headers.get("content-type") ?? "").toContain("text/event-stream");
 
       const deltaText = await resDelta.text();
+      const deltaOpts = (agentCommand.mock.calls[0] as unknown[] | undefined)?.[0];
+      expectTimestampedMessage(
+        (deltaOpts as { message?: string } | undefined)?.message ?? "",
+        "hi",
+      );
       const deltaEvents = parseSseEvents(deltaText);
 
       const eventTypes = deltaEvents.map((e) => e.event).filter(Boolean);

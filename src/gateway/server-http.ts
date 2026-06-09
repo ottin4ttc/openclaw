@@ -615,7 +615,7 @@ export function createGatewayHttpServer(opts: {
     });
 
     // Don't interfere with WebSocket upgrades; ws handles the 'upgrade' event.
-    if (String(req.headers.upgrade ?? "").toLowerCase() === "websocket") {
+    if ((req.headers.upgrade ?? "").toLowerCase() === "websocket") {
       return;
     }
 
@@ -663,6 +663,7 @@ export function createGatewayHttpServer(opts: {
             handleOpenResponsesHttpRequest(req, res, {
               auth: resolvedAuth,
               config: openResponsesConfig,
+              openClawConfig: configSnapshot,
               trustedProxies,
               allowRealIpFallback,
               rateLimiter,
@@ -676,6 +677,7 @@ export function createGatewayHttpServer(opts: {
             handleOpenAiHttpRequest(req, res, {
               auth: resolvedAuth,
               config: openAiChatCompletionsConfig,
+              openClawConfig: configSnapshot,
               trustedProxies,
               allowRealIpFallback,
               rateLimiter,

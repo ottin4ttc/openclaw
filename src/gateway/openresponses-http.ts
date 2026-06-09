@@ -13,6 +13,7 @@ import { createDefaultDeps } from "../cli/deps.js";
 import { agentCommandFromIngress } from "../commands/agent.js";
 import type { ImageContent } from "../commands/agent/types.js";
 import type { GatewayHttpResponsesConfig } from "../config/types.gateway.js";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { emitAgentEvent, onAgentEvent } from "../infra/agent-events.js";
 import { logWarn } from "../logger.js";
 import {
@@ -45,11 +46,13 @@ import {
   type Usage,
 } from "./open-responses.schema.js";
 import { buildAgentPrompt } from "./openresponses-prompt.js";
+import { injectTimestamp, timestampOptsFromConfig } from "./server-methods/agent-timestamp.js";
 
 type OpenResponsesHttpOptions = {
   auth: ResolvedGatewayAuth;
   maxBodyBytes?: number;
   config?: GatewayHttpResponsesConfig;
+  openClawConfig?: OpenClawConfig;
   trustedProxies?: string[];
   allowRealIpFallback?: boolean;
   rateLimiter?: AuthRateLimiter;
@@ -460,6 +463,10 @@ export async function handleOpenResponsesHttpRequest(
     });
     return true;
   }
+  const agentMessage = injectTimestamp(
+    prompt.message,
+    timestampOptsFromConfig(opts.openClawConfig ?? {}),
+  );
 
   const responseId = `resp_${randomUUID()}`;
   const outputItemId = `msg_${randomUUID()}`;
@@ -472,7 +479,7 @@ export async function handleOpenResponsesHttpRequest(
   if (!stream) {
     try {
       const result = await runResponsesAgentCommand({
-        message: prompt.message,
+        message: agentMessage,
         images,
         clientTools: resolvedClientTools,
         extraSystemPrompt,
@@ -699,7 +706,7 @@ export async function handleOpenResponsesHttpRequest(
   void (async () => {
     try {
       const result = await runResponsesAgentCommand({
-        message: prompt.message,
+        message: agentMessage,
         images,
         clientTools: resolvedClientTools,
         extraSystemPrompt,
