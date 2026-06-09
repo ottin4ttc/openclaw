@@ -398,6 +398,8 @@ describe("buildAgentSystemPrompt", () => {
 
     expect(prompt).toContain("session_status");
     expect(prompt).toContain("current date");
+    expect(prompt).toContain("Date hints");
+    expect(prompt).toContain("memory/YYYY-MM-DD.md");
   });
 
   // The system prompt intentionally does NOT include the current date/time.

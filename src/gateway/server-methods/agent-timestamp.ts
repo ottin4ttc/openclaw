@@ -15,6 +15,7 @@ const CRON_TIME_PATTERN = /Current time: /;
  * with the formatting.
  */
 const TIMESTAMP_ENVELOPE_PATTERN = /^\[.*\d{4}-\d{2}-\d{2} \d{2}:\d{2}/;
+const ONE_DAY_MS = 24 * 60 * 60 * 1000;
 
 export interface TimestampInjectionOptions {
   timezone?: string;
@@ -60,6 +61,9 @@ export function injectTimestamp(message: string, opts?: TimestampInjectionOption
   if (!formatted) {
     return message;
   }
+  const yesterday = formatZonedTimestamp(new Date(now.getTime() - ONE_DAY_MS), {
+    timeZone: timezone,
+  });
 
   // 3-letter DOW: small models (8B) can't reliably derive day-of-week from
   // a date, and may treat a bare "Wed" as a typo. Costs ~1 token.
@@ -67,7 +71,14 @@ export function injectTimestamp(message: string, opts?: TimestampInjectionOption
     now,
   );
 
-  return `Current time: ${dow} ${formatted}\n${message}`;
+  const todayDate = formatted.slice(0, 10);
+  const yesterdayDate = yesterday?.slice(0, 10) ?? "";
+  const dateHint =
+    yesterdayDate.length > 0
+      ? `Date hints: today=${todayDate}; yesterday=${yesterdayDate}; use these for memory/YYYY-MM-DD.md paths.`
+      : `Date hints: today=${todayDate}; use this for memory/YYYY-MM-DD.md paths.`;
+
+  return `Current time: ${dow} ${formatted}\n${dateHint}\n${message}`;
 }
 
 /**

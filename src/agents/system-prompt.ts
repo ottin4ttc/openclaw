@@ -98,7 +98,12 @@ function buildTimeSection(params: { userTimezone?: string }) {
   if (!params.userTimezone) {
     return [];
   }
-  return ["## Current Date & Time", `Time zone: ${params.userTimezone}`, ""];
+  return [
+    "## Current Date & Time",
+    `Time zone: ${params.userTimezone}`,
+    "For relative dates like today/yesterday/tomorrow, and for memory/YYYY-MM-DD.md paths, use the latest user message's `Current time:` or `Date hints:` line if present. Otherwise run session_status. Never infer the current date from model knowledge.",
+    "",
+  ];
 }
 
 function buildReplyTagsSection(isMinimal: boolean) {
@@ -371,7 +376,7 @@ export function buildAgentSystemPrompt(params: {
   const runtimeInfo = params.runtimeInfo;
   const runtimeChannel = runtimeInfo?.channel?.trim().toLowerCase();
   const runtimeCapabilities = (runtimeInfo?.capabilities ?? [])
-    .map((cap) => String(cap).trim())
+    .map((cap) => cap.trim())
     .filter(Boolean);
   const runtimeCapabilitiesLower = new Set(runtimeCapabilities.map((cap) => cap.toLowerCase()));
   const inlineButtonsEnabled = runtimeCapabilitiesLower.has("inlinebuttons");

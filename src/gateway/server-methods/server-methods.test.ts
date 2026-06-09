@@ -118,21 +118,25 @@ describe("injectTimestamp", () => {
     vi.useRealTimers();
   });
 
-  it("prepends a compact timestamp matching formatZonedTimestamp", () => {
+  it("prepends timestamp and memory date hints matching formatZonedTimestamp", () => {
     const result = injectTimestamp("Is it the weekend?", {
       timezone: "America/New_York",
     });
 
-    expect(result).toMatch(/^Current time: Wed 2026-01-28 20:30 EST\nIs it the weekend\?$/);
+    expect(result).toMatch(
+      /^Current time: Wed 2026-01-28 20:30 EST\nDate hints: today=2026-01-28; yesterday=2026-01-27; use these for memory\/YYYY-MM-DD\.md paths\.\nIs it the weekend\?$/,
+    );
   });
 
-  it("uses a Current time line with DOW prefix", () => {
+  it("uses Current time and Date hints lines with DOW prefix", () => {
     const now = new Date();
     const expected = formatZonedTimestamp(now, { timeZone: "America/New_York" });
 
     const result = injectTimestamp("hello", { timezone: "America/New_York" });
 
-    expect(result).toBe(`Current time: Wed ${expected}\nhello`);
+    expect(result).toBe(
+      `Current time: Wed ${expected}\nDate hints: today=2026-01-28; yesterday=2026-01-27; use these for memory/YYYY-MM-DD.md paths.\nhello`,
+    );
   });
 
   it("always uses 24-hour format", () => {
@@ -146,13 +150,18 @@ describe("injectTimestamp", () => {
   it("uses the configured timezone", () => {
     const result = injectTimestamp("hello", { timezone: "America/Chicago" });
 
-    expect(result).toMatch(/^Current time: Wed 2026-01-28 19:30 CST\n/);
+    expect(result).toMatch(
+      /^Current time: Wed 2026-01-28 19:30 CST\nDate hints: today=2026-01-28; yesterday=2026-01-27; use these for memory\/YYYY-MM-DD\.md paths\.\n/,
+    );
   });
 
   it("defaults to UTC when no timezone specified", () => {
     const result = injectTimestamp("hello", {});
 
     expect(result).toMatch(/^Current time: Thu 2026-01-29 01:30/);
+    expect(result).toContain(
+      "\nDate hints: today=2026-01-29; yesterday=2026-01-28; use these for memory/YYYY-MM-DD.md paths.\n",
+    );
   });
 
   it("returns empty/whitespace messages unchanged", () => {
@@ -187,7 +196,9 @@ describe("injectTimestamp", () => {
 
     const result = injectTimestamp("hello", { timezone: "America/New_York" });
 
-    expect(result).toMatch(/^Current time: Sun 2026-02-01 00:00 EST\n/);
+    expect(result).toMatch(
+      /^Current time: Sun 2026-02-01 00:00 EST\nDate hints: today=2026-02-01; yesterday=2026-01-31; use these for memory\/YYYY-MM-DD\.md paths\.\n/,
+    );
   });
 
   it("handles date boundaries (just before midnight)", () => {
@@ -195,17 +206,23 @@ describe("injectTimestamp", () => {
 
     const result = injectTimestamp("hello", { timezone: "America/New_York" });
 
-    expect(result).toMatch(/^Current time: Sat 2026-01-31 23:59 EST\n/);
+    expect(result).toMatch(
+      /^Current time: Sat 2026-01-31 23:59 EST\nDate hints: today=2026-01-31; yesterday=2026-01-30; use these for memory\/YYYY-MM-DD\.md paths\.\n/,
+    );
   });
 
   it("handles DST correctly (same UTC hour, different local time)", () => {
     vi.setSystemTime(new Date("2026-01-15T05:00:00.000Z"));
     const winter = injectTimestamp("winter", { timezone: "America/New_York" });
-    expect(winter).toMatch(/^Current time: Thu 2026-01-15 00:00 EST\n/);
+    expect(winter).toMatch(
+      /^Current time: Thu 2026-01-15 00:00 EST\nDate hints: today=2026-01-15; yesterday=2026-01-14; use these for memory\/YYYY-MM-DD\.md paths\.\n/,
+    );
 
     vi.setSystemTime(new Date("2026-07-15T04:00:00.000Z"));
     const summer = injectTimestamp("summer", { timezone: "America/New_York" });
-    expect(summer).toMatch(/^Current time: Wed 2026-07-15 00:00 EDT\n/);
+    expect(summer).toMatch(
+      /^Current time: Wed 2026-07-15 00:00 EDT\nDate hints: today=2026-07-15; yesterday=2026-07-14; use these for memory\/YYYY-MM-DD\.md paths\.\n/,
+    );
   });
 
   it("accepts a custom now date", () => {
@@ -216,7 +233,9 @@ describe("injectTimestamp", () => {
       now: customDate,
     });
 
-    expect(result).toMatch(/^Current time: Fri 2025-07-04 12:00 EDT\n/);
+    expect(result).toMatch(
+      /^Current time: Fri 2025-07-04 12:00 EDT\nDate hints: today=2025-07-04; yesterday=2025-07-03; use these for memory\/YYYY-MM-DD\.md paths\.\n/,
+    );
   });
 });
 
