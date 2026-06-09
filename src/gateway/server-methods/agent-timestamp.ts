@@ -22,10 +22,10 @@ export interface TimestampInjectionOptions {
 }
 
 /**
- * Injects a compact timestamp prefix into a message if one isn't already
- * present. Uses the same `YYYY-MM-DD HH:MM TZ` format as channel envelope
- * timestamps ({@link formatZonedTimestamp}), keeping token cost low (~7
- * tokens) and format consistent across all agent contexts.
+ * Injects an authoritative current-time line into a message if one isn't
+ * already present. Uses the same `YYYY-MM-DD HH:MM TZ` format as channel
+ * envelope timestamps ({@link formatZonedTimestamp}), while keeping the
+ * date/time separate from the user's prose so models treat it as context.
  *
  * Used by the gateway `agent` and `chat.send` handlers to give TUI, web,
  * spawned subagents, `sessions_send`, and heartbeat wake events date/time
@@ -67,7 +67,7 @@ export function injectTimestamp(message: string, opts?: TimestampInjectionOption
     now,
   );
 
-  return `[${dow} ${formatted}] ${message}`;
+  return `Current time: ${dow} ${formatted}\n${message}`;
 }
 
 /**

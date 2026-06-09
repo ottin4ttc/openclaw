@@ -87,7 +87,7 @@ function expectTimestampedMessage(message: string, body: string) {
   const escapedBody = body.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   expect(message).toMatch(
     new RegExp(
-      String.raw`^\[[A-Z][a-z]{2} \d{4}-\d{2}-\d{2} \d{2}:\d{2}(?: [^\]]+)?\] ${escapedBody}$`,
+      String.raw`^Current time: [A-Z][a-z]{2} \d{4}-\d{2}-\d{2} \d{2}:\d{2}(?: [^\n]+)?\n${escapedBody}$`,
     ),
   );
 }
