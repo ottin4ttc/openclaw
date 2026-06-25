@@ -33,6 +33,7 @@ function mockJsonResponse(results: Array<{ title?: string; url?: string; content
         headers: { get: (h: string) => (h === "content-type" ? "application/json" : null) },
         json: async () => ({ results }),
       } as unknown as Response,
+      finalUrl: "https://searxng.test/search",
     }),
   );
 }
@@ -43,7 +44,9 @@ describe("web_search searxng: missing baseUrl", () => {
   it("returns missing_searxng_base_url error payload without making HTTP request", async () => {
     // provider=searxng but no baseUrl configured
     const tool = createWebSearchTool({
-      config: makeConfig() as unknown as Parameters<typeof createWebSearchTool>[0]["config"],
+      config: makeConfig() as unknown as NonNullable<
+        Parameters<typeof createWebSearchTool>[0]
+      >["config"],
     });
     const result = (await tool!.execute("id", { query: "test no baseurl abc" })) as {
       details: Record<string, unknown>;
@@ -62,9 +65,9 @@ describe("web_search searxng: successful search", () => {
       { title: "Second Result", url: "https://other.org/page", content: "Other" },
     ]);
     const tool = createWebSearchTool({
-      config: makeConfig("http://localhost:8080") as unknown as Parameters<
-        typeof createWebSearchTool
-      >[0]["config"],
+      config: makeConfig("http://localhost:8080") as unknown as NonNullable<
+        Parameters<typeof createWebSearchTool>[0]
+      >["config"],
     });
     const result = (await tool!.execute("id", { query: "test map results" })) as {
       details: Record<string, unknown>;
@@ -78,9 +81,9 @@ describe("web_search searxng: successful search", () => {
   it("returns empty results array when SearXNG has no matches", async () => {
     mockJsonResponse([]);
     const tool = createWebSearchTool({
-      config: makeConfig("http://localhost:8080") as unknown as Parameters<
-        typeof createWebSearchTool
-      >[0]["config"],
+      config: makeConfig("http://localhost:8080") as unknown as NonNullable<
+        Parameters<typeof createWebSearchTool>[0]
+      >["config"],
     });
     const result = (await tool!.execute("id", { query: "test empty results xyz" })) as {
       details: Record<string, unknown>;
@@ -102,12 +105,13 @@ describe("web_search searxng: error handling", () => {
           headers: { get: () => "text/html" },
           text: async () => "down for maintenance",
         } as unknown as Response,
+        finalUrl: "https://searxng.test/search",
       }),
     );
     const tool = createWebSearchTool({
-      config: makeConfig("http://localhost:8080") as unknown as Parameters<
-        typeof createWebSearchTool
-      >[0]["config"],
+      config: makeConfig("http://localhost:8080") as unknown as NonNullable<
+        Parameters<typeof createWebSearchTool>[0]
+      >["config"],
     });
     await expect(tool!.execute("id", { query: "test http 503 error" })).rejects.toThrow("503");
   });
@@ -119,12 +123,13 @@ describe("web_search searxng: error handling", () => {
           ok: true,
           headers: { get: (h: string) => (h === "content-type" ? "text/html" : null) },
         } as unknown as Response,
+        finalUrl: "https://searxng.test/search",
       }),
     );
     const tool = createWebSearchTool({
-      config: makeConfig("http://localhost:8080") as unknown as Parameters<
-        typeof createWebSearchTool
-      >[0]["config"],
+      config: makeConfig("http://localhost:8080") as unknown as NonNullable<
+        Parameters<typeof createWebSearchTool>[0]
+      >["config"],
     });
     await expect(tool!.execute("id", { query: "test html response" })).rejects.toThrow(
       "search.formats",
@@ -138,9 +143,9 @@ describe("web_search searxng: cache", () => {
   it("serves second identical query from cache without a second HTTP request", async () => {
     mockJsonResponse([{ title: "Cached", url: "https://cached.example.com", content: "data" }]);
     const tool = createWebSearchTool({
-      config: makeConfig("http://localhost:8080") as unknown as Parameters<
-        typeof createWebSearchTool
-      >[0]["config"],
+      config: makeConfig("http://localhost:8080") as unknown as NonNullable<
+        Parameters<typeof createWebSearchTool>[0]
+      >["config"],
     });
     const query = `test cache hit unique query ${Date.now()}`;
     await tool!.execute("id", { query });
