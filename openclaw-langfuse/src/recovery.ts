@@ -36,6 +36,30 @@ function parseMarkers(raw: string): { starts: Set<string>; ends: Set<string> } {
 }
 
 /**
+ * Parse inline _langfuse metadata from JSONL messages.
+ * Returns traceIds found in message metadata (from before_message_write hook).
+ * These are an additional recovery signal when sidecar markers are unavailable.
+ */
+function parseInlineLangfuseMarkers(raw: string): Set<string> {
+  const traceIds = new Set<string>();
+  for (const line of raw.split("\n")) {
+    if (!line.includes("_langfuse")) {
+      continue;
+    }
+    try {
+      const parsed = JSON.parse(line);
+      const meta = parsed?.message?.metadata?._langfuse;
+      if (meta?.traceId) {
+        traceIds.add(String(meta.traceId));
+      }
+    } catch {
+      /* ignore malformed lines */
+    }
+  }
+  return traceIds;
+}
+
+/**
  * Read file content, optionally reading only the tail for large files.
  */
 function readFileOrTail(filePath: string, tailBytes: number): string | null {
@@ -134,6 +158,21 @@ export function scanIncompleteTraces(stateDir: string): IncompleteTraceInfo[] {
       for (const traceId of starts) {
         if (!ends.has(traceId)) {
           results.push({ traceId, agentId, sessionId, jsonlPath: sessionJsonlPath });
+        }
+      }
+
+      // Supplementary: check for inline _langfuse metadata in JSONL messages.
+      // This catches traces from new openclaw versions where before_message_write
+      // injected identifiers but sidecar markers may be incomplete.
+      if (starts.size === 0 && fs.existsSync(sessionJsonlPath)) {
+        const jsonlRaw = hasSidecar ? readFileOrTail(sessionJsonlPath, TAIL_BYTES) : raw;
+        if (jsonlRaw) {
+          const inlineTraceIds = parseInlineLangfuseMarkers(jsonlRaw);
+          for (const traceId of inlineTraceIds) {
+            if (!ends.has(traceId) && !results.some((r) => r.traceId === traceId)) {
+              results.push({ traceId, agentId, sessionId, jsonlPath: sessionJsonlPath });
+            }
+          }
         }
       }
     }

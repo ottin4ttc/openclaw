@@ -1,6 +1,6 @@
 import type Langfuse from "langfuse";
 /* eslint-disable @typescript-eslint/no-base-to-string, @typescript-eslint/restrict-template-expressions, @typescript-eslint/no-redundant-type-constituents */
-import type { PluginLogger } from "openclaw/plugin-sdk";
+import type { PluginLogger } from "openclaw/plugin-sdk/plugin-entry";
 import { redactObject } from "./redact.js";
 import { writeObservationEvent, readObservationEvents } from "./session.js";
 import type { TraceContextEntry } from "./trace-context.js";

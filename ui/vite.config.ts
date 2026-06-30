@@ -33,6 +33,12 @@ export default defineConfig(() => {
       sourcemap: true,
       // Keep CI/onboard logs clean; current control UI chunking is intentionally above 500 kB.
       chunkSizeWarningLimit: 1024,
+      rollupOptions: {
+        // Some src/ modules transitively imported by the UI use Node-only APIs
+        // (e.g. createRequire from node:module via version.ts). Rollup externalizes
+        // these for browser but fails on missing named exports; shimming avoids that.
+        shimMissingExports: true,
+      },
     },
     server: {
       host: true,

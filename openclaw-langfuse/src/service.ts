@@ -4,7 +4,7 @@ import type {
   OpenClawPluginService,
   OpenClawPluginServiceContext,
   PluginLogger,
-} from "openclaw/plugin-sdk";
+} from "openclaw/plugin-sdk/plugin-entry";
 import { resolveCredentials } from "./config.js";
 import type { LangfusePluginConfig } from "./config.js";
 import { checkModelCostConfig, formatCostWarning } from "./diagnose.js";
@@ -49,6 +49,27 @@ import {
 // Re-export for external consumers (e.g. tracer.test.ts)
 export { generateTraceId, generateObservationId } from "./utils.js";
 
+export type BeforeMessageWriteEvent = {
+  message: unknown;
+  sessionKey?: string;
+  agentId?: string;
+};
+
+// Result type deliberately uses `any` for message to match the upstream
+// AgentMessage union without importing it (not exported from plugin SDK).
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export type BeforeMessageWriteResult = {
+  block?: boolean;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  message?: any;
+};
+
+export type SessionStartEvent = {
+  sessionId: string;
+  sessionKey?: string;
+  resumedFrom?: string;
+};
+
 export type LangfuseServiceHookHandlers = {
   beforePromptBuild: (
     event: BeforePromptBuildEvent,
@@ -61,6 +82,11 @@ export type LangfuseServiceHookHandlers = {
   afterToolCall: (event: AfterToolCallEvent, ctx: ToolCtx) => void;
   agentEnd: (event: AgentEndEvent, ctx: AgentCtx) => void | Promise<void>;
   sessionEnd: (event: SessionEndEvent, ctx: SessionCtx) => void;
+  sessionStart: (event: SessionStartEvent, ctx: SessionCtx) => void;
+  beforeMessageWrite: (
+    event: BeforeMessageWriteEvent,
+    ctx: { agentId?: string; sessionKey?: string },
+  ) => BeforeMessageWriteResult | void;
 };
 
 export type LangfuseService = OpenClawPluginService & {
@@ -80,6 +106,7 @@ let disabled = false;
 let serviceLogger: PluginLogger | null = null;
 let serviceStateDir: string | null = null;
 let unsubscribeDiagnostics: (() => void) | null = null;
+let unsubscribeTranscript: (() => void) | null = null;
 let sdkEventCleanups: Array<() => void> = [];
 let promptManager: PromptManager | null = null;
 
@@ -89,6 +116,18 @@ let promptManager: PromptManager | null = null;
 export function createLangfuseService(
   config: LangfusePluginConfig,
   logger?: PluginLogger,
+  pluginRuntime?: {
+    events?: {
+      onSessionTranscriptUpdate?: (
+        listener: (update: {
+          sessionFile: string;
+          sessionKey?: string;
+          message?: unknown;
+          messageId?: string;
+        }) => void,
+      ) => () => void;
+    };
+  },
 ): LangfuseService {
   serviceLogger = logger ?? null;
 
@@ -332,11 +371,15 @@ export function createLangfuseService(
       const model = qualifiedModel(event.provider, event.model);
       const startTime = new Date();
 
-      // Build generation input from historyMessages (excluding system messages)
+      // Build generation input from historyMessages (excluding system messages) + current prompt
       const historyMsgs = Array.isArray(event.historyMessages) ? event.historyMessages : [];
       const nonSystemMessages = historyMsgs
         .map((m) => buildApiMessage(m as Record<string, unknown>))
         .filter((m) => (m as Record<string, unknown>).role !== "system");
+      // Append current user prompt so the generation input includes the triggering message
+      if (event.prompt) {
+        nonSystemMessages.push({ role: "user", content: event.prompt });
+      }
       const genInput = redactObject(
         truncatePayload({ model: event.model, messages: nonSystemMessages }),
         redactEnabled,
@@ -673,6 +716,9 @@ export function createLangfuseService(
         `Langfuse: agentEnd path — useBatchCreation=${useBatchCreation} isRecovery=${isRecoveryEntry} llmCallCount=${entry.llmCallCount} completedGens=${entry.completedGenerations.size} turnEntries=${turnEntries.length}`,
       );
 
+      let batchTotalUsage:
+        | { input: number; output: number; cacheRead: number; cacheWrite: number; total: number }
+        | undefined;
       if (useBatchCreation) {
         const obsResult = buildObservationsFromEntries(
           entry.trace,
@@ -701,6 +747,7 @@ export function createLangfuseService(
         if (obsResult.lastProvider) {
           entry.lastProvider = obsResult.lastProvider;
         }
+        batchTotalUsage = obsResult.totalUsage;
       } else {
         finalizeIncrementalObservations(
           entry,
@@ -732,13 +779,53 @@ export function createLangfuseService(
         }
       }
 
-      const finalUsage = entry.storedUsage
+      // Aggregate usage across all completed generations (real-time path) or fall back to
+      // batch/stored usage for backward compatibility.
+      // Aggregate usage from all assistant messages in turnEntries (works for both
+      // new real-time path and old JSONL-only path — JSONL always has usage data).
+      let aggregatedUsage:
+        | { input: number; output: number; cacheRead: number; cacheWrite: number; total: number }
+        | undefined;
+      if (turnEntries.length > 0) {
+        const acc = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
+        for (const te of turnEntries) {
+          const msg = te.message;
+          if (msg.role !== "assistant") {
+            continue;
+          }
+          const u = msg.usage as Record<string, unknown> | undefined;
+          if (!u) {
+            continue;
+          }
+          acc.input += (u.input as number) || 0;
+          acc.output += (u.output as number) || 0;
+          acc.cacheRead += (u.cacheRead as number) || 0;
+          acc.cacheWrite += (u.cacheWrite as number) || 0;
+          acc.total +=
+            (u.totalTokens as number) ||
+            (u.total as number) ||
+            ((u.input as number) || 0) + ((u.output as number) || 0);
+        }
+        if (acc.input > 0 || acc.output > 0 || acc.total > 0) {
+          aggregatedUsage = acc;
+        }
+        serviceLogger?.info?.(
+          `Langfuse: usage from turnEntries — input=${acc.input} output=${acc.output} total=${acc.total}`,
+        );
+      }
+      const usageSrc =
+        aggregatedUsage ??
+        (batchTotalUsage &&
+        (batchTotalUsage.input > 0 || batchTotalUsage.output > 0 || batchTotalUsage.total > 0)
+          ? batchTotalUsage
+          : entry.storedUsage);
+      const finalUsage = usageSrc
         ? {
-            inputTokens: entry.storedUsage.input,
-            outputTokens: entry.storedUsage.output,
-            cacheReadInputTokens: entry.storedUsage.cacheRead || undefined,
-            cacheWriteInputTokens: entry.storedUsage.cacheWrite || undefined,
-            totalTokens: entry.storedUsage.total,
+            inputTokens: usageSrc.input,
+            outputTokens: usageSrc.output,
+            cacheReadInputTokens: usageSrc.cacheRead || undefined,
+            cacheWriteInputTokens: usageSrc.cacheWrite || undefined,
+            totalTokens: usageSrc.total,
           }
         : undefined;
 
@@ -804,7 +891,264 @@ export function createLangfuseService(
         `Langfuse session end: agentId=${ctx.agentId ?? "unknown"} sessionKey=${ctx.sessionKey ?? "unknown"} messageCount=${event.messageCount} durationMs=${event.durationMs ?? "unknown"}`,
       );
     },
+
+    // session_start: initialize trace context early
+    sessionStart(event: SessionStartEvent, ctx: SessionCtx): void {
+      if (disabled || !langfuse || !contextMap) {
+        return;
+      }
+      serviceLogger?.debug?.(
+        `Langfuse session start: sessionId=${event.sessionId} sessionKey=${ctx.sessionKey ?? "unknown"} resumedFrom=${event.resumedFrom ?? "none"}`,
+      );
+    },
+
+    // before_message_write: inject langfuse identifiers into JSONL messages
+    beforeMessageWrite(
+      event: BeforeMessageWriteEvent,
+      ctx: { agentId?: string; sessionKey?: string },
+    ): BeforeMessageWriteResult | void {
+      if (disabled || !contextMap) {
+        return;
+      }
+      const entry = getEntry(ctx.agentId, ctx.sessionKey);
+      if (!entry) {
+        return;
+      }
+
+      const msg = event.message as Record<string, unknown> | undefined;
+      if (!msg || typeof msg !== "object") {
+        return;
+      }
+      const role = msg.role as string | undefined;
+      if (!role) {
+        return;
+      }
+
+      const metadata = (msg.metadata ?? {}) as Record<string, unknown>;
+
+      if (role === "assistant") {
+        metadata._langfuse = {
+          traceId: entry.traceId,
+          genId: entry.currentGenerationId,
+        };
+        return { message: { ...msg, metadata } };
+      }
+
+      if (role === "toolResult" || role === "tool") {
+        const toolCallId = (msg.toolCallId as string) ?? (msg.tool_call_id as string) ?? undefined;
+        if (toolCallId) {
+          const pendingSpan = entry.pendingSpans.get(toolCallId);
+          const spanId = pendingSpan
+            ? generateObservationId(entry.traceId, "span", toolCallId)
+            : undefined;
+          metadata._langfuse = {
+            traceId: entry.traceId,
+            spanId,
+            toolCallId,
+          };
+          return { message: { ...msg, metadata } };
+        }
+      }
+    },
   };
+
+  // ---------------------------------------------------------------------------
+  // Real-time transcript update handler
+  // Processes every message written to the session JSONL via onSessionTranscriptUpdate.
+  // Creates/updates Langfuse observations in real-time, including intermediate
+  // LLM calls during tool-use loops that llm_input/llm_output hooks cannot see.
+  // ---------------------------------------------------------------------------
+
+  let flushTimer: ReturnType<typeof setTimeout> | null = null;
+  const FLUSH_DEBOUNCE_MS = 2000; // buffer flushes to avoid per-message API calls
+
+  function scheduleFlush(): void {
+    if (flushTimer) {
+      return; // already scheduled
+    }
+    flushTimer = setTimeout(() => {
+      flushTimer = null;
+      langfuse?.flushAsync().catch((e: unknown) => {
+        serviceLogger?.debug?.(`Langfuse: transcript flush failed: ${String(e)}`);
+      });
+    }, FLUSH_DEBOUNCE_MS);
+  }
+
+  function handleTranscriptUpdate(
+    update: { sessionFile: string; sessionKey?: string; message?: unknown; messageId?: string },
+    _redactEnabled: boolean,
+  ): void {
+    if (disabled || !langfuse || !contextMap) {
+      return;
+    }
+    const msg = update.message as Record<string, unknown> | undefined;
+    if (!msg || typeof msg !== "object") {
+      return;
+    }
+    const role = msg.role as string | undefined;
+    if (!role) {
+      return;
+    }
+
+    // Find active trace entry — we don't have agentId in the update,
+    // so use the most recent non-finalized entry as a best-effort match.
+    const entry = contextMap.findActive();
+    if (!entry || entry.finalized) {
+      return;
+    }
+
+    if (role === "assistant") {
+      const usage = msg.usage as Record<string, unknown> | undefined;
+      const model = msg.model as string | undefined;
+      const provider = msg.provider as string | undefined;
+      const stopReason = msg.stopReason as string | undefined;
+
+      // Check if this assistant message was already captured by llm_output
+      // (to avoid double-counting). If completedGenerations has entries for this
+      // llmCallCount, skip.
+      if (entry.completedGenerations.size >= entry.llmCallCount && entry.llmCallCount > 0) {
+        serviceLogger?.debug?.(
+          `Langfuse: transcript assistant msg — already captured by llm_output (completedGens=${entry.completedGenerations.size})`,
+        );
+        // Still update usage/output if the completed generation is missing them
+        return;
+      }
+
+      serviceLogger?.info?.(
+        `Langfuse: transcript assistant msg — model=${model ?? "?"} stopReason=${stopReason ?? "?"} hasUsage=${!!usage}`,
+      );
+
+      // Store usage/output on entry for agent_end trace metadata (mirrors llm_output behavior)
+      if (usage) {
+        entry.storedUsage = {
+          input: (usage.input as number) ?? undefined,
+          output: (usage.output as number) ?? undefined,
+          cacheRead: (usage.cacheRead as number) ?? undefined,
+          cacheWrite: (usage.cacheWrite as number) ?? undefined,
+          total: (usage.totalTokens as number) ?? (usage.total as number) ?? undefined,
+        };
+      }
+      if (msg.content) {
+        const contentArr = Array.isArray(msg.content) ? msg.content : [msg.content];
+        const texts = contentArr
+          .filter(
+            (b: unknown) =>
+              !!b && typeof b === "object" && (b as Record<string, unknown>).type === "text",
+          )
+          .map((b: unknown) => (b as Record<string, unknown>).text as string);
+        if (texts.length > 0) {
+          entry.storedOutput = texts.join("\n");
+        }
+      }
+      if (model) {
+        entry.lastModel = model;
+      }
+      if (provider) {
+        entry.lastProvider = provider;
+      }
+
+      // If there's a pending generation (created by llm_input but not completed by llm_output),
+      // complete it with data from the transcript message
+      const pendingEntries = [...entry.pendingGenerations.entries()];
+      if (pendingEntries.length > 0) {
+        const [runId, pendingGen] = pendingEntries[0];
+        const eu = usage;
+        pendingGen.update({
+          endTime: new Date(),
+          ...(msg.content
+            ? { output: redactObject(truncatePayload(msg.content), _redactEnabled) }
+            : {}),
+          ...(stopReason ? { metadata: { provider, model, stopReason } } : {}),
+          ...(eu
+            ? {
+                usageDetails: {
+                  input: (eu.input as number) ?? 0,
+                  output: (eu.output as number) ?? 0,
+                  total: (eu.totalTokens as number) ?? (eu.total as number) ?? 0,
+                  ...(eu.cacheRead ? { cache_read_input_tokens: eu.cacheRead as number } : {}),
+                  ...(eu.cacheWrite
+                    ? { cache_creation_input_tokens: eu.cacheWrite as number }
+                    : {}),
+                },
+              }
+            : {}),
+        });
+        entry.pendingGenerations.delete(runId);
+        entry.completedGenerations.set(entry.llmCallCount, pendingGen);
+        serviceLogger?.debug?.(
+          `Langfuse: transcript completed pending generation (llmCall=${entry.llmCallCount})`,
+        );
+      } else {
+        // No pending generation — this is an intermediate LLM call during a tool-use loop
+        // that llm_input/llm_output hooks cannot see. Create a new generation from scratch.
+        entry.llmCallCount += 1;
+        const genId = generateObservationId(entry.traceId, "gen", entry.llmCallCount);
+        const qualModel = model
+          ? qualifiedModel(provider ?? "", model)
+          : (entry.lastModel ?? "unknown");
+        const endTime = new Date();
+
+        const eu = usage;
+        const generation = entry.trace.generation({
+          id: genId,
+          name: `llm-call-${entry.llmCallCount}`,
+          model: qualModel,
+          startTime: endTime, // best-effort: we don't have the actual start time
+          endTime,
+          ...(msg.content
+            ? { output: redactObject(truncatePayload(msg.content), _redactEnabled) }
+            : {}),
+          ...(entry.currentGenerationId ? { parentObservationId: entry.currentGenerationId } : {}),
+          metadata: { provider, model, stopReason, source: "transcript-realtime" },
+          ...(eu
+            ? {
+                usageDetails: {
+                  input: (eu.input as number) ?? 0,
+                  output: (eu.output as number) ?? 0,
+                  total: (eu.totalTokens as number) ?? (eu.total as number) ?? 0,
+                  ...(eu.cacheRead ? { cache_read_input_tokens: eu.cacheRead as number } : {}),
+                  ...(eu.cacheWrite
+                    ? { cache_creation_input_tokens: eu.cacheWrite as number }
+                    : {}),
+                },
+              }
+            : {}),
+        });
+        entry.completedGenerations.set(entry.llmCallCount, generation);
+        entry.currentGenerationId = genId;
+        serviceLogger?.info?.(
+          `Langfuse: transcript created intermediate generation ${genId} (llmCall=${entry.llmCallCount})`,
+        );
+      }
+
+      scheduleFlush();
+    }
+
+    if (role === "toolResult" || role === "tool") {
+      const toolCallId = (msg.toolCallId as string) ?? (msg.tool_call_id as string) ?? undefined;
+      if (!toolCallId) {
+        return;
+      }
+
+      // Complete pending span if one exists (created by before_tool_call hook)
+      const pendingSpan = entry.pendingSpans.get(toolCallId);
+      if (pendingSpan) {
+        const error = msg.error as string | undefined;
+        const result = msg.content ?? msg.result;
+        pendingSpan.update({
+          endTime: new Date(),
+          ...(result ? { output: redactObject(truncatePayload(result), _redactEnabled) } : {}),
+          ...(error ? { statusMessage: error, level: "ERROR" as const } : {}),
+        });
+        entry.pendingSpans.delete(toolCallId);
+        entry.completedSpanToolCallIds.add(toolCallId);
+        serviceLogger?.debug?.(
+          `Langfuse: transcript completed tool span (toolCallId=${toolCallId})`,
+        );
+        scheduleFlush();
+      }
+    }
+  }
 
   return {
     id: "openclaw-langfuse",
@@ -949,6 +1293,16 @@ export function createLangfuseService(
         });
       }
 
+      // Subscribe to real-time transcript updates for per-message observation creation.
+      // This captures every message written by pi-agent-core (including intermediate
+      // tool-use loop messages that llm_input/llm_output hooks cannot see).
+      if (langfuse && contextMap && pluginRuntime?.events?.onSessionTranscriptUpdate) {
+        unsubscribeTranscript = pluginRuntime.events.onSessionTranscriptUpdate((update) => {
+          handleTranscriptUpdate(update, redactEnabled);
+        });
+        ctx.logger.info("Langfuse: subscribed to onSessionTranscriptUpdate");
+      }
+
       ctx.logger.info(`Langfuse plugin initialized (${baseUrl})`);
     },
 
@@ -957,6 +1311,10 @@ export function createLangfuseService(
         unsub();
       }
       sdkEventCleanups = [];
+      if (unsubscribeTranscript) {
+        unsubscribeTranscript();
+        unsubscribeTranscript = null;
+      }
       if (unsubscribeDiagnostics) {
         unsubscribeDiagnostics();
         unsubscribeDiagnostics = null;

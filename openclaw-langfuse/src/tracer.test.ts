@@ -1,4 +1,4 @@
-import type { PluginLogger, OpenClawPluginServiceContext } from "openclaw/plugin-sdk";
+import type { PluginLogger, OpenClawPluginServiceContext } from "openclaw/plugin-sdk/plugin-entry";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import type { LangfusePluginConfig } from "./config.js";
 import { computeCorrectedStartTimes } from "./finalize.js";

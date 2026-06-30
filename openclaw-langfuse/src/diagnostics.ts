@@ -1,6 +1,6 @@
 import type Langfuse from "langfuse";
 /* eslint-disable @typescript-eslint/no-base-to-string, @typescript-eslint/restrict-template-expressions, @typescript-eslint/no-redundant-type-constituents */
-import type { PluginLogger } from "openclaw/plugin-sdk";
+import type { PluginLogger } from "openclaw/plugin-sdk/plugin-entry";
 import type { LangfusePluginConfig } from "./config.js";
 import { createToolSpansFromMessages } from "./observations.js";
 import type { PromptManager } from "./prompt-manager.js";

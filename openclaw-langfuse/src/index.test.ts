@@ -1,4 +1,4 @@
-import type { PluginLogger } from "openclaw/plugin-sdk";
+import type { PluginLogger } from "openclaw/plugin-sdk/plugin-entry";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import type { LangfusePluginConfig } from "./config.js";
 
@@ -67,14 +67,14 @@ describe("Langfuse plugin registration (index.ts)", () => {
   it("register calls api.registerService", async () => {
     const { default: plugin } = await import("../index.js");
     const api = makeApi(baseConfig);
-    plugin.register(api as never);
+    await plugin.register(api as never);
     expect(api.registerService).toHaveBeenCalledOnce();
   });
 
   it("registers tracing hooks when tracing enabled", async () => {
     const { default: plugin } = await import("../index.js");
     const api = makeApi(baseConfig);
-    plugin.register(api as never);
+    await plugin.register(api as never);
 
     const registeredEvents = api.on.mock.calls.map((c: unknown[]) => c[0]);
     expect(registeredEvents).toContain("before_agent_start");
@@ -89,7 +89,7 @@ describe("Langfuse plugin registration (index.ts)", () => {
   it("skips tracing hooks when tracing.enabled is false", async () => {
     const { default: plugin } = await import("../index.js");
     const api = makeApi({ ...baseConfig, tracing: { enabled: false } });
-    plugin.register(api as never);
+    await plugin.register(api as never);
 
     const registeredEvents = api.on.mock.calls.map((c: unknown[]) => c[0]);
     expect(registeredEvents).not.toContain("before_agent_start");
@@ -107,7 +107,7 @@ describe("Langfuse plugin registration (index.ts)", () => {
       ...baseConfig,
       prompts: [{ match: "agent-1", langfusePrompt: "my-prompt" }],
     });
-    plugin.register(api as never);
+    await plugin.register(api as never);
 
     const registeredEvents = api.on.mock.calls.map((c: unknown[]) => c[0]);
     expect(registeredEvents).toContain("before_prompt_build");
@@ -116,7 +116,7 @@ describe("Langfuse plugin registration (index.ts)", () => {
   it("skips prompt hook when no prompts configured", async () => {
     const { default: plugin } = await import("../index.js");
     const api = makeApi({ ...baseConfig, prompts: [] });
-    plugin.register(api as never);
+    await plugin.register(api as never);
 
     const registeredEvents = api.on.mock.calls.map((c: unknown[]) => c[0]);
     expect(registeredEvents).not.toContain("before_prompt_build");

@@ -5,17 +5,21 @@
 // ---------------------------------------------------------------------------
 
 export type AgentCtx = {
+  runId?: string;
   agentId?: string;
   sessionKey?: string;
   sessionId?: string;
-  channelId?: string;
+  workspaceDir?: string;
+  messageProvider?: string;
   trigger?: string;
+  channelId?: string;
 };
 
 export type ToolCtx = {
   agentId?: string;
   sessionKey?: string;
   sessionId?: string;
+  runId?: string;
   toolName: string;
   toolCallId?: string;
 };
