@@ -7,9 +7,7 @@ read_when:
 title: "Canvas"
 ---
 
-# Canvas (macOS app)
-
-The macOS app embeds an agent‑controlled **Canvas panel** using `WKWebView`. It
+The macOS app embeds an agent-controlled **Canvas panel** using `WKWebView`. It
 is a lightweight visual workspace for HTML/CSS/JS, A2UI, and small interactive
 UI surfaces.
 
@@ -29,13 +27,13 @@ Examples:
 - `openclaw-canvas://main/assets/app.css` → `<canvasRoot>/main/assets/app.css`
 - `openclaw-canvas://main/widgets/todo/` → `<canvasRoot>/main/widgets/todo/index.html`
 
-If no `index.html` exists at the root, the app shows a **built‑in scaffold page**.
+If no `index.html` exists at the root, the app shows a **built-in scaffold page**.
 
 ## Panel behavior
 
 - Borderless, resizable panel anchored near the menu bar (or mouse cursor).
 - Remembers size/position per session.
-- Auto‑reloads when local canvas files change.
+- Auto-reloads when local canvas files change.
 - Only one Canvas panel is visible at a time (session is switched as needed).
 
 Canvas can be disabled from Settings → **Allow Canvas**. When disabled, canvas
@@ -67,7 +65,7 @@ Notes:
 ## A2UI in Canvas
 
 A2UI is hosted by the Gateway canvas host and rendered inside the Canvas panel.
-When the Gateway advertises a Canvas host, the macOS app auto‑navigates to the
+When the Gateway advertises a Canvas host, the macOS app auto-navigates to the
 A2UI host page on first open.
 
 Default A2UI host URL:
@@ -116,10 +114,26 @@ Example (in JS):
 window.location.href = "openclaw://agent?message=Review%20this%20design";
 ```
 
-The app prompts for confirmation unless a valid key is provided.
+Supported query parameters:
+
+- `message`: prefilled agent prompt.
+- `sessionKey`: stable session identifier.
+- `thinking`: optional thinking profile.
+- `deliver`, `to`, or `channel`: delivery target.
+- `timeoutSeconds`: optional run timeout.
+- `key`: app-generated safety token for trusted local callers.
+
+The app prompts for confirmation unless a valid key is provided. Unkeyed links
+show the message and URL before approval, and ignore delivery routing fields;
+keyed links use the normal Gateway run path.
 
 ## Security notes
 
 - Canvas scheme blocks directory traversal; files must live under the session root.
 - Local Canvas content uses a custom scheme (no loopback server required).
 - External `http(s)` URLs are allowed only when explicitly navigated.
+
+## Related
+
+- [macOS app](/platforms/macos)
+- [WebChat](/web/webchat)

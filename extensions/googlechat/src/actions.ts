@@ -1,17 +1,18 @@
+// Googlechat plugin module implements actions behavior.
+import {
+  createActionGate,
+  jsonResult,
+  readPositiveIntegerParam,
+  readReactionParams,
+  readStringParam,
+} from "openclaw/plugin-sdk/channel-actions";
 import type {
   ChannelMessageActionAdapter,
   ChannelMessageActionName,
-  OpenClawConfig,
-} from "../runtime-api.js";
-import {
-  createActionGate,
-  extractToolSend,
-  jsonResult,
-  loadOutboundMediaFromUrl,
-  readNumberParam,
-  readReactionParams,
-  readStringParam,
-} from "../runtime-api.js";
+} from "openclaw/plugin-sdk/channel-contract";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+import { loadOutboundMediaFromUrl } from "openclaw/plugin-sdk/outbound-media";
+import { extractToolSend } from "openclaw/plugin-sdk/tool-send";
 import { listEnabledGoogleChatAccounts, resolveGoogleChatAccount } from "./accounts.js";
 import {
   createGoogleChatReaction,
@@ -31,15 +32,9 @@ function listEnabledAccounts(cfg: OpenClawConfig) {
   );
 }
 
-function isReactionsEnabled(accounts: ReturnType<typeof listEnabledAccounts>, cfg: OpenClawConfig) {
+function isReactionsEnabled(accounts: Array<{ config: { actions?: unknown } }>) {
   for (const account of accounts) {
-    const gate = createActionGate(
-      (account.config.actions ??
-        (cfg.channels?.["googlechat"] as { actions?: unknown })?.actions) as Record<
-        string,
-        boolean | undefined
-      >,
-    );
+    const gate = createActionGate(account.config.actions as Record<string, boolean | undefined>);
     if (gate("reactions")) {
       return true;
     }
@@ -63,7 +58,7 @@ async function loadGoogleChatActionMedia(params: {
 }) {
   const runtime = getGoogleChatRuntime();
   return /^https?:\/\//i.test(params.mediaUrl)
-    ? await runtime.channel.media.fetchRemoteMedia({
+    ? await runtime.channel.media.readRemoteMediaBuffer({
         url: params.mediaUrl,
         maxBytes: params.maxBytes,
       })
@@ -76,15 +71,19 @@ async function loadGoogleChatActionMedia(params: {
 }
 
 export const googlechatMessageActions: ChannelMessageActionAdapter = {
-  describeMessageTool: ({ cfg }) => {
-    const accounts = listEnabledAccounts(cfg);
+  describeMessageTool: ({ cfg, accountId }) => {
+    const accounts = accountId
+      ? [resolveGoogleChatAccount({ cfg, accountId })].filter(
+          (account) => account.enabled && account.credentialSource !== "none",
+        )
+      : listEnabledAccounts(cfg);
     if (accounts.length === 0) {
       return null;
     }
     const actions = new Set<ChannelMessageActionName>([]);
     actions.add("send");
     actions.add("upload-file");
-    if (isReactionsEnabled(accounts, cfg)) {
+    if (isReactionsEnabled(accounts)) {
       actions.add("react");
       actions.add("reactions");
     }
@@ -103,7 +102,7 @@ export const googlechatMessageActions: ChannelMessageActionAdapter = {
     mediaReadFile,
   }) => {
     const account = resolveGoogleChatAccount({
-      cfg: cfg,
+      cfg,
       accountId,
     });
     if (account.credentialSource === "none") {
@@ -149,7 +148,7 @@ export const googlechatMessageActions: ChannelMessageActionAdapter = {
           buffer: loaded.buffer,
           contentType: loaded.contentType,
         });
-        await sendGoogleChatMessage({
+        const sent = await sendGoogleChatMessage({
           account,
           space,
           text: content,
@@ -163,20 +162,20 @@ export const googlechatMessageActions: ChannelMessageActionAdapter = {
               ]
             : undefined,
         });
-        return jsonResult({ ok: true, to: space });
+        return jsonResult({ ok: true, to: space, ...sent });
       }
 
       if (action === "upload-file") {
         throw new Error("upload-file requires media, filePath, or path");
       }
 
-      await sendGoogleChatMessage({
+      const sent = await sendGoogleChatMessage({
         account,
         space,
         text: content,
         thread: threadId ?? undefined,
       });
-      return jsonResult({ ok: true, to: space });
+      return jsonResult({ ok: true, to: space, ...sent });
     }
 
     if (action === "react") {
@@ -215,7 +214,7 @@ export const googlechatMessageActions: ChannelMessageActionAdapter = {
 
     if (action === "reactions") {
       const messageName = readStringParam(params, "messageId", { required: true });
-      const limit = readNumberParam(params, "limit", { integer: true });
+      const limit = readPositiveIntegerParam(params, "limit");
       const reactions = await listGoogleChatReactions({
         account,
         messageName,

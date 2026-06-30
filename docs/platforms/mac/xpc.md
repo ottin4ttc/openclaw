@@ -21,6 +21,10 @@ title: "macOS IPC"
 
 - The app runs the Gateway (local mode) and connects to it as a node.
 - Agent actions are performed via `node.invoke` (e.g. `system.run`, `system.notify`, `canvas.*`).
+- Common Mac node commands include `canvas.*`, `camera.snap`, `camera.clip`,
+  `screen.snapshot`, `screen.record`, `system.run`, and `system.notify`.
+- The node reports a `permissions` map so agents can see whether screen,
+  camera, microphone, speech, automation, or accessibility access is available.
 
 ### Node service + app IPC
 
@@ -59,3 +63,8 @@ Agent -> Gateway -> Node Service (WS)
 - All communication remains local-only; no network sockets are exposed.
 - TCC prompts originate only from the GUI app bundle; keep the signed bundle ID stable across rebuilds.
 - IPC hardening: socket mode `0600`, token, peer-UID checks, HMAC challenge/response, short TTL.
+
+## Related
+
+- [macOS app](/platforms/macos)
+- [macOS IPC flow (Exec approvals)](/tools/exec-approvals-advanced#macos-ipc-flow)

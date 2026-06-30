@@ -1,3 +1,4 @@
+// Tests Claude provider usage fetch normalization and error handling.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createProviderUsageFetch,
@@ -41,11 +42,38 @@ async function expectMissingScopeWithoutFallback(mockFetch: ScopeFallbackFetch) 
   expectMissingScopeError(result);
   const calledUrls = mockFetch.mock.calls.map(([input]) => toRequestUrl(input));
   expect(calledUrls.length).toBeGreaterThan(0);
-  expect(calledUrls.every((url) => url.includes("/api/oauth/usage"))).toBe(true);
+  expect(calledUrls.filter((url) => !url.includes("/api/oauth/usage"))).toEqual([]);
 }
 
 function makeOrgAResponse() {
   return makeResponse(200, [{ uuid: "org-a" }]);
+}
+
+function makeOversizedJsonResponse(status: number): {
+  response: Response;
+  state: { canceled: boolean; enqueuedBytes: number };
+} {
+  const state = { canceled: false, enqueuedBytes: 0 };
+  const chunkSize = 1024 * 1024;
+  let emitted = 0;
+  const response = new Response(
+    new ReadableStream({
+      pull(controller) {
+        if (emitted >= 64) {
+          controller.close();
+          return;
+        }
+        emitted += 1;
+        state.enqueuedBytes += chunkSize;
+        controller.enqueue(new Uint8Array(chunkSize));
+      },
+      cancel() {
+        state.canceled = true;
+      },
+    }),
+    { status, headers: { "Content-Type": "application/json" } },
+  );
+  return { response, state };
 }
 
 describe("fetchClaudeUsage", () => {
@@ -125,6 +153,27 @@ describe("fetchClaudeUsage", () => {
 
     const result = await fetchClaudeUsage("token", 5000, mockFetch);
     expect(result.error).toBe("HTTP 502");
+    expect(result.windows).toHaveLength(0);
+  });
+
+  it("bounds oversized oauth error bodies and cancels the stream", async () => {
+    const oversized = makeOversizedJsonResponse(403);
+    const mockFetch = createProviderUsageFetch(async () => oversized.response);
+
+    const result = await fetchClaudeUsage("token", 5000, mockFetch);
+
+    expect(result.error).toBe("HTTP 403");
+    expect(result.windows).toHaveLength(0);
+    expect(oversized.state.canceled).toBe(true);
+    expect(oversized.state.enqueuedBytes).toBeLessThan(64 * 1024 * 1024);
+  });
+
+  it("returns a stable error for malformed successful oauth usage JSON", async () => {
+    const mockFetch = createProviderUsageFetch(async () => makeResponse(200, "{not json"));
+
+    const result = await fetchClaudeUsage("token", 5000, mockFetch);
+
+    expect(result.error).toBe("Malformed usage response");
     expect(result.windows).toHaveLength(0);
   });
 

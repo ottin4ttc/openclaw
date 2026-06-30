@@ -1,182 +1,211 @@
+// Feishu plugin module implements dynamic agent behavior.
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { resolveChannelConfigWrites } from "openclaw/plugin-sdk/channel-config-writes";
+import { normalizeAccountId, resolveAgentRoute } from "openclaw/plugin-sdk/routing";
 import type { OpenClawConfig, PluginRuntime } from "../runtime-api.js";
+import { resolveFeishuAccount } from "./accounts.js";
 import type { DynamicAgentCreationConfig } from "./types.js";
 
-export type MaybeCreateDynamicAgentResult = {
+type MaybeCreateDynamicAgentResult = {
   created: boolean;
   updatedCfg: OpenClawConfig;
   agentId?: string;
 };
 
-// Serialize dynamic agent creation to prevent concurrent read-modify-write races.
-// Multiple DM users sending messages simultaneously would otherwise clobber each other's
-// config writes, leaving agents with workspace dirs on disk but missing from the config.
-let _createLock: Promise<void> = Promise.resolve();
+type DynamicAgentMutationResult = {
+  created: boolean;
+  agentId?: string;
+};
 
-function withCreateLock<T>(fn: () => Promise<T>): Promise<T> {
-  let release!: () => void;
-  const next = new Promise<void>((resolve) => {
-    release = resolve;
-  });
-  const prev = _createLock;
-  _createLock = next;
-  return prev.then(async () => {
-    try {
-      return await fn();
-    } finally {
-      release();
-    }
-  });
+class DynamicAgentMutationSkipped extends Error {
+  constructor(readonly cfg: OpenClawConfig) {
+    super("dynamic agent mutation skipped");
+  }
+}
+
+function hasDefaultDirectRoute(
+  cfg: OpenClawConfig,
+  accountId: string,
+  senderOpenId: string,
+): boolean {
+  return (
+    resolveAgentRoute({
+      cfg,
+      channel: "feishu",
+      accountId,
+      peer: { kind: "direct", id: senderOpenId },
+    }).matchedBy === "default"
+  );
+}
+
+function resolveDynamicAgentConfig(
+  cfg: OpenClawConfig,
+  accountId: string,
+): DynamicAgentCreationConfig | undefined {
+  return resolveFeishuAccount({ cfg, accountId }).config.dynamicAgentCreation as
+    | DynamicAgentCreationConfig
+    | undefined;
+}
+
+function isAtDynamicAgentLimit(
+  cfg: OpenClawConfig,
+  dynamicCfg: DynamicAgentCreationConfig,
+): boolean {
+  if (dynamicCfg.maxAgents === undefined) {
+    return false;
+  }
+  const feishuAgentCount = (cfg.agents?.list ?? []).filter((agent) =>
+    agent.id.startsWith("feishu-"),
+  ).length;
+  return feishuAgentCount >= dynamicCfg.maxAgents;
+}
+
+function resolveDynamicAgentId(accountId: string, senderOpenId: string): string {
+  if (accountId === "default") {
+    return `feishu-${senderOpenId}`;
+  }
+  const identityDigest = createHash("sha256")
+    .update(accountId)
+    .update("\0")
+    .update(senderOpenId)
+    .digest("hex")
+    .slice(0, 32);
+  return `feishu-${accountId.slice(0, 12)}-${identityDigest}`;
 }
 
 /**
- * Check if a dynamic agent should be created for a DM user and create it if needed.
- * This creates a unique agent instance with its own workspace for each DM user.
- *
- * Serialized via an in-process lock so concurrent DMs don't clobber each other's config writes.
+ * Refresh an existing DM binding or create its dynamic agent when current
+ * account policy permits config writes.
  */
-export function maybeCreateDynamicAgent(params: {
+export async function maybeCreateDynamicAgent(params: {
   cfg: OpenClawConfig;
   runtime: PluginRuntime;
+  accountId: string;
   senderOpenId: string;
-  senderName?: string;
-  dynamicCfg: DynamicAgentCreationConfig;
-  accountId?: string;
+  canCreateForConfig: (cfg: OpenClawConfig) => Promise<boolean>;
   log: (msg: string) => void;
 }): Promise<MaybeCreateDynamicAgentResult> {
-  return withCreateLock(() => doCreateDynamicAgent(params));
-}
+  const { cfg, runtime, senderOpenId, canCreateForConfig, log } = params;
+  const accountId = normalizeAccountId(params.accountId);
 
-async function doCreateDynamicAgent(params: {
-  cfg: OpenClawConfig;
-  runtime: PluginRuntime;
-  senderOpenId: string;
-  senderName?: string;
-  dynamicCfg: DynamicAgentCreationConfig;
-  accountId?: string;
-  log: (msg: string) => void;
-}): Promise<MaybeCreateDynamicAgentResult> {
-  const { runtime, senderOpenId, senderName, dynamicCfg, accountId, log } = params;
-
-  // Re-read config inside the lock to avoid stale-snapshot races.
-  // The caller's `cfg` may already be outdated if another agent was created concurrently.
-  const cfg = runtime.config.loadConfig();
-
-  // Check if there's already a binding for this user
-  const existingBindings = cfg.bindings ?? [];
-  const hasBinding = existingBindings.some(
-    (b) =>
-      b.match?.channel === "feishu" &&
-      b.match?.peer?.kind === "direct" &&
-      b.match?.peer?.id === senderOpenId,
-  );
-
-  if (hasBinding) {
+  if (!hasDefaultDirectRoute(cfg, accountId, senderOpenId)) {
     return { created: false, updatedCfg: cfg };
   }
 
-  // Check maxAgents limit if configured
-  if (dynamicCfg.maxAgents !== undefined) {
-    const feishuAgentCount = (cfg.agents?.list ?? []).filter((a) =>
-      a.id.startsWith("feishu-"),
-    ).length;
-    if (feishuAgentCount >= dynamicCfg.maxAgents) {
-      log(
-        `feishu: maxAgents limit (${dynamicCfg.maxAgents}) reached, not creating agent for ${senderOpenId}`,
-      );
-      return { created: false, updatedCfg: cfg };
-    }
+  const currentCfg = runtime.config.current() as OpenClawConfig;
+  if (!hasDefaultDirectRoute(currentCfg, accountId, senderOpenId)) {
+    return { created: false, updatedCfg: currentCfg };
   }
 
-  // Use full OpenID as agent ID suffix (OpenID format: ou_xxx is already filesystem-safe)
-  const agentId = `feishu-${senderOpenId}`;
+  const currentDynamicCfg = resolveDynamicAgentConfig(currentCfg, accountId);
+  if (!currentDynamicCfg?.enabled) {
+    return { created: false, updatedCfg: currentCfg };
+  }
+  if (!resolveChannelConfigWrites({ cfg: currentCfg, channelId: "feishu", accountId })) {
+    log(`feishu: config writes disabled, not creating agent for ${senderOpenId}`);
+    return { created: false, updatedCfg: currentCfg };
+  }
+  const agentId = resolveDynamicAgentId(accountId, senderOpenId);
+  const currentAgentExists = (currentCfg.agents?.list ?? []).some((agent) => agent.id === agentId);
+  // Legacy unscoped agents are indistinguishable from valid default-account state.
+  // Keep maxAgents as a hard cap instead of auto-rebinding or deleting ambiguous user data.
+  if (!currentAgentExists && isAtDynamicAgentLimit(currentCfg, currentDynamicCfg)) {
+    log(
+      `feishu: maxAgents limit (${currentDynamicCfg.maxAgents}) reached, not creating agent for ${senderOpenId}`,
+    );
+    return { created: false, updatedCfg: currentCfg };
+  }
+  if (!(await canCreateForConfig(currentCfg))) {
+    return { created: false, updatedCfg: currentCfg };
+  }
 
-  // Check if agent already exists (but binding was missing)
-  const existingAgent = (cfg.agents?.list ?? []).find((a) => a.id === agentId);
-  if (existingAgent) {
-    // Agent exists but binding doesn't - just add the binding
-    log(`feishu: agent "${agentId}" exists, adding missing binding for ${senderOpenId}`);
+  // The config mutation lock owns the final duplicate/limit checks. This keeps
+  // simultaneous DM creations and policy updates from producing stale writes.
+  let skippedCfg: OpenClawConfig | undefined;
+  const committed = await runtime.config
+    .mutateConfigFile<DynamicAgentMutationResult>({
+      base: "runtime",
+      afterWrite: { mode: "auto" },
+      mutate: async (draft) => {
+        if (!hasDefaultDirectRoute(draft, accountId, senderOpenId)) {
+          throw new DynamicAgentMutationSkipped(draft);
+        }
 
-    const updatedCfg: OpenClawConfig = {
-      ...cfg,
-      bindings: [
-        ...existingBindings,
-        {
-          agentId,
-          match: {
-            channel: "feishu",
-            accountId: "*",
-            peer: { kind: "direct", id: senderOpenId },
+        const dynamicCfg = resolveDynamicAgentConfig(draft, accountId);
+        if (
+          !dynamicCfg?.enabled ||
+          !resolveChannelConfigWrites({ cfg: draft, channelId: "feishu", accountId })
+        ) {
+          throw new DynamicAgentMutationSkipped(draft);
+        }
+        const agentExists = (draft.agents?.list ?? []).some((agent) => agent.id === agentId);
+        if (!agentExists && isAtDynamicAgentLimit(draft, dynamicCfg)) {
+          log(
+            `feishu: maxAgents limit (${dynamicCfg.maxAgents}) reached, not creating agent for ${senderOpenId}`,
+          );
+          throw new DynamicAgentMutationSkipped(draft);
+        }
+        if (!(await canCreateForConfig(draft))) {
+          throw new DynamicAgentMutationSkipped(draft);
+        }
+
+        if (!agentExists) {
+          const workspaceTemplate =
+            dynamicCfg.workspaceTemplate ?? "~/.openclaw/workspace-{agentId}";
+          const agentDirTemplate =
+            dynamicCfg.agentDirTemplate ?? "~/.openclaw/agents/{agentId}/agent";
+          const workspace = resolveUserPath(
+            workspaceTemplate.replace("{userId}", senderOpenId).replace("{agentId}", agentId),
+          );
+          const agentDir = resolveUserPath(
+            agentDirTemplate.replace("{userId}", senderOpenId).replace("{agentId}", agentId),
+          );
+          log(`feishu: creating dynamic agent "${agentId}" for user ${senderOpenId}`);
+          log(`  workspace: ${workspace}`);
+          log(`  agentDir: ${agentDir}`);
+          await fs.promises.mkdir(workspace, { recursive: true });
+          await fs.promises.mkdir(agentDir, { recursive: true });
+          draft.agents = {
+            ...draft.agents,
+            list: [...(draft.agents?.list ?? []), { id: agentId, workspace, agentDir }],
+          };
+        } else {
+          log(`feishu: agent "${agentId}" exists, adding missing binding for ${senderOpenId}`);
+        }
+
+        draft.bindings = [
+          ...(draft.bindings ?? []),
+          {
+            agentId,
+            match: {
+              channel: "feishu",
+              accountId,
+              peer: { kind: "direct", id: senderOpenId },
+            },
           },
-        },
-      ],
-    };
-
-    await runtime.config.writeConfigFile(updatedCfg);
-    return { created: true, updatedCfg, agentId };
+        ];
+        return { created: true, agentId };
+      },
+    })
+    .catch((error: unknown) => {
+      if (error instanceof DynamicAgentMutationSkipped) {
+        skippedCfg = error.cfg;
+        return null;
+      }
+      throw error;
+    });
+  if (!committed) {
+    return { created: false, updatedCfg: skippedCfg ?? currentCfg };
   }
 
-  // Resolve path templates with substitutions
-  const workspaceTemplate = dynamicCfg.workspaceTemplate ?? "~/.openclaw/workspace-{agentId}";
-  const agentDirTemplate = dynamicCfg.agentDirTemplate ?? "~/.openclaw/agents/{agentId}/agent";
-
-  const workspace = resolveUserPath(
-    workspaceTemplate.replace("{userId}", senderOpenId).replace("{agentId}", agentId),
-  );
-  const agentDir = resolveUserPath(
-    agentDirTemplate.replace("{userId}", senderOpenId).replace("{agentId}", agentId),
-  );
-
-  log(`feishu: creating dynamic agent "${agentId}" for user ${senderOpenId}`);
-  log(`  workspace: ${workspace}`);
-  log(`  agentDir: ${agentDir}`);
-
-  // Create directories
-  await fs.promises.mkdir(workspace, { recursive: true });
-  await fs.promises.mkdir(agentDir, { recursive: true });
-
-  // Write agent metadata (open_id + name) for external scripts to consume
-  const meta = {
-    openId: senderOpenId,
-    name: senderName || undefined,
-    agentId,
-    createdAt: new Date().toISOString(),
+  return {
+    created: committed.result?.created ?? false,
+    updatedCfg: runtime.config.current() as OpenClawConfig,
+    agentId: committed.result?.agentId,
   };
-  const metaPath = path.join(agentDir, "meta.json");
-  await fs.promises.writeFile(metaPath, JSON.stringify(meta, null, 2) + "\n");
-  log(`feishu: wrote agent metadata to ${metaPath}`);
-
-  // Re-read config again before the final write — directory creation above may have
-  // yielded the event loop, allowing another agent's write to complete in between.
-  const freshCfg = runtime.config.loadConfig();
-  const freshBindings = freshCfg.bindings ?? [];
-
-  // Update configuration with new agent and binding
-  const updatedCfg: OpenClawConfig = {
-    ...freshCfg,
-    agents: {
-      ...freshCfg.agents,
-      list: [...(freshCfg.agents?.list ?? []), { id: agentId, workspace, agentDir }],
-    },
-    bindings: [
-      ...freshBindings,
-      {
-        agentId,
-        match: {
-          channel: "feishu",
-          accountId: "*",
-          peer: { kind: "direct", id: senderOpenId },
-        },
-      },
-    ],
-  };
-
-  // Write updated config using PluginRuntime API
-  await runtime.config.writeConfigFile(updatedCfg);
-
-  return { created: true, updatedCfg, agentId };
 }
 
 /**

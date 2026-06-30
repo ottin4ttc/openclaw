@@ -4,10 +4,8 @@ read_when:
   - You want a self-hosted web search provider
   - You want to use SearXNG for web_search
   - You need a privacy-focused or air-gapped search option
-title: "SearXNG Search"
+title: "SearXNG search"
 ---
-
-# SearXNG Search
 
 OpenClaw supports [SearXNG](https://docs.searxng.org/) as a **self-hosted,
 key-free** `web_search` provider. SearXNG is an open-source meta-search engine
@@ -22,6 +20,11 @@ Advantages:
 ## Setup
 
 <Steps>
+  <Step title="Install the plugin">
+    ```bash
+    openclaw plugins install @openclaw/searxng-plugin
+    ```
+  </Step>
   <Step title="Run a SearXNG instance">
     ```bash
     docker run -d -p 8888:8080 searxng/searxng
@@ -82,6 +85,15 @@ Plugin-level settings for the SearXNG instance:
 
 The `baseUrl` field also accepts SecretRef objects.
 
+Transport rules:
+
+- `https://` works for public or private SearXNG hosts
+- `http://` is only accepted for trusted private-network or loopback hosts
+- public SearXNG hosts must use `https://`
+- private/internal hosts use the self-hosted network guard; public `https://`
+  hosts stay on the strict web-search guard and cannot redirect to private
+  addresses
+
 ## Environment variable
 
 Set `SEARXNG_BASE_URL` as an alternative to config:
@@ -105,12 +117,22 @@ key wins first).
 ## Notes
 
 - **JSON API** -- uses SearXNG's native `format=json` endpoint, not HTML scraping
+- **Image result URLs** -- image-category results include `img_src` when SearXNG
+  returns a direct image URL
 - **No API key** -- works with any SearXNG instance out of the box
-- **Auto-detection order** -- SearXNG is checked last (order 200) in auto-detection,
-  so any API-backed provider with a key takes priority over SearXNG, and SearXNG sits
-  behind DuckDuckGo (order 100) as well
+- **Base URL validation** -- `baseUrl` must be a valid `http://` or `https://`
+  URL; public hosts must use `https://`
+- **Network guard** -- private/internal SearXNG endpoints opt in to
+  private-network access; public `https://` SearXNG endpoints keep strict SSRF
+  protection
+- **Auto-detection order** -- SearXNG is checked after API-backed providers
+  with configured keys (order 200). Key-free providers such as DuckDuckGo or
+  Ollama Web Search are not auto-selected without an explicit provider choice
 - **Self-hosted** -- you control the instance, queries, and upstream search engines
 - **Categories** default to `general` when not configured
+- **Category fallback** -- if a non-`general` category request succeeds but
+  returns zero results, OpenClaw retries the same query once with `general`
+  before returning an empty result set
 
 <Tip>
   For SearXNG JSON API to work, make sure your SearXNG instance has the `json`
@@ -120,5 +142,5 @@ key wins first).
 ## Related
 
 - [Web Search overview](/tools/web) -- all providers and auto-detection
-- [DuckDuckGo Search](/tools/duckduckgo-search) -- another key-free fallback
+- [DuckDuckGo Search](/tools/duckduckgo-search) -- another key-free provider
 - [Brave Search](/tools/brave-search) -- structured results with free tier
