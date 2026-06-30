@@ -86,19 +86,19 @@ describe("Langfuse plugin registration (index.ts)", () => {
     expect(registeredEvents).toContain("session_end");
   });
 
-  it("skips tracing hooks when tracing.enabled is false", async () => {
+  it("registers tracing hooks when tracing.enabled is false", async () => {
     const { default: plugin } = await import("../index.js");
     const api = makeApi({ ...baseConfig, tracing: { enabled: false } });
     await plugin.register(api as never);
 
     const registeredEvents = api.on.mock.calls.map((c: unknown[]) => c[0]);
-    expect(registeredEvents).not.toContain("before_agent_start");
-    expect(registeredEvents).not.toContain("llm_input");
-    expect(registeredEvents).not.toContain("llm_output");
-    expect(registeredEvents).not.toContain("before_tool_call");
-    expect(registeredEvents).not.toContain("after_tool_call");
-    expect(registeredEvents).not.toContain("agent_end");
-    expect(registeredEvents).not.toContain("session_end");
+    expect(registeredEvents).toContain("before_agent_start");
+    expect(registeredEvents).toContain("llm_input");
+    expect(registeredEvents).toContain("llm_output");
+    expect(registeredEvents).toContain("before_tool_call");
+    expect(registeredEvents).toContain("after_tool_call");
+    expect(registeredEvents).toContain("agent_end");
+    expect(registeredEvents).toContain("session_end");
   });
 
   it("registers prompt hook when prompts configured", async () => {
@@ -113,12 +113,12 @@ describe("Langfuse plugin registration (index.ts)", () => {
     expect(registeredEvents).toContain("before_prompt_build");
   });
 
-  it("skips prompt hook when no prompts configured", async () => {
+  it("registers prompt hook when no prompts configured", async () => {
     const { default: plugin } = await import("../index.js");
     const api = makeApi({ ...baseConfig, prompts: [] });
     await plugin.register(api as never);
 
     const registeredEvents = api.on.mock.calls.map((c: unknown[]) => c[0]);
-    expect(registeredEvents).not.toContain("before_prompt_build");
+    expect(registeredEvents).toContain("before_prompt_build");
   });
 });

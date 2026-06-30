@@ -18,6 +18,14 @@ export default defineConfig({
         find: "openclaw/plugin-sdk",
         replacement: path.join(repoRoot, "src", "plugin-sdk", "index.ts"),
       },
+      {
+        find: /^@openclaw\/normalization-core\/(.+)$/,
+        replacement: path.join(repoRoot, "packages", "normalization-core", "src", "$1.ts"),
+      },
+      {
+        find: "@openclaw/normalization-core",
+        replacement: path.join(repoRoot, "packages", "normalization-core", "src", "index.ts"),
+      },
     ],
   },
   test: {
