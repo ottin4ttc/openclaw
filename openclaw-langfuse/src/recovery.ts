@@ -1,10 +1,16 @@
 import fs from "node:fs";
 import path from "node:path";
 import type Langfuse from "langfuse";
+import { resolveTranscriptSessionKeyBySessionId } from "openclaw/plugin-sdk/session-store-runtime";
 import { buildObservationsFromEntries } from "./observations.js";
 import { redactText } from "./redact.js";
-import { readSessionMessages, resolveMarkerFilePath, writeTraceMarker } from "./session.js";
-import type { IncompleteTraceInfo, MinimalLogger } from "./types.js";
+import {
+  readSessionMessages,
+  readSessionMessagesByIdentity,
+  resolveMarkerFilePath,
+  writeTraceMarker,
+} from "./session.js";
+import type { IncompleteTraceInfo, MinimalLogger, SessionEntry } from "./types.js";
 import { extractUserMessageText, filterCurrentTurnEntries } from "./utils.js";
 
 /**
@@ -80,6 +86,53 @@ function readFileOrTail(filePath: string, tailBytes: number): string | null {
   }
 }
 
+function readCompleteMarkerLedger(filePath: string): string | null {
+  try {
+    return fs.readFileSync(filePath, "utf-8");
+  } catch {
+    return null;
+  }
+}
+
+function recoveryEnv(stateDir: string | null): NodeJS.ProcessEnv {
+  return stateDir ? { ...process.env, OPENCLAW_STATE_DIR: stateDir } : process.env;
+}
+
+function parseMarkerTimestamp(value: unknown): number | undefined {
+  if (typeof value === "string") {
+    const parsed = Date.parse(value);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  }
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+async function readRecoverySessionMessages(
+  stateDir: string | null,
+  agentId: string,
+  sessionId: string,
+  logger?: MinimalLogger | null,
+): Promise<{ entries: SessionEntry[]; sessionKey?: string }> {
+  const env = recoveryEnv(stateDir);
+  const sessionKey = resolveTranscriptSessionKeyBySessionId({ agentId, sessionId, env });
+  if (sessionKey) {
+    const sqliteEntries = await readSessionMessagesByIdentity(
+      { agentId, sessionId, sessionKey, env },
+      logger,
+    );
+    if (sqliteEntries.length > 0) {
+      return { entries: sqliteEntries, sessionKey };
+    }
+    logger?.debug?.(
+      `Langfuse: SQLite transcript empty during recovery for agent=${agentId} session=${sessionId}, trying legacy JSONL fallback`,
+    );
+  } else {
+    logger?.debug?.(
+      `Langfuse: no SQLite transcript session key for agent=${agentId} session=${sessionId}, trying legacy JSONL fallback`,
+    );
+  }
+  return { entries: readSessionMessages(stateDir, agentId, sessionId, logger), sessionKey };
+}
+
 /**
  * Scan stateDir for incomplete traces (have trace-start but no trace-end).
  * Prioritizes sidecar `.langfuse-markers.jsonl` files; falls back to scanning
@@ -146,7 +199,11 @@ export function scanIncompleteTraces(stateDir: string): IncompleteTraceInfo[] {
         continue;
       }
 
-      const raw = readFileOrTail(markerSourceFile, TAIL_BYTES);
+      // Current sidecars mix trace markers with observation events. A long turn can push
+      // an unmatched trace-start outside a fixed tail, so marker ledgers must be complete.
+      const raw = hasSidecar
+        ? readCompleteMarkerLedger(markerSourceFile)
+        : readFileOrTail(markerSourceFile, TAIL_BYTES);
       if (!raw) {
         continue;
       }
@@ -164,7 +221,7 @@ export function scanIncompleteTraces(stateDir: string): IncompleteTraceInfo[] {
       // Supplementary: check for inline _langfuse metadata in JSONL messages.
       // This catches traces from new openclaw versions where before_message_write
       // injected identifiers but sidecar markers may be incomplete.
-      if (starts.size === 0 && fs.existsSync(sessionJsonlPath)) {
+      if (fs.existsSync(sessionJsonlPath)) {
         const jsonlRaw = hasSidecar ? readFileOrTail(sessionJsonlPath, TAIL_BYTES) : raw;
         if (jsonlRaw) {
           const inlineTraceIds = parseInlineLangfuseMarkers(jsonlRaw);
@@ -182,7 +239,7 @@ export function scanIncompleteTraces(stateDir: string): IncompleteTraceInfo[] {
 }
 
 /**
- * Recover a single incomplete trace by rebuilding observations from JSONL.
+ * Recover a single incomplete trace by rebuilding observations from the canonical transcript.
  * Writes a trace-end marker after successful recovery and flushes to Langfuse.
  * Returns the number of created observations.
  */
@@ -194,8 +251,24 @@ export async function recoverTrace(
   logger?: MinimalLogger | null,
 ): Promise<number> {
   const { traceId, agentId, sessionId } = traceInfo;
+  const sidecarPath = resolveMarkerFilePath(stateDir ?? "", agentId, sessionId);
+  const markerRaw = readCompleteMarkerLedger(sidecarPath);
+  if (markerRaw) {
+    const { ends } = parseMarkers(markerRaw);
+    if (ends.has(traceId)) {
+      logger?.debug?.(
+        `Langfuse: skip recovery for trace ${traceId}; end marker appeared before recovery`,
+      );
+      return 0;
+    }
+  }
 
-  const allEntries = readSessionMessages(stateDir, agentId, sessionId, logger);
+  const { entries: allEntries, sessionKey } = await readRecoverySessionMessages(
+    stateDir,
+    agentId,
+    sessionId,
+    logger,
+  );
   if (allEntries.length === 0) {
     return 0;
   }
@@ -205,9 +278,9 @@ export async function recoverTrace(
   // then fall back to scanning the session JSONL for old embedded markers.
   let traceStartIdx = -1;
   let traceStartTimestamp: number | undefined;
+  let nextTraceBoundaryTimestamp: number | undefined;
 
   // Try sidecar file first
-  const sidecarPath = resolveMarkerFilePath(stateDir ?? "", agentId, sessionId);
   let foundInSidecar = false;
   try {
     const sidecarRaw = fs.readFileSync(sidecarPath, "utf-8");
@@ -222,12 +295,17 @@ export async function recoverTrace(
           parsed?.customType === "langfuse-trace-start" &&
           parsed?.data?.traceId === traceId
         ) {
-          if (typeof parsed.timestamp === "string") {
-            traceStartTimestamp = Date.parse(parsed.timestamp);
-          } else if (typeof parsed.timestamp === "number") {
-            traceStartTimestamp = parsed.timestamp;
-          }
+          traceStartTimestamp = parseMarkerTimestamp(parsed.timestamp);
           foundInSidecar = true;
+          continue;
+        }
+        if (
+          foundInSidecar &&
+          parsed?.type === "custom" &&
+          parsed?.customType === "langfuse-trace-start" &&
+          parsed?.data?.traceId !== traceId
+        ) {
+          nextTraceBoundaryTimestamp = parseMarkerTimestamp(parsed.timestamp);
           break;
         }
       } catch {
@@ -239,15 +317,18 @@ export async function recoverTrace(
   }
 
   // Re-read raw JSONL to find trace-start position relative to message entries
-  let raw: string;
+  let lines: string[] = [];
   try {
-    raw = fs.readFileSync(traceInfo.jsonlPath, "utf-8");
+    const raw = fs.readFileSync(traceInfo.jsonlPath, "utf-8");
+    lines = raw.split(/\r?\n/);
   } catch {
-    return 0;
+    if (!foundInSidecar) {
+      return 0;
+    }
   }
 
-  const lines = raw.split(/\r?\n/);
   let messageLineIdx = 0;
+  let nextTraceBoundaryIdx = -1;
   for (const line of lines) {
     if (!line.trim()) {
       continue;
@@ -261,13 +342,20 @@ export async function recoverTrace(
       ) {
         // Found old embedded marker — use its timestamp if sidecar didn't have one
         if (!foundInSidecar) {
-          if (typeof parsed.timestamp === "string") {
-            traceStartTimestamp = Date.parse(parsed.timestamp);
-          } else if (typeof parsed.timestamp === "number") {
-            traceStartTimestamp = parsed.timestamp;
-          }
+          traceStartTimestamp = parseMarkerTimestamp(parsed.timestamp);
         }
         traceStartIdx = messageLineIdx;
+      } else if (
+        traceStartIdx >= 0 &&
+        parsed?.type === "custom" &&
+        parsed?.customType === "langfuse-trace-start" &&
+        parsed?.data?.traceId !== traceId
+      ) {
+        nextTraceBoundaryIdx = messageLineIdx;
+        if (nextTraceBoundaryTimestamp === undefined) {
+          nextTraceBoundaryTimestamp = parseMarkerTimestamp(parsed.timestamp);
+        }
+        break;
       } else if (parsed?.message) {
         messageLineIdx++;
       }
@@ -285,21 +373,28 @@ export async function recoverTrace(
         break;
       }
     }
-    // If no message after timestamp, use all entries
-    if (traceStartIdx < 0) {
-      traceStartIdx = 0;
-    }
   }
 
   if (traceStartIdx < 0) {
     return 0;
   }
 
+  const traceEndIdx =
+    nextTraceBoundaryIdx >= 0
+      ? nextTraceBoundaryIdx
+      : nextTraceBoundaryTimestamp !== undefined
+        ? allEntries.findIndex(
+            (entry, index) =>
+              index > traceStartIdx && entry.timestamp >= nextTraceBoundaryTimestamp,
+          )
+        : -1;
+
   // Get entries after the trace-start marker
-  const entriesAfterStart = allEntries.slice(traceStartIdx);
-  const turnEntries = filterCurrentTurnEntries(
-    entriesAfterStart.length > 0 ? entriesAfterStart : allEntries,
+  const entriesAfterStart = allEntries.slice(
+    traceStartIdx,
+    traceEndIdx >= 0 ? traceEndIdx : undefined,
   );
+  const turnEntries = filterCurrentTurnEntries(entriesAfterStart);
 
   if (turnEntries.length === 0) {
     return 0;
@@ -311,10 +406,11 @@ export async function recoverTrace(
   const trace = lf.trace({
     id: traceId,
     name: agentId,
-    sessionId,
+    sessionId: sessionKey ?? sessionId,
     metadata: {
       agentId,
       sessionId,
+      sessionKey,
       timestamp: entryTimestamp,
       source: "startup-recovery",
     },
@@ -342,6 +438,7 @@ export async function recoverTrace(
     metadata: {
       agentId,
       sessionId,
+      sessionKey,
       timestamp: entryTimestamp,
       source: "startup-recovery",
       stats: {
@@ -362,11 +459,11 @@ export async function recoverTrace(
     },
   });
 
-  // Write trace-end marker to prevent re-recovery on next startup
-  writeTraceMarker(stateDir, agentId, sessionId, "end", traceId, logger);
-
   // Flush to Langfuse
   await lf.flushAsync();
+
+  // Write trace-end marker only after Langfuse accepts the buffered recovery.
+  writeTraceMarker(stateDir, agentId, sessionId, "end", traceId, logger);
 
   return obsResult.llmCallCount + obsResult.toolCallCount;
 }

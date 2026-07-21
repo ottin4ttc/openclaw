@@ -1,5 +1,9 @@
 import fs from "node:fs";
 import path from "node:path";
+import {
+  readVisibleSessionTranscriptMessageEntries,
+  type SessionTranscriptTargetParams,
+} from "openclaw/plugin-sdk/session-transcript-runtime";
 import type { SessionEntry, MinimalLogger } from "./types.js";
 
 // ---------------------------------------------------------------------------
@@ -27,6 +31,62 @@ export function readSessionMessages(
     return [];
   }
   const sessionFile = path.join(stateDir, "agents", agentId, "sessions", `${sessionId}.jsonl`);
+  return readSessionMessagesFromFile(sessionFile, logger);
+}
+
+/** Reads the current SQLite-backed transcript through OpenClaw's public session identity API. */
+export async function readSessionMessagesByIdentity(
+  target: SessionTranscriptTargetParams,
+  logger?: MinimalLogger | null,
+): Promise<SessionEntry[]> {
+  try {
+    const entries = await readVisibleSessionTranscriptMessageEntries(target);
+    return entries.map((entry) => {
+      const message = entry.message as unknown as Record<string, unknown>;
+      const timestamp = timestampFromPersistedMessage(entry.createdAt, message);
+      return {
+        id: entry.entryId,
+        ...(entry.parentId ? { parentId: entry.parentId } : {}),
+        timestamp,
+        message,
+      };
+    });
+  } catch (error) {
+    logger?.warn?.(
+      `Langfuse: failed to read session transcript for agent=${target.agentId ?? "unknown"} session=${target.sessionId} — ${String(error)}`,
+    );
+    return [];
+  }
+}
+
+function timestampFromPersistedMessage(
+  persistedTimestamp: unknown,
+  message: Record<string, unknown>,
+): number {
+  if (typeof persistedTimestamp === "string") {
+    const parsed = Date.parse(persistedTimestamp);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  } else if (typeof persistedTimestamp === "number" && Number.isFinite(persistedTimestamp)) {
+    return persistedTimestamp;
+  }
+  const messageTimestamp = message.timestamp;
+  if (typeof messageTimestamp === "string") {
+    const parsed = Date.parse(messageTimestamp);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  } else if (typeof messageTimestamp === "number" && Number.isFinite(messageTimestamp)) {
+    return messageTimestamp;
+  }
+  return Date.now();
+}
+
+export function readSessionMessagesFromFile(
+  sessionFile: string,
+  logger?: MinimalLogger | null,
+): SessionEntry[] {
   if (!fs.existsSync(sessionFile)) {
     logger?.warn?.(`Langfuse: session JSONL not found: ${sessionFile}`);
     return [];
@@ -53,17 +113,13 @@ export function readSessionMessages(
         // Derive timestamp: prefer outer entry timestamp (when JSONL line was written,
         // i.e. message completion time) over inner message.timestamp (which for assistant
         // messages is the LLM call initiation time, not completion time).
-        let ts: number;
-        if (typeof parsed.timestamp === "string") {
-          ts = Date.parse(parsed.timestamp);
-        } else if (typeof parsed.timestamp === "number") {
-          ts = parsed.timestamp;
-        } else if (typeof msg.timestamp === "number") {
-          ts = msg.timestamp;
-        } else {
-          ts = Date.now();
-        }
-        entries.push({ timestamp: ts, message: msg });
+        const ts = timestampFromPersistedMessage(parsed.timestamp, msg);
+        entries.push({
+          ...(typeof parsed.id === "string" ? { id: parsed.id } : {}),
+          ...(typeof parsed.parentId === "string" ? { parentId: parsed.parentId } : {}),
+          timestamp: ts,
+          message: msg,
+        });
       }
     } catch {
       /* ignore malformed lines */

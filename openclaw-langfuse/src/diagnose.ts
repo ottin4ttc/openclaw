@@ -23,11 +23,10 @@ export type ModelCostIssue = {
   allModels: ModelEntry[];
 };
 
-const DEFAULT_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
-
 /**
  * Check all custom providers in openclaw.json for models missing `cost` config.
- * Missing cost causes pi-ai's calculateCost() to crash, resulting in zero usage data.
+ * OpenClaw defaults missing prices to zero, so token usage remains available but
+ * monetary cost attribution is unavailable until prices are configured.
  */
 export function checkModelCostConfig(stateDir?: string): ModelCostIssue[] {
   if (!stateDir) {
@@ -76,22 +75,12 @@ export function checkModelCostConfig(stateDir?: string): ModelCostIssue[] {
 }
 
 /**
- * Generate `openclaw config set` commands that add cost to specific models.
- * Uses array index to target only the cost field, leaving other model config untouched.
+ * Missing model prices need provider-specific rates. Do not generate a zero-cost
+ * repair command because that would hide unresolved monetary attribution.
  */
 export function generateFixCommands(issues: ModelCostIssue[]): string[] {
-  const commands: string[] = [];
-  for (const issue of issues) {
-    const idx = issue.allModels.findIndex((m) => m.id === issue.modelId);
-    if (idx === -1) {
-      continue;
-    }
-    const costJson = JSON.stringify(DEFAULT_COST);
-    commands.push(
-      `openclaw config set models.providers.${issue.provider}.models.${idx}.cost '${costJson}'`,
-    );
-  }
-  return commands;
+  void issues;
+  return [];
 }
 
 /**
@@ -105,7 +94,8 @@ export function formatCostWarning(issues: ModelCostIssue[]): string {
   const models = issues.map((i) => `${i.provider}/${i.modelId}`).join(", ");
   return (
     `Langfuse: ${issues.length} custom model(s) missing 'cost' config: ${models}. ` +
-    `This causes zero usage/token data in traces. ` +
-    `Run 'npm run diagnose' in the openclaw-langfuse plugin directory for fix commands.`
+    `Token usage remains available, but monetary cost attribution is unresolved until ` +
+    `real provider prices are configured. Run 'npm run diagnose' in the ` +
+    `openclaw-langfuse plugin directory for details.`
   );
 }

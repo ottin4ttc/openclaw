@@ -16,12 +16,13 @@ import {
   normalizeInboundTextNewlines,
   sanitizeInboundSystemTags,
 } from "../../auto-reply/reply/inbound-text.js";
-import type { FinalizedMsgContext } from "../../auto-reply/templating.js";
+import type { FinalizedMsgContext, MentionSource } from "../../auto-reply/templating.js";
 import type { ContextVisibilityMode } from "../../config/types.base.js";
 import type { PluginHookChannelContext } from "../../plugins/hook-channel-context.types.js";
 import { shouldIncludeSupplementalContext } from "../../security/context-visibility.js";
+import type { InboundImplicitMentionKind } from "../mention-gating.js";
+import type { ChannelIngressCommandAccess } from "../message-access/runtime-types.js";
 import type {
-  AccessFacts,
   CommandFacts,
   ConversationFacts,
   InboundMediaFacts,
@@ -54,8 +55,20 @@ export type ChannelInboundSupplementalResolutionOptions = {
   suppressSelfQuoteBody?: boolean;
   suppressSelfQuoteMedia?: boolean;
 };
-type BuildAccessFacts = Omit<AccessFacts, "commands"> & {
-  commands?: Partial<NonNullable<AccessFacts["commands"]>>;
+type BuildChannelInboundEventAccess = {
+  commands?: Pick<ChannelIngressCommandAccess, "authorized">;
+  mentions?: {
+    canDetectMention: boolean;
+    wasMentioned: boolean;
+    hasAnyMention?: boolean;
+    explicitlyMentionedBot?: boolean;
+    mentionedUserIds?: string[];
+    mentionedSubteamIds?: string[];
+    mentionSource?: MentionSource;
+    implicitMentionKinds?: InboundImplicitMentionKind[];
+    requireMention?: boolean;
+    effectiveWasMentioned?: boolean;
+  };
 };
 
 export type BuildChannelInboundEventContextParams = {
@@ -72,7 +85,7 @@ export type BuildChannelInboundEventContextParams = {
   route: RouteFacts;
   reply: ReplyPlanFacts;
   message: MessageFacts;
-  access?: BuildAccessFacts;
+  access?: BuildChannelInboundEventAccess;
   command?: CommandFacts;
   commandTurn?: CommandTurnContext;
   media?: InboundMediaFacts[];
@@ -199,6 +212,19 @@ export function filterChannelInboundSupplementalContext(params: {
     forwarded,
     thread,
   };
+}
+
+/** Resolves whether a supplemental-context sender passes the active group policy. */
+export function resolveInboundSupplementalSenderAllowed<TAllowFrom>(params: {
+  isGroup: boolean;
+  groupPolicy: string;
+  allowFrom: readonly TAllowFrom[];
+  isSenderAllowed: (allowFrom: readonly TAllowFrom[]) => boolean;
+}): boolean {
+  if (!params.isGroup || params.groupPolicy !== "allowlist") {
+    return true;
+  }
+  return params.isSenderAllowed(params.allowFrom);
 }
 
 export function filterChannelInboundQuoteContext(
@@ -388,13 +414,10 @@ export function finalizeChannelInboundContext<T extends Record<string, unknown>>
   return isPromiseLike(prepared) ? prepared.then(finish) : finish(prepared);
 }
 
-function resolveAccessFactsCommandAuthorized(
-  access: BuildAccessFacts | undefined,
+function resolveIngressCommandAuthorized(
+  access: BuildChannelInboundEventAccess | undefined,
 ): boolean | undefined {
-  const commands = access?.commands;
-  return typeof commands?.authorized === "boolean"
-    ? commands.authorized
-    : commands?.authorizers?.some((entry) => entry.allowed);
+  return access?.commands?.authorized;
 }
 
 function normalizeUntrustedGroupPrompt(value: unknown): string | undefined {
@@ -436,7 +459,7 @@ function resolveChannelCommandContext(params: {
   command?: CommandFacts;
   commandTurn?: CommandTurnContext;
   message: MessageFacts;
-  access?: BuildAccessFacts;
+  access?: BuildChannelInboundEventAccess;
 }): CommandTurnContext | undefined {
   if (params.commandTurn) {
     return params.commandTurn;
@@ -450,7 +473,7 @@ function resolveChannelCommandContext(params: {
     authorized:
       command.kind === "normal"
         ? false
-        : (command.authorized ?? resolveAccessFactsCommandAuthorized(params.access) === true),
+        : (command.authorized ?? resolveIngressCommandAuthorized(params.access) === true),
     commandName: command.name,
     body,
   });
@@ -509,12 +532,13 @@ export function buildChannelInboundEventContext(
     Provider: params.provider ?? params.channel,
     Surface: params.surface ?? params.provider ?? params.channel,
     WasMentioned: params.access?.mentions?.wasMentioned,
+    GroupRequireMention: params.access?.mentions?.requireMention,
     ExplicitlyMentionedBot: params.access?.mentions?.explicitlyMentionedBot,
     MentionedUserIds: params.access?.mentions?.mentionedUserIds,
     MentionedSubteamIds: params.access?.mentions?.mentionedSubteamIds,
     ImplicitMentionKinds: params.access?.mentions?.implicitMentionKinds,
     MentionSource: params.access?.mentions?.mentionSource,
-    CommandAuthorized: resolveAccessFactsCommandAuthorized(params.access) === true,
+    CommandAuthorized: resolveIngressCommandAuthorized(params.access) === true,
     CommandTurn: commandTurn,
     MessageThreadId: params.reply.messageThreadId ?? params.conversation.threadId,
     NativeChannelId: params.reply.nativeChannelId ?? params.conversation.nativeChannelId,

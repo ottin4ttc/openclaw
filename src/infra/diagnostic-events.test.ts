@@ -5,6 +5,7 @@ import {
   emitInternalDiagnosticEvent,
   emitTrustedDiagnosticEvent,
   emitTrustedDiagnosticEventWithPrivateData,
+  emitTrustedSkillUsedDiagnosticEvent,
   emitTrustedSecurityEvent,
   formatDiagnosticTraceparentForPropagation,
   hasPendingInternalDiagnosticEvent,
@@ -14,13 +15,14 @@ import {
   onDiagnosticEvent,
   onTrustedInternalDiagnosticEvent,
   resetDiagnosticEventsForTest,
+  resolveTrustedDiagnosticModelContentCapturePolicy,
   setDiagnosticsEnabledForProcess,
   waitForDiagnosticEventsDrained,
+  type DiagnosticEventPrivateData,
   type DiagnosticEventPayload,
 } from "./diagnostic-events.js";
 import {
   createDiagnosticTraceContext,
-  resetDiagnosticTraceContextForTest,
   runWithDiagnosticTraceContext,
 } from "./diagnostic-trace-context.js";
 
@@ -31,7 +33,6 @@ describe("diagnostic-events", () => {
 
   afterEach(() => {
     resetDiagnosticEventsForTest();
-    resetDiagnosticTraceContextForTest();
     vi.restoreAllMocks();
   });
 
@@ -88,6 +89,32 @@ describe("diagnostic-events", () => {
     expectConsoleErrorPrefix(
       errorSpy,
       "[diagnostic-events] listener error type=message.queued seq=1: Error: boom",
+    );
+  });
+
+  it("isolates async listener failures and still drains the queue", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const seen: string[] = [];
+    onInternalDiagnosticEvent(async () => {
+      throw new Error("async boom");
+    });
+    onInternalDiagnosticEvent((event) => {
+      seen.push(event.type);
+    });
+
+    emitDiagnosticEvent({
+      type: "model.call.started",
+      runId: "run-async-error",
+      callId: "call-async-error",
+      provider: "openai",
+      model: "gpt-5.5",
+    });
+    await waitForDiagnosticEventsDrained();
+
+    expect(seen).toEqual(["model.call.started"]);
+    expectConsoleErrorPrefix(
+      errorSpy,
+      "[diagnostic-events] listener error type=model.call.started seq=1: Error: async boom",
     );
   });
 
@@ -316,6 +343,43 @@ describe("diagnostic-events", () => {
     expect(publicEvents).toStrictEqual([]);
     expect(internalEvents).toEqual([{ trusted: true, type: "model.call.started" }]);
   });
+
+  it.each([true, false])(
+    "keeps skill file identity trusted-only when diagnostics enabled=%s",
+    async (enabled) => {
+      const skillFile = "/workspace/skills/daily-brief/SKILL.md";
+      const publicEvents: DiagnosticEventPayload[] = [];
+      const sharedEvents: DiagnosticEventPayload[] = [];
+      const trustedEvents: Array<{
+        event: DiagnosticEventPayload;
+        privateData: DiagnosticEventPrivateData;
+      }> = [];
+      onDiagnosticEvent((event) => publicEvents.push(event));
+      onInternalDiagnosticEvent((event) => sharedEvents.push(event));
+      onTrustedInternalDiagnosticEvent((event, _metadata, privateData) => {
+        trustedEvents.push({ event, privateData });
+      });
+      setDiagnosticsEnabledForProcess(enabled);
+
+      emitTrustedSkillUsedDiagnosticEvent(
+        {
+          type: "skill.used",
+          skillName: "Daily Brief",
+          skillSource: "workspace",
+          activation: "read",
+        },
+        { skillUsage: { skillFile } },
+      );
+      await waitForDiagnosticEventsDrained();
+
+      expect(JSON.stringify(publicEvents)).not.toContain(skillFile);
+      expect(JSON.stringify(sharedEvents)).not.toContain(skillFile);
+      expect(JSON.stringify(trustedEvents[0]?.event)).not.toContain(skillFile);
+      expect(trustedEvents).toHaveLength(1);
+      expect(trustedEvents[0]?.event).not.toHaveProperty("skillFile");
+      expect(trustedEvents[0]?.privateData.skillUsage?.skillFile).toBe(skillFile);
+    },
+  );
 
   it("emits canonical security events only through the trusted security helper", () => {
     const internalEvents: Array<{
@@ -598,6 +662,465 @@ describe("diagnostic-events", () => {
     ).toBe(false);
   });
 
+  it("waits for async trusted listeners before reporting the queue drained", async () => {
+    let releaseListener: (() => void) | undefined;
+    const listenerGate = new Promise<void>((resolve) => {
+      releaseListener = resolve;
+    });
+    let listenerCompleted = false;
+    let drainCompleted = false;
+
+    onTrustedInternalDiagnosticEvent(async (event) => {
+      if (event.type !== "model.call.completed") {
+        return;
+      }
+      await listenerGate;
+      listenerCompleted = true;
+    });
+
+    emitTrustedDiagnosticEvent({
+      type: "model.call.completed",
+      runId: "run-async-listener",
+      callId: "call-async-listener",
+      provider: "openai",
+      model: "gpt-5.5",
+      durationMs: 1,
+    });
+
+    const drainPromise = waitForDiagnosticEventsDrained().then(() => {
+      drainCompleted = true;
+    });
+    await new Promise<void>((resolve) => {
+      setImmediate(resolve);
+    });
+
+    try {
+      expect(listenerCompleted).toBe(false);
+      expect(drainCompleted).toBe(false);
+    } finally {
+      releaseListener?.();
+      await drainPromise;
+    }
+
+    expect(listenerCompleted).toBe(true);
+    expect(drainCompleted).toBe(true);
+  });
+
+  it("preserves event order for each async listener without blocking unrelated listeners", async () => {
+    let releaseStarted: (() => void) | undefined;
+    const startedGate = new Promise<void>((resolve) => {
+      releaseStarted = resolve;
+    });
+    const orderedListenerEvents: string[] = [];
+    const independentListenerEvents: string[] = [];
+
+    onInternalDiagnosticEvent(async (event) => {
+      if (event.type === "model.call.started") {
+        orderedListenerEvents.push("started:begin");
+        await startedGate;
+        orderedListenerEvents.push("started:end");
+        return;
+      }
+      if (event.type === "model.call.completed") {
+        orderedListenerEvents.push("completed");
+      }
+    });
+    onInternalDiagnosticEvent((event) => {
+      if (event.type === "model.call.started" || event.type === "model.call.completed") {
+        independentListenerEvents.push(event.type);
+      }
+    });
+
+    emitDiagnosticEvent({
+      type: "model.call.started",
+      runId: "run-ordered-listener",
+      callId: "call-ordered-listener",
+      provider: "openai",
+      model: "gpt-5.5",
+    });
+    emitDiagnosticEvent({
+      type: "model.call.completed",
+      runId: "run-ordered-listener",
+      callId: "call-ordered-listener",
+      provider: "openai",
+      model: "gpt-5.5",
+      durationMs: 1,
+    });
+
+    await new Promise<void>((resolve) => {
+      setImmediate(resolve);
+    });
+    await new Promise<void>((resolve) => {
+      setImmediate(resolve);
+    });
+
+    expect(orderedListenerEvents).toEqual(["started:begin"]);
+    expect(independentListenerEvents).toEqual(["model.call.started", "model.call.completed"]);
+
+    releaseStarted?.();
+    await waitForDiagnosticEventsDrained();
+
+    expect(orderedListenerEvents).toEqual(["started:begin", "started:end", "completed"]);
+  });
+
+  it("snapshots queued listener payloads before the prior listener task settles", async () => {
+    let releaseFirst: (() => void) | undefined;
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const seen: Array<{ traceId: string | undefined; inputMessages: unknown }> = [];
+    onTrustedInternalDiagnosticEvent(
+      async (event, _metadata, privateData) => {
+        if (event.type !== "model.call.started") {
+          return;
+        }
+        if (event.callId === "call-first") {
+          await firstGate;
+          return;
+        }
+        seen.push({
+          traceId: event.trace?.traceId,
+          inputMessages: privateData.modelContent?.inputMessages,
+        });
+      },
+      { captureModelContent: { inputMessages: true } },
+    );
+
+    emitTrustedDiagnosticEvent({
+      type: "model.call.started",
+      runId: "run-snapshot",
+      callId: "call-first",
+      provider: "openai",
+      model: "gpt-5.5",
+    });
+    const event = {
+      type: "model.call.started" as const,
+      runId: "run-snapshot",
+      callId: "call-second",
+      provider: "openai",
+      model: "gpt-5.5",
+      trace: { traceId: "1".repeat(32), spanId: "2".repeat(16) },
+    };
+    const privateData: DiagnosticEventPrivateData = {
+      modelContent: { inputMessages: [{ role: "user", content: "before" }] },
+    };
+    emitTrustedDiagnosticEventWithPrivateData(event, privateData);
+
+    event.trace.traceId = "3".repeat(32);
+    const inputMessages = privateData.modelContent?.inputMessages as Array<{
+      content: string;
+    }>;
+    inputMessages[0]!.content = "after";
+
+    releaseFirst?.();
+    await waitForDiagnosticEventsDrained();
+
+    expect(seen).toEqual([
+      {
+        traceId: "1".repeat(32),
+        inputMessages: [{ role: "user", content: "before" }],
+      },
+    ]);
+  });
+
+  it("bounds the pending task chain for a stalled async listener", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    let releaseFirst: (() => void) | undefined;
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let seen = 0;
+    onInternalDiagnosticEvent(async (event) => {
+      if (event.type !== "model.usage") {
+        return;
+      }
+      seen += 1;
+      if (seen === 1) {
+        await firstGate;
+      }
+    });
+
+    for (let index = 0; index <= 10_000; index += 1) {
+      emitDiagnosticEvent({
+        type: "model.usage",
+        provider: "openai",
+        model: "gpt-5.5",
+        usage: { input: index + 1 },
+      });
+    }
+
+    expectConsoleErrorPrefix(
+      errorSpy,
+      "[diagnostic-events] listener queue saturated type=model.usage seq=10001",
+    );
+    releaseFirst?.();
+    await waitForDiagnosticEventsDrained();
+    expect(seen).toBe(10_000);
+  });
+
+  it("bounds retained bytes for a stalled async listener queue", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    let releaseFirst: (() => void) | undefined;
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const seen: number[] = [];
+    onInternalDiagnosticEvent(async (event) => {
+      if (event.type !== "model.usage") {
+        return;
+      }
+      seen.push(event.usage.input ?? 0);
+      if (event.usage.input === 1) {
+        await firstGate;
+      }
+    });
+
+    const largeModelName = "x".repeat(9 * 1024 * 1024);
+    emitDiagnosticEvent({
+      type: "model.usage",
+      provider: "openai",
+      model: "small",
+      usage: { input: 1 },
+    });
+    emitDiagnosticEvent({
+      type: "model.usage",
+      provider: "openai",
+      model: largeModelName,
+      usage: { input: 2 },
+    });
+    emitDiagnosticEvent({
+      type: "model.usage",
+      provider: "openai",
+      model: largeModelName,
+      usage: { input: 3 },
+    });
+    emitDiagnosticEvent({
+      type: "model.usage",
+      provider: "openai",
+      model: "small-after-drop",
+      usage: { input: 4 },
+    });
+
+    expectConsoleErrorPrefix(
+      errorSpy,
+      "[diagnostic-events] listener queue saturated type=model.usage seq=3",
+    );
+    releaseFirst?.();
+    await waitForDiagnosticEventsDrained();
+
+    expect(seen).toEqual([1, 2, 4]);
+  });
+
+  it("drops an oversized first event before invoking an async listener", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const listener = vi.fn(async () => undefined);
+    onInternalDiagnosticEvent(listener);
+
+    emitDiagnosticEvent({
+      type: "model.usage",
+      provider: "openai",
+      model: "x".repeat(17 * 1024 * 1024),
+      usage: { input: 1 },
+    });
+
+    expectConsoleErrorPrefix(
+      errorSpy,
+      "[diagnostic-events] listener queue saturated type=model.usage seq=1",
+    );
+    expect(listener).not.toHaveBeenCalled();
+    await waitForDiagnosticEventsDrained();
+  });
+
+  it("bounds trusted listener queues after private-data capture filtering", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    let releaseFirst: (() => void) | undefined;
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const inputOnlySeen: string[] = [];
+    const outputOnlySeen: string[] = [];
+
+    onTrustedInternalDiagnosticEvent(
+      async (event) => {
+        if (event.type !== "model.call.started") {
+          return;
+        }
+        if (event.callId === "call-first") {
+          await firstGate;
+          return;
+        }
+        inputOnlySeen.push(event.callId);
+      },
+      { captureModelContent: { inputMessages: true } },
+    );
+    onTrustedInternalDiagnosticEvent(
+      async (event) => {
+        if (event.type !== "model.call.started") {
+          return;
+        }
+        if (event.callId === "call-first") {
+          await firstGate;
+          return;
+        }
+        outputOnlySeen.push(event.callId);
+      },
+      { captureModelContent: { outputMessages: true } },
+    );
+
+    emitTrustedDiagnosticEvent({
+      type: "model.call.started",
+      runId: "run-byte-policy",
+      callId: "call-first",
+      provider: "openai",
+      model: "gpt-5.5",
+    });
+    emitTrustedDiagnosticEventWithPrivateData(
+      {
+        type: "model.call.started",
+        runId: "run-byte-policy",
+        callId: "call-large",
+        provider: "openai",
+        model: "gpt-5.5",
+      },
+      {
+        modelContent: {
+          inputMessages: ["allowed input"],
+          outputMessages: ["x".repeat(17 * 1024 * 1024)],
+        },
+      },
+    );
+    emitTrustedDiagnosticEventWithPrivateData(
+      {
+        type: "model.call.started",
+        runId: "run-byte-policy",
+        callId: "call-small",
+        provider: "openai",
+        model: "gpt-5.5",
+      },
+      {
+        modelContent: {
+          outputMessages: ["small output"],
+        },
+      },
+    );
+
+    await new Promise<void>((resolve) => {
+      setImmediate(resolve);
+    });
+    expectConsoleErrorPrefix(
+      errorSpy,
+      "[diagnostic-events] trusted listener queue saturated type=model.call.started seq=2",
+    );
+    releaseFirst?.();
+    await waitForDiagnosticEventsDrained();
+
+    expect(inputOnlySeen).toEqual(["call-large", "call-small"]);
+    expect(outputOnlySeen).toEqual(["call-small"]);
+  });
+
+  it("keeps later events behind the full async listener queue", async () => {
+    const releases = new Map<string, () => void>();
+    const gates = new Map(
+      ["call-1", "call-2", "call-3"].map((callId) => [
+        callId,
+        new Promise<void>((resolve) => releases.set(callId, resolve)),
+      ]),
+    );
+    const seen: string[] = [];
+    onInternalDiagnosticEvent(async (event) => {
+      if (event.type !== "model.call.started" || !event.callId) {
+        return;
+      }
+      seen.push(`${event.callId}:begin`);
+      await gates.get(event.callId);
+      seen.push(`${event.callId}:end`);
+    });
+
+    for (const callId of ["call-1", "call-2", "call-3"]) {
+      emitDiagnosticEvent({
+        type: "model.call.started",
+        runId: "run-queued-listener",
+        callId,
+        provider: "openai",
+        model: "gpt-5.5",
+      });
+    }
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(seen).toEqual(["call-1:begin"]);
+
+    releases.get("call-1")?.();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(seen).toEqual(["call-1:begin", "call-1:end", "call-2:begin"]);
+
+    emitDiagnosticEvent({
+      type: "model.call.started",
+      runId: "run-queued-listener",
+      callId: "call-4",
+      provider: "openai",
+      model: "gpt-5.5",
+    });
+    releases.get("call-2")?.();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(seen).toEqual([
+      "call-1:begin",
+      "call-1:end",
+      "call-2:begin",
+      "call-2:end",
+      "call-3:begin",
+    ]);
+
+    releases.get("call-3")?.();
+    await waitForDiagnosticEventsDrained();
+    expect(seen).toEqual([
+      "call-1:begin",
+      "call-1:end",
+      "call-2:begin",
+      "call-2:end",
+      "call-3:begin",
+      "call-3:end",
+      "call-4:begin",
+      "call-4:end",
+    ]);
+  });
+
+  it("does not let async listener rejection poison later delivery", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const seen: string[] = [];
+    onInternalDiagnosticEvent(async (event) => {
+      if (event.type === "model.call.started") {
+        seen.push("started");
+        throw new Error("ordered async boom");
+      }
+      if (event.type === "model.call.completed") {
+        seen.push("completed");
+      }
+    });
+
+    emitDiagnosticEvent({
+      type: "model.call.started",
+      runId: "run-reject-ordered-listener",
+      callId: "call-reject-ordered-listener",
+      provider: "openai",
+      model: "gpt-5.5",
+    });
+    emitDiagnosticEvent({
+      type: "model.call.completed",
+      runId: "run-reject-ordered-listener",
+      callId: "call-reject-ordered-listener",
+      provider: "openai",
+      model: "gpt-5.5",
+      durationMs: 1,
+    });
+
+    await waitForDiagnosticEventsDrained();
+
+    expect(seen).toEqual(["started", "completed"]);
+    expectConsoleErrorPrefix(
+      errorSpy,
+      "[diagnostic-events] listener error type=model.call.started seq=1: Error: ordered async boom",
+    );
+  });
+
   it("passes immutable pending diagnostic copies to queue inspectors", async () => {
     const events: DiagnosticEventPayload[] = [];
     onInternalDiagnosticEvent((event) => {
@@ -778,6 +1301,41 @@ describe("diagnostic-events", () => {
     expect(events.filter((event) => event.type === "model.call.started")).toHaveLength(10_000);
   });
 
+  it("bounds the global async queue by retained payload bytes", async () => {
+    const events: DiagnosticEventPayload[] = [];
+    onTrustedInternalDiagnosticEvent(
+      (event) => {
+        events.push(event);
+      },
+      { captureModelContent: { inputMessages: true } },
+    );
+    const largeValue = "x".repeat(17 * 1024 * 1024);
+
+    for (const callId of ["call-large-first", "call-large-second"]) {
+      emitTrustedDiagnosticEventWithPrivateData(
+        {
+          type: "model.call.started",
+          runId: "run-large-queue",
+          callId,
+          provider: "openai",
+          model: "gpt-5.4",
+        },
+        { modelContent: { outputMessages: [largeValue] } },
+      );
+    }
+
+    await waitForDiagnosticEventsDrained();
+
+    expect(events.filter((event) => event.type === "model.call.started")).toHaveLength(1);
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "diagnostic.async_queue.dropped",
+        droppedEvents: 1,
+        droppedTrustedEvents: 1,
+      }),
+    );
+  });
+
   it("keeps log records off the public diagnostic event stream", async () => {
     const publicEvents: string[] = [];
     const internalEvents: string[] = [];
@@ -866,6 +1424,173 @@ describe("diagnostic-events", () => {
         systemPrompt: "secret system",
       },
     });
+  });
+
+  it("filters trusted private model content to an explicit listener capture policy", async () => {
+    const selected: DiagnosticEventPrivateData[] = [];
+    const outputOnly: DiagnosticEventPrivateData[] = [];
+    onTrustedInternalDiagnosticEvent(
+      (_event, _metadata, privateData) => {
+        selected.push(privateData);
+      },
+      {
+        captureModelContent: {
+          inputMessages: true,
+          systemPrompt: true,
+        },
+      },
+    );
+    onTrustedInternalDiagnosticEvent(
+      (_event, _metadata, privateData) => {
+        outputOnly.push(privateData);
+      },
+      {
+        captureModelContent: {
+          outputMessages: true,
+        },
+      },
+    );
+
+    emitTrustedDiagnosticEventWithPrivateData(
+      {
+        type: "model.call.started",
+        runId: "run-filtered",
+        callId: "call-filtered",
+        provider: "openai",
+        model: "gpt-5.4",
+      },
+      {
+        modelContent: {
+          inputMessages: ["secret prompt"],
+          systemPrompt: "secret system",
+        },
+      },
+    );
+
+    await waitForDiagnosticEventsDrained();
+
+    expect(selected).toEqual([
+      {
+        modelContent: {
+          inputMessages: ["secret prompt"],
+          systemPrompt: "secret system",
+        },
+      },
+    ]);
+    expect(outputOnly).toEqual([{}]);
+  });
+
+  it("treats omitted trusted listener options as full content capture", () => {
+    const stop = onTrustedInternalDiagnosticEvent(() => {});
+
+    expect(resolveTrustedDiagnosticModelContentCapturePolicy()).toEqual({
+      inputMessages: true,
+      outputMessages: true,
+      toolInputs: true,
+      toolOutputs: true,
+      systemPrompt: true,
+      toolDefinitions: true,
+      anyModelContent: true,
+    });
+
+    stop();
+    expect(resolveTrustedDiagnosticModelContentCapturePolicy()).toEqual({
+      inputMessages: false,
+      outputMessages: false,
+      toolInputs: false,
+      toolOutputs: false,
+      systemPrompt: false,
+      toolDefinitions: false,
+      anyModelContent: false,
+    });
+  });
+
+  it("preserves full capture for trusted listeners registered by an older module instance", () => {
+    const stop = onTrustedInternalDiagnosticEvent(() => {});
+    const state = (globalThis as unknown as Record<PropertyKey, unknown>)[
+      Symbol.for("openclaw.diagnosticEvents.state.v1")
+    ] as { trustedListenerOptions: Map<unknown, unknown> };
+    state.trustedListenerOptions.clear();
+
+    expect(resolveTrustedDiagnosticModelContentCapturePolicy()).toEqual({
+      inputMessages: true,
+      outputMessages: true,
+      toolInputs: true,
+      toolOutputs: true,
+      systemPrompt: true,
+      toolDefinitions: true,
+      anyModelContent: true,
+    });
+
+    stop();
+  });
+
+  it("aggregates trusted listener content capture only while subscribed", () => {
+    const stopInput = onTrustedInternalDiagnosticEvent(() => {}, {
+      captureModelContent: {
+        inputMessages: true,
+        toolInputs: true,
+      },
+    });
+    const stopOutput = onTrustedInternalDiagnosticEvent(() => {}, {
+      captureModelContent: {
+        outputMessages: true,
+        toolOutputs: true,
+      },
+    });
+
+    expect(resolveTrustedDiagnosticModelContentCapturePolicy()).toEqual({
+      inputMessages: true,
+      outputMessages: true,
+      toolInputs: true,
+      toolOutputs: true,
+      systemPrompt: false,
+      toolDefinitions: false,
+      anyModelContent: true,
+    });
+
+    stopInput();
+    expect(resolveTrustedDiagnosticModelContentCapturePolicy()).toEqual({
+      inputMessages: false,
+      outputMessages: true,
+      toolInputs: false,
+      toolOutputs: true,
+      systemPrompt: false,
+      toolDefinitions: false,
+      anyModelContent: true,
+    });
+
+    stopOutput();
+    expect(resolveTrustedDiagnosticModelContentCapturePolicy()).toEqual({
+      inputMessages: false,
+      outputMessages: false,
+      toolInputs: false,
+      toolOutputs: false,
+      systemPrompt: false,
+      toolDefinitions: false,
+      anyModelContent: false,
+    });
+  });
+
+  it("captures model content for a tool-only trusted listener", () => {
+    const stop = onTrustedInternalDiagnosticEvent(() => {}, {
+      captureModelContent: {
+        toolInputs: true,
+        toolOutputs: true,
+      },
+    });
+
+    expect(resolveTrustedDiagnosticModelContentCapturePolicy()).toEqual({
+      inputMessages: false,
+      outputMessages: false,
+      toolInputs: true,
+      toolOutputs: true,
+      systemPrompt: false,
+      toolDefinitions: false,
+      anyModelContent: true,
+    });
+
+    stop();
   });
 
   it("skips event enrichment and subscribers when diagnostics are disabled", () => {

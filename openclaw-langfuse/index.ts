@@ -9,8 +9,12 @@ export default definePluginEntry({
   description: "Langfuse tracing and prompt management for OpenClaw",
   register(api: OpenClawPluginApi) {
     const config = (api.pluginConfig ?? {}) as LangfusePluginConfig;
-    // Skip registration if no valid config (happens during CLI snapshot passes)
+    const hasEnvCredentials = Boolean(
+      process.env["LANGFUSE_PUBLIC_KEY"] || process.env["LANGFUSE_SECRET_KEY"],
+    );
+    // Skip registration if no config or Langfuse env credentials exist (happens during CLI snapshot passes).
     if (
+      !hasEnvCredentials &&
       !config.baseUrl &&
       !config.publicKey &&
       !config.secretKey &&

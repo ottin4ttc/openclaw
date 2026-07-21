@@ -183,6 +183,30 @@ describe("resolveModelRuntimePolicy", () => {
     });
   });
 
+  it("preserves slash-containing model ids owned by an explicit provider", () => {
+    const config = {
+      agents: {
+        defaults: {
+          models: {
+            "codex/aliyun/qwen3.7-plus": { agentRuntime: { id: "codex" } },
+          },
+        },
+      },
+    } as OpenClawConfig;
+
+    expect(
+      resolveModelRuntimePolicy({
+        config,
+        provider: "codex",
+        modelId: "aliyun/qwen3.7-plus",
+      }),
+    ).toEqual({
+      policy: { id: "codex" },
+      source: "model",
+      matchedProvider: "codex",
+    });
+  });
+
   it("prefers exact provider model runtime policy over agent provider wildcards", () => {
     const config = {
       agents: {

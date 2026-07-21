@@ -15,6 +15,7 @@ import {
   pruneStaleRootChunkFiles,
   pruneUntrackedGeneratedSourceDeclarations,
   resolveTsdownBuildInvocation,
+  resolveTsdownBuildInvocations,
   runTsdownBuildInvocation,
   signalTsdownBuildProcessTree,
 } from "../../scripts/tsdown-build.mjs";
@@ -65,9 +66,26 @@ async function waitForFile(filePath: string, timeoutMs: number): Promise<void> {
     if (fs.existsSync(filePath)) {
       return;
     }
-    await sleep(25);
+    await sleep(5);
   }
   throw new Error(`timed out waiting for ${filePath}`);
+}
+
+// Pid files are written with plain writeFileSync, so an existence poll can
+// observe the open-truncate 0-byte window and parse NaN (the #109140 flake
+// class). Wait until the content parses to a real pid, not just for the file.
+async function waitForPidFile(filePath: string, timeoutMs: number): Promise<number> {
+  const deadlineAt = Date.now() + timeoutMs;
+  while (Date.now() < deadlineAt) {
+    if (fs.existsSync(filePath)) {
+      const pid = Number.parseInt(fs.readFileSync(filePath, "utf8"), 10);
+      if (Number.isInteger(pid) && pid > 0) {
+        return pid;
+      }
+    }
+    await sleep(5);
+  }
+  throw new Error(`timed out waiting for pid in ${filePath}`);
 }
 
 async function waitForDead(pid: number, timeoutMs: number): Promise<void> {
@@ -76,7 +94,7 @@ async function waitForDead(pid: number, timeoutMs: number): Promise<void> {
     if (!isProcessAlive(pid)) {
       return;
     }
-    await sleep(25);
+    await sleep(5);
   }
   throw new Error(`timed out waiting for pid ${pid} to exit`);
 }
@@ -131,6 +149,101 @@ describe("resolveTsdownBuildInvocation", () => {
     expect(result.args).toContain("tsdown");
     expect(result.args).toEqual(expect.arrayContaining(["--config-loader", "unrun", "--no-clean"]));
     expect(result.args.slice(-2)).toEqual(["--format", "esm"]);
+  });
+
+  it("builds AI, package, and unified declarations without overlapping the main graphs", () => {
+    const results = resolveTsdownBuildInvocations({
+      args: ["--format", "esm"],
+      platform: "linux",
+      nodeExecPath: "/usr/bin/node",
+      npmExecPath: "/tmp/pnpm.cjs",
+      env: {},
+      ...NO_MEMORY_LIMIT,
+    });
+
+    expect(results).toHaveLength(3);
+    expect(results[0]?.args).toEqual(
+      expect.arrayContaining(["--config", "tsdown.ai.config.ts", "--format", "esm"]),
+    );
+    expect(results[1]?.args).toEqual(
+      expect.arrayContaining(["--filter", "openclaw-packages", "--format", "esm"]),
+    );
+    expect(results[2]?.args).toEqual(
+      expect.arrayContaining(["--filter", "openclaw-unified", "--format", "esm"]),
+    );
+  });
+
+  it.each([
+    ["environment", [], { OPENCLAW_RUN_NODE_SKIP_DTS_BUILD: "1" }],
+    ["CLI", ["--no-dts"], {}],
+  ])("keeps %s no-DTS builds in one main invocation", (_source, args, env) => {
+    const results = resolveTsdownBuildInvocations({
+      args,
+      platform: "linux",
+      nodeExecPath: "/usr/bin/node",
+      npmExecPath: "/tmp/pnpm.cjs",
+      env,
+      ...NO_MEMORY_LIMIT,
+    });
+
+    expect(results).toHaveLength(2);
+    expect(results[0]?.args).toEqual(expect.arrayContaining(["--config", "tsdown.ai.config.ts"]));
+    expect(results[1]?.args).not.toContain("--filter");
+  });
+
+  it("serializes declaration graphs when --dts overrides the no-DTS environment", () => {
+    const results = resolveTsdownBuildInvocations({
+      args: ["--dts"],
+      platform: "linux",
+      nodeExecPath: "/usr/bin/node",
+      npmExecPath: "/tmp/pnpm.cjs",
+      env: { OPENCLAW_RUN_NODE_SKIP_DTS_BUILD: "1" },
+      ...NO_MEMORY_LIMIT,
+    });
+
+    expect(results).toHaveLength(3);
+    expect(results[1]?.args).toEqual(expect.arrayContaining(["--filter", "openclaw-packages"]));
+    expect(results[2]?.args).toEqual(expect.arrayContaining(["--filter", "openclaw-unified"]));
+  });
+
+  it.each([
+    ["long filter", ["--filter", "openclaw-unified"]],
+    ["long assigned filter", ["--filter=openclaw-unified"]],
+    ["short filter", ["-F", "openclaw-unified"]],
+    ["short assigned filter", ["-F=openclaw-unified"]],
+  ])("keeps a caller-provided %s in one main invocation", (_label, args) => {
+    const results = resolveTsdownBuildInvocations({
+      args,
+      platform: "linux",
+      nodeExecPath: "/usr/bin/node",
+      npmExecPath: "/tmp/pnpm.cjs",
+      env: {},
+      ...NO_MEMORY_LIMIT,
+    });
+
+    expect(results).toHaveLength(2);
+    expect(results[0]?.args).not.toEqual(expect.arrayContaining(args));
+    expect(results[1]?.args.slice(-args.length)).toEqual(args);
+  });
+
+  it.each([
+    ["long config", ["--config", "custom.tsdown.config.ts"]],
+    ["long assigned config", ["--config=custom.tsdown.config.ts"]],
+    ["short config", ["-c", "custom.tsdown.config.ts"]],
+    ["short assigned config", ["-c=custom.tsdown.config.ts"]],
+    ["config disabled", ["--no-config", "src/index.ts"]],
+  ])("keeps a caller-provided %s in one unfiltered invocation", (_label, args) => {
+    const results = resolveTsdownBuildInvocations({
+      args,
+      platform: "linux",
+      nodeExecPath: "/usr/bin/node",
+      npmExecPath: "/tmp/pnpm.cjs",
+      env: {},
+      ...NO_MEMORY_LIMIT,
+    });
+
+    expect(results).toHaveLength(1);
+    expect(results[0]?.args.slice(-args.length)).toEqual(args);
   });
 
   it("routes Windows tsdown builds through the pnpm runner instead of shell=true", () => {
@@ -778,7 +891,7 @@ describe("runTsdownBuildInvocation", () => {
     async () => {
       const rootDir = createTempDir("openclaw-tsdown-timeout-");
       const childPidPath = path.join(rootDir, "child.pid");
-      const timeoutMs = 1_000;
+      const timeoutMs = 250;
       let childPid: number | undefined;
       const childScript = "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);";
       const parentScript = [
@@ -813,8 +926,7 @@ describe("runTsdownBuildInvocation", () => {
           },
         );
 
-        await waitForFile(childPidPath, timeoutMs);
-        childPid = Number.parseInt(fs.readFileSync(childPidPath, "utf8"), 10);
+        childPid = await waitForPidFile(childPidPath, timeoutMs);
         expect(isProcessAlive(childPid)).toBe(true);
         const result = await runPromise;
 
@@ -842,7 +954,7 @@ describe("runTsdownBuildInvocation", () => {
         "  setTimeout(() => {",
         `    fs.writeFileSync(${JSON.stringify(cleanupPath)}, 'clean');`,
         "    process.exit(0);",
-        "  }, 75);",
+        "  }, 50);",
         "});",
         `fs.writeFileSync(${JSON.stringify(readyPath)}, 'ready');`,
         "setInterval(() => {}, 1000);",
@@ -874,18 +986,18 @@ describe("runTsdownBuildInvocation", () => {
             env: {
               ...process.env,
               OPENCLAW_TSDOWN_HEARTBEAT_MS: "0",
-              OPENCLAW_TSDOWN_TIMEOUT_MS: "1000",
+              OPENCLAW_TSDOWN_TIMEOUT_MS: "250",
             },
           },
         );
 
         await waitForFile(readyPath, 2_000);
-        childPid = Number.parseInt(fs.readFileSync(childPidPath, "utf8"), 10);
+        childPid = await waitForPidFile(childPidPath, 2_000);
         const result = await runPromise;
 
         expect(result.timedOut).toBe(true);
         expect(fs.readFileSync(cleanupPath, "utf8")).toBe("clean");
-        expect(Date.now() - startedAt).toBeLessThan(1_700);
+        expect(Date.now() - startedAt).toBeLessThan(900);
         await waitForDead(childPid, 2_000);
       } finally {
         if (childPid && isProcessAlive(childPid)) {
@@ -933,8 +1045,7 @@ describe("runTsdownBuildInvocation", () => {
         });
 
         await waitForFile(readyPath, 2_000);
-        await waitForFile(childPidPath, 2_000);
-        childPid = Number.parseInt(fs.readFileSync(childPidPath, "utf8"), 10);
+        childPid = await waitForPidFile(childPidPath, 2_000);
         expect(isProcessAlive(childPid)).toBe(true);
 
         runner.kill("SIGTERM");

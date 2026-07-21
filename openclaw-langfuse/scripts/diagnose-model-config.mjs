@@ -3,7 +3,7 @@
  * Diagnose openclaw model configuration issues that affect usage tracking.
  *
  * Checks all custom providers for:
- * 1. Missing `cost` field — causes pi-ai calculateCost() to crash
+ * 1. Missing `cost` field — leaves monetary cost attribution at zero
  * 2. Missing `compat.supportsUsageInStreaming: true` — prevents streaming
  *    usage data (token counts) from being returned by the provider
  *
@@ -13,8 +13,6 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-
-const DEFAULT_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 
 const configPath = process.argv[2] || join(homedir(), ".openclaw", "openclaw.json");
 
@@ -131,15 +129,17 @@ if (costIssues.length === 0 && usageIssues.length === 0 && cacheRetentionIssues.
 
 if (costIssues.length > 0) {
   console.log(`⚠️  Found ${costIssues.length} model(s) missing cost configuration.`);
-  console.log(`Missing cost causes pi-ai calculateCost() to crash, resulting in zero cost data.\n`);
-  console.log(`Run the following commands to fix:\n`);
-  const costJson = JSON.stringify(DEFAULT_COST);
+  console.log(
+    `OpenClaw defaults missing prices to zero. Token usage remains available, but monetary cost attribution is unresolved until real provider prices are configured.\n`,
+  );
+  console.log(
+    `Diagnose will not write zero-cost defaults because that would hide unresolved pricing.`,
+  );
+  console.log(`Configure explicit per-token prices for these models:\n`);
   for (const issue of costIssues) {
     const label = issue.modelName ? `${issue.modelId} (${issue.modelName})` : issue.modelId;
     console.log(`# ${issue.provider}: ${label}`);
-    console.log(
-      `openclaw config set models.providers.${issue.provider}.models.${issue.idx}.cost '${costJson}'\n`,
-    );
+    console.log(`models.providers.${issue.provider}.models.${issue.idx}.cost\n`);
   }
 }
 
@@ -156,7 +156,7 @@ if (usageIssues.length > 0) {
     const label = issue.modelName ? `${issue.modelId} (${issue.modelName})` : issue.modelId;
     console.log(`# ${issue.provider}: ${label}`);
     console.log(
-      `openclaw config set models.providers.${issue.provider}.models.${issue.idx}.compat '{"supportsUsageInStreaming":true}'\n`,
+      `openclaw config set models.providers.${issue.provider}.models.${issue.idx}.compat.supportsUsageInStreaming true\n`,
     );
   }
 }

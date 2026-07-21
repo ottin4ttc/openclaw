@@ -3,6 +3,12 @@
     "entries": {
       "openclaw-langfuse": {
         "enabled": true,
+        "hooks": {
+          // Required for LLM/tool tracing hooks. Enables this plugin to read
+          // conversation hook payloads; keep redact=true below unless you need
+          // full payloads in Langfuse.
+          "allowConversationAccess": true
+        },
         "config": {
           // ============================================================
           // Langfuse Connection

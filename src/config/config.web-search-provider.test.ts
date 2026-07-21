@@ -1,6 +1,6 @@
 // Covers web-search provider config parsing and provider defaults.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { testing as webSearchTesting } from "../agents/tools/web-search.js";
+import { resolveWebSearchProviderId } from "../web-search/runtime.js";
 import { buildWebSearchProviderConfig } from "./test-helpers.js";
 import { validateConfigObjectWithPlugins } from "./validation.js";
 
@@ -241,7 +241,9 @@ vi.mock("../plugins/manifest-registry.js", () => {
   };
 });
 
-const { resolveSearchProvider } = webSearchTesting;
+const resolveSearchProvider = (
+  search?: Parameters<typeof resolveWebSearchProviderId>[0]["search"],
+) => resolveWebSearchProviderId({ search });
 
 type ValidationMessage = {
   path?: string;
@@ -706,7 +708,7 @@ describe("web search provider auto-detection", () => {
 
 describe("searxng provider config validation", () => {
   it("accepts searxng provider with baseUrl", () => {
-    const res = validateConfigObject(
+    const res = validateConfigObjectWithPlugins(
       buildWebSearchProviderConfig({
         provider: "searxng",
         providerConfig: { baseUrl: "http://localhost:8080" },
@@ -716,7 +718,9 @@ describe("searxng provider config validation", () => {
   });
 
   it("accepts searxng provider with no extra config", () => {
-    const res = validateConfigObject(buildWebSearchProviderConfig({ provider: "searxng" }));
+    const res = validateConfigObjectWithPlugins(
+      buildWebSearchProviderConfig({ provider: "searxng" }),
+    );
     expect(res.ok).toBe(true);
   });
 });

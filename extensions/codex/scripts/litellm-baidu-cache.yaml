@@ -1,0 +1,18 @@
+model_list:
+  - model_name: deepseek-v4-pro
+    litellm_params:
+      model: openai/deepseek-v4-pro
+      api_base: https://qianfan.bj.baidubce.com/v2
+      api_key: os.environ/BAIDU_API_KEY
+      use_chat_completions_api: true
+      drop_params: true
+  - model_name: glm-5.2
+    litellm_params:
+      model: openai/glm-5.2
+      api_base: https://qianfan.bj.baidubce.com/v2
+      api_key: os.environ/BAIDU_API_KEY
+      use_chat_completions_api: true
+      drop_params: true
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY

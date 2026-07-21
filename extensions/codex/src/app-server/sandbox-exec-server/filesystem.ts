@@ -21,6 +21,7 @@ import {
   requireObject,
   requireString,
 } from "./json-rpc.js";
+import { resolveExecServerPath } from "./path-uri.js";
 import { requireBackend, requireFsBridge } from "./runtime.js";
 import type { DirectoryEntry, OpenClawExecServer, ResolvedFsSandboxPolicy } from "./types.js";
 
@@ -32,7 +33,7 @@ export async function readFile(
   params: JsonValue | undefined,
 ): Promise<JsonObject> {
   const record = requireObject(params, "fs/readFile params");
-  const filePath = requireString(record.path, "path");
+  const filePath = resolveExecServerPath(requireString(record.path, "path"), "read path");
   assertFsSandboxAccess(execServer, record, [{ path: filePath, access: "read" }]);
   const fsBridge = requireFsBridge(execServer);
   const stat = await fsBridge.stat({ filePath });
@@ -56,7 +57,7 @@ export async function writeFile(
   params: JsonValue | undefined,
 ): Promise<void> {
   const record = requireObject(params, "fs/writeFile params");
-  const filePath = requireString(record.path, "path");
+  const filePath = resolveExecServerPath(requireString(record.path, "path"), "write path");
   assertFsSandboxAccess(execServer, record, [{ path: filePath, access: "write" }]);
   const fsBridge = requireFsBridge(execServer);
   const parent = await fsBridge.stat({ filePath: pathPosix.dirname(filePath) });
@@ -76,7 +77,10 @@ export async function createDirectory(
   params: JsonValue | undefined,
 ): Promise<void> {
   const record = requireObject(params, "fs/createDirectory params");
-  const filePath = requireString(record.path, "path");
+  const filePath = resolveExecServerPath(
+    requireString(record.path, "path"),
+    "create-directory path",
+  );
   assertFsSandboxAccess(execServer, record, [{ path: filePath, access: "write" }]);
   const fsBridge = requireFsBridge(execServer);
   if (record.recursive === false) {
@@ -97,12 +101,20 @@ export async function getMetadata(
   params: JsonValue | undefined,
 ): Promise<JsonObject> {
   const record = requireObject(params, "fs/getMetadata params");
-  const filePath = requireString(record.path, "path");
+  const filePath = resolveExecServerPath(requireString(record.path, "path"), "metadata path");
   assertFsSandboxAccess(execServer, record, [{ path: filePath, access: "read" }]);
   const fsBridge = requireFsBridge(execServer);
-  const stat = await fsBridge.stat({
-    filePath,
-  });
+  let stat: SandboxFsStat | null;
+  try {
+    stat = await fsBridge.stat({ filePath });
+  } catch (error) {
+    // Codex probes parent directories for project markers. Outside the mounted
+    // virtual filesystem those paths are absent, while direct reads stay denied.
+    if (error instanceof Error && error.message.startsWith("Path escapes sandbox root (")) {
+      throw new JsonRpcProtocolError(JSON_RPC_NOT_FOUND, "file not found");
+    }
+    throw error;
+  }
   if (!stat) {
     throw new JsonRpcProtocolError(JSON_RPC_NOT_FOUND, "file not found");
   }
@@ -115,7 +127,7 @@ export async function readDirectory(
   params: JsonValue | undefined,
 ): Promise<JsonObject> {
   const record = requireObject(params, "fs/readDirectory params");
-  const filePath = requireString(record.path, "path");
+  const filePath = resolveExecServerPath(requireString(record.path, "path"), "read-directory path");
   const fsSandboxPolicy = resolveFsSandboxPolicy(execServer, record);
   return {
     entries: await listDirectoryEntries(execServer, filePath, fsSandboxPolicy),
@@ -163,7 +175,7 @@ export async function removePath(
   params: JsonValue | undefined,
 ): Promise<void> {
   const record = requireObject(params, "fs/remove params");
-  const filePath = requireString(record.path, "path");
+  const filePath = resolveExecServerPath(requireString(record.path, "path"), "remove path");
   const fsSandboxPolicy = resolveFsSandboxPolicy(execServer, record);
   assertResolvedFsSandboxAccess(fsSandboxPolicy, [{ path: filePath, access: "write" }]);
   if (record.recursive !== false) {
@@ -183,10 +195,13 @@ export async function copyPath(
   params: JsonValue | undefined,
 ): Promise<void> {
   const record = requireObject(params, "fs/copy params");
-  const sourcePath = requireString(record.sourcePath ?? record.source, "sourcePath");
-  const destinationPath = requireString(
-    record.destinationPath ?? record.destination,
-    "destinationPath",
+  const sourcePath = resolveExecServerPath(
+    requireString(record.sourcePath ?? record.source, "sourcePath"),
+    "copy source path",
+  );
+  const destinationPath = resolveExecServerPath(
+    requireString(record.destinationPath ?? record.destination, "destinationPath"),
+    "copy destination path",
   );
   const fsSandboxPolicy = resolveFsSandboxPolicy(execServer, record);
   assertResolvedFsSandboxAccess(fsSandboxPolicy, [
@@ -266,6 +281,7 @@ function metadataResponse(stat: SandboxFsStat | null): JsonObject {
     isDirectory: stat?.type === "directory",
     isFile: stat?.type === "file",
     isSymlink: false,
+    size: stat?.size ?? 0,
     createdAtMs: 0,
     modifiedAtMs: stat?.mtimeMs ?? 0,
   };

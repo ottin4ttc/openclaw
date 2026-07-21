@@ -1,9 +1,11 @@
 import crypto from "node:crypto";
 // Memory Core doctor contract migrates shipped workspace dreaming state.
 import fsSync from "node:fs";
+import type { Dirent } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
+import { reclaimDefinitelyStaleFileLock } from "openclaw/plugin-sdk/file-lock";
 import { resolveUserPath } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
 import {
   ensureMemoryIndexSchema,
@@ -18,7 +20,11 @@ import {
 } from "openclaw/plugin-sdk/memory-core-host-engine-storage";
 import { resolveMemoryDreamingWorkspaces } from "openclaw/plugin-sdk/memory-core-host-status";
 import { normalizeAgentId } from "openclaw/plugin-sdk/routing";
-import type { PluginDoctorStateMigration } from "openclaw/plugin-sdk/runtime-doctor";
+import {
+  archiveLegacyStateSource,
+  legacyStateFileExists,
+  type PluginDoctorStateMigration,
+} from "openclaw/plugin-sdk/runtime-doctor";
 import {
   ensureOpenClawAgentDatabaseSchema,
   resolveOpenClawAgentSqlitePath,
@@ -38,10 +44,10 @@ import {
   SHORT_TERM_PHASE_SIGNAL_NAMESPACE,
   SHORT_TERM_RECALL_NAMESPACE,
   configureMemoryCoreDreamingState,
-  readMemoryCoreWorkspaceEntries,
   writeMemoryCoreWorkspaceEntries,
   writeMemoryCoreWorkspaceEntry,
 } from "./src/dreaming-state.js";
+import { dreamingStateComparison } from "./src/migration/dreaming-state-comparison.js";
 import {
   SHORT_TERM_PHASE_SIGNAL_RELATIVE_PATH,
   SHORT_TERM_STORE_RELATIVE_PATH,
@@ -101,6 +107,12 @@ type LegacyMemorySidecarImportResult = {
 };
 
 type MemoryFtsTokenizer = "unicode61" | "trigram";
+
+class LegacyMemoryDerivedRowsConflictError extends Error {
+  constructor(readonly tableName: string) {
+    super(`legacy memory ${tableName} rows conflict with canonical memory index rows`);
+  }
+}
 
 function tableExists(db: DatabaseSync, schema: string, tableName: string): boolean {
   return Boolean(db.prepare(`SELECT 1 FROM ${schema}.sqlite_master WHERE name = ?`).get(tableName));
@@ -201,10 +213,26 @@ function formatLegacyVectorRows(count: number | undefined): string {
   return count === undefined ? "legacy vector rows" : `${count} vector row(s)`;
 }
 
-function assertLegacyRowsCopied(db: DatabaseSync, query: string, tableName: string): void {
+function assertLegacyDerivedRowsCopied(db: DatabaseSync, query: string, tableName: string): void {
   const row = db.prepare(query).get() as { missing?: unknown } | undefined;
   if (Number(row?.missing ?? 0) > 0) {
-    throw new Error(`legacy memory ${tableName} rows conflict with canonical memory index rows`);
+    throw new LegacyMemoryDerivedRowsConflictError(tableName);
+  }
+}
+
+function assertLegacyVectorRowsReferenceChunks(db: DatabaseSync, schema: string): void {
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS missing
+       FROM ${schema}.${LEGACY_MEMORY_VECTOR_TABLE} AS legacy
+       WHERE NOT EXISTS (
+         SELECT 1 FROM main.${MEMORY_INDEX_CHUNKS_TABLE} AS chunk
+         WHERE chunk.id = legacy.id
+       )`,
+    )
+    .get() as { missing?: unknown } | undefined;
+  if (Number(row?.missing ?? 0) > 0) {
+    throw new Error(`legacy memory ${LEGACY_MEMORY_VECTOR_TABLE} rows reference missing chunks`);
   }
 }
 
@@ -330,17 +358,8 @@ function copyLegacyMemoryVectorRows(db: DatabaseSync, schema: string): void {
   if (!tableExists(db, "main", MEMORY_INDEX_VECTOR_TABLE)) {
     return;
   }
-  assertLegacyRowsCopied(
-    db,
-    `SELECT COUNT(*) AS missing
-     FROM ${schema}.${LEGACY_MEMORY_VECTOR_TABLE} AS legacy
-     WHERE NOT EXISTS (
-       SELECT 1 FROM main.${MEMORY_INDEX_CHUNKS_TABLE} AS chunk
-       WHERE chunk.id = legacy.id
-     )`,
-    `${LEGACY_MEMORY_VECTOR_TABLE} chunk references`,
-  );
-  assertLegacyRowsCopied(
+  assertLegacyVectorRowsReferenceChunks(db, schema);
+  assertLegacyDerivedRowsCopied(
     db,
     `SELECT COUNT(*) AS missing
      FROM ${schema}.${LEGACY_MEMORY_VECTOR_TABLE} AS legacy
@@ -358,7 +377,7 @@ function copyLegacyMemoryVectorRows(db: DatabaseSync, schema: string): void {
       WHERE canonical.id = legacy.id
     );
   `);
-  assertLegacyRowsCopied(
+  assertLegacyDerivedRowsCopied(
     db,
     `SELECT COUNT(*) AS missing
      FROM ${schema}.${LEGACY_MEMORY_VECTOR_TABLE} AS legacy
@@ -388,7 +407,7 @@ function copyLegacyMemoryFtsRows(db: DatabaseSync, schema: string): void {
       WHERE canonical.id = legacy.id
     );
   `);
-  assertLegacyRowsCopied(
+  assertLegacyDerivedRowsCopied(
     db,
     `SELECT COUNT(*) AS missing
      FROM ${schema}.chunks AS legacy
@@ -425,7 +444,7 @@ function copyLegacyMemoryIndexRows(
     SELECT id, path, source, start_line, end_line, hash, model, text, embedding, updated_at
     FROM ${schema}.chunks;
   `);
-  assertLegacyRowsCopied(
+  assertLegacyDerivedRowsCopied(
     db,
     `SELECT COUNT(*) AS missing
      FROM ${schema}.meta AS legacy
@@ -435,7 +454,7 @@ function copyLegacyMemoryIndexRows(
      )`,
     "meta",
   );
-  assertLegacyRowsCopied(
+  assertLegacyDerivedRowsCopied(
     db,
     `SELECT COUNT(*) AS missing
      FROM ${schema}.files AS legacy
@@ -449,7 +468,7 @@ function copyLegacyMemoryIndexRows(
      )`,
     "files",
   );
-  assertLegacyRowsCopied(
+  assertLegacyDerivedRowsCopied(
     db,
     `SELECT COUNT(*) AS missing
      FROM ${schema}.chunks AS legacy
@@ -483,14 +502,16 @@ function copyLegacyMemoryIndexRows(
         dims INTEGER,
         updated_at INTEGER NOT NULL,
         PRIMARY KEY (provider, model, provider_key, hash)
-      );
+      ) STRICT;
       INSERT OR IGNORE INTO main.${MEMORY_EMBEDDING_CACHE_TABLE} (
         provider, model, provider_key, hash, embedding, dims, updated_at
       )
       SELECT provider, model, provider_key, hash, embedding, dims, updated_at
       FROM ${schema}.embedding_cache;
     `);
-    assertLegacyRowsCopied(
+    // Matching cache keys are derived rows. Validate shape before deciding whether the
+    // entire stale sidecar should yield to the canonical index.
+    assertLegacyDerivedRowsCopied(
       db,
       `SELECT COUNT(*) AS missing
        FROM ${schema}.embedding_cache AS legacy
@@ -500,9 +521,8 @@ function copyLegacyMemoryIndexRows(
            AND canonical.model = legacy.model
            AND canonical.provider_key = legacy.provider_key
            AND canonical.hash = legacy.hash
-           AND canonical.embedding IS legacy.embedding
            AND canonical.dims IS legacy.dims
-           AND canonical.updated_at IS legacy.updated_at
+           AND CASE WHEN json_valid(canonical.embedding) AND json_valid(legacy.embedding) THEN json_type(canonical.embedding) = 'array' AND json_array_length(canonical.embedding) = canonical.dims AND json_type(legacy.embedding) = 'array' AND json_array_length(legacy.embedding) = legacy.dims ELSE 0 END
        )`,
       "embedding_cache",
     );
@@ -724,7 +744,7 @@ async function collectLegacyMemorySidecarSources(params: {
   async function addSource(agentId: string, legacyPath: string): Promise<void> {
     const normalizedPath = path.resolve(legacyPath);
     const key = `${agentId}\0${normalizedPath}`;
-    if (seen.has(key) || !(await fileExists(normalizedPath))) {
+    if (seen.has(key) || !(await legacyStateFileExists(normalizedPath))) {
       return;
     }
     seen.add(key);
@@ -759,7 +779,7 @@ async function archiveLegacyMemorySidecar(params: {
     await Promise.all(
       LEGACY_MEMORY_SIDECAR_SUFFIXES.map(async (suffix) => {
         const filePath = `${params.source.legacyPath}${suffix}`;
-        return (await fileExists(filePath)) ? filePath : null;
+        return (await legacyStateFileExists(filePath)) ? filePath : null;
       }),
     )
   ).filter((filePath): filePath is string => filePath !== null);
@@ -770,7 +790,7 @@ async function archiveLegacyMemorySidecar(params: {
     await Promise.all(
       existingSources.map(async (sourcePath) => {
         const archivedPath = `${sourcePath}.migrated`;
-        return (await fileExists(archivedPath)) ? archivedPath : null;
+        return (await legacyStateFileExists(archivedPath)) ? archivedPath : null;
       }),
     )
   ).filter((filePath): filePath is string => filePath !== null);
@@ -789,7 +809,10 @@ async function archiveLegacyMemorySidecar(params: {
     } catch (err) {
       for (const entry of renamed.toReversed()) {
         try {
-          if ((await fileExists(entry.archivedPath)) && !(await fileExists(entry.sourcePath))) {
+          if (
+            (await legacyStateFileExists(entry.archivedPath)) &&
+            !(await legacyStateFileExists(entry.sourcePath))
+          ) {
             await fs.rename(entry.archivedPath, entry.sourcePath);
           }
         } catch (rollbackErr) {
@@ -827,7 +850,7 @@ async function preserveLegacyMemorySidecarRetryPath(params: {
     await Promise.all(
       LEGACY_MEMORY_SIDECAR_SUFFIXES.map(async (suffix) => {
         const targetPath = `${retryPath}${suffix}`;
-        return (await fileExists(targetPath)) ? targetPath : null;
+        return (await legacyStateFileExists(targetPath)) ? targetPath : null;
       }),
     )
   ).filter((targetPath): targetPath is string => targetPath !== null);
@@ -843,14 +866,14 @@ async function preserveLegacyMemorySidecarRetryPath(params: {
             .digest("hex")
             .slice(0, 12)}.sqlite`,
         );
-  if (await fileExists(targetBasePath)) {
+  if (await legacyStateFileExists(targetBasePath)) {
     return;
   }
   const existingSources = (
     await Promise.all(
       LEGACY_MEMORY_SIDECAR_SUFFIXES.map(async (suffix) => {
         const sourcePath = `${params.source.legacyPath}${suffix}`;
-        return (await fileExists(sourcePath))
+        return (await legacyStateFileExists(sourcePath))
           ? { sourcePath, targetPath: `${targetBasePath}${suffix}` }
           : null;
       }),
@@ -926,6 +949,14 @@ async function migrateLegacyMemorySidecarSource(params: {
         requireVectorRows: vectorEnabled,
       });
     } catch (err) {
+      if (err instanceof LegacyMemoryDerivedRowsConflictError) {
+        // Every imported table is a derived search index. A same-identity mismatch means the
+        // current per-agent row wins; normal sync rebuilds any rows skipped with the sidecar.
+        params.changes.push(
+          `Resolved Memory Core legacy memory index conflict for agent ${params.source.agentId} by keeping canonical per-agent SQLite rows`,
+        );
+        return { archiveReady: true };
+      }
       await preserveLegacyMemorySidecarRetryPath(params);
       params.warnings.push(
         `Skipped Memory Core legacy memory index import for agent ${params.source.agentId} because legacy rows could not be imported: ${String(err)}`,
@@ -985,40 +1016,8 @@ function resolveConfiguredWorkspaces(config: unknown, env: NodeJS.ProcessEnv): s
   ).map((entry) => entry.workspaceDir);
 }
 
-async function fileExists(filePath: string): Promise<boolean> {
-  try {
-    const stat = await fs.stat(filePath);
-    return stat.isFile();
-  } catch {
-    return false;
-  }
-}
-
 async function readJsonFile(filePath: string): Promise<unknown> {
   return JSON.parse(await fs.readFile(filePath, "utf8"));
-}
-
-async function archiveLegacySource(params: {
-  filePath: string;
-  label: string;
-  changes: string[];
-  warnings: string[];
-}): Promise<void> {
-  const archivedPath = `${params.filePath}.migrated`;
-  if (await fileExists(archivedPath)) {
-    params.warnings.push(
-      `Left migrated Memory Core ${params.label} source in place because ${archivedPath} already exists`,
-    );
-    return;
-  }
-  try {
-    await fs.rename(params.filePath, archivedPath);
-    params.changes.push(`Archived Memory Core ${params.label} legacy source -> ${archivedPath}`);
-  } catch (err) {
-    params.warnings.push(
-      `Failed archiving Memory Core ${params.label} legacy source: ${String(err)}`,
-    );
-  }
 }
 
 async function collectLegacySources(
@@ -1035,7 +1034,7 @@ async function collectLegacySources(
     ];
     for (const candidate of candidates) {
       const filePath = path.join(workspaceDir, candidate.relativePath);
-      if (await fileExists(filePath)) {
+      if (await legacyStateFileExists(filePath)) {
         sources.push({ workspaceDir, label: candidate.label, filePath });
       }
     }
@@ -1043,8 +1042,50 @@ async function collectLegacySources(
   return sources;
 }
 
-async function workspaceHasRows(namespace: string, workspaceDir: string): Promise<boolean> {
-  return (await readMemoryCoreWorkspaceEntries({ namespace, workspaceDir })).length > 0;
+const RETIRED_QMD_GLOBAL_LOCK_NAME = "embed.lock.lock";
+const RETIRED_QMD_AGENT_LOCK_NAME = "qmd-write.lock.lock";
+
+async function readDirectoryEntries(directoryPath: string): Promise<Dirent[]> {
+  try {
+    return (await fs.readdir(directoryPath, { withFileTypes: true })).toSorted((left, right) =>
+      left.name.localeCompare(right.name),
+    );
+  } catch {
+    return [];
+  }
+}
+
+async function collectRetiredQmdFileLocks(stateDir: string): Promise<string[]> {
+  const stateEntries = await readDirectoryEntries(stateDir);
+  const lockPaths: string[] = [];
+
+  if (stateEntries.some((entry) => entry.name === "qmd" && entry.isDirectory())) {
+    const qmdDir = path.join(stateDir, "qmd");
+    const qmdEntries = await readDirectoryEntries(qmdDir);
+    if (qmdEntries.some((entry) => entry.name === RETIRED_QMD_GLOBAL_LOCK_NAME && entry.isFile())) {
+      lockPaths.push(path.join(qmdDir, RETIRED_QMD_GLOBAL_LOCK_NAME));
+    }
+  }
+
+  if (!stateEntries.some((entry) => entry.name === "agents" && entry.isDirectory())) {
+    return lockPaths;
+  }
+  const agentsDir = path.join(stateDir, "agents");
+  for (const entry of await readDirectoryEntries(agentsDir)) {
+    if (!entry.isDirectory() || entry.name !== normalizeAgentId(entry.name)) {
+      continue;
+    }
+    const agentDir = path.join(agentsDir, entry.name);
+    const agentEntries = await readDirectoryEntries(agentDir);
+    if (
+      agentEntries.some(
+        (agentEntry) => agentEntry.name === RETIRED_QMD_AGENT_LOCK_NAME && agentEntry.isFile(),
+      )
+    ) {
+      lockPaths.push(path.join(agentDir, RETIRED_QMD_AGENT_LOCK_NAME));
+    }
+  }
+  return lockPaths;
 }
 
 async function migrateDailyIngestion(source: LegacySource): Promise<number> {
@@ -1128,19 +1169,6 @@ async function migratePhaseSignals(source: LegacySource): Promise<number> {
   return Object.keys(state.entries).length;
 }
 
-function targetNamespacesForSource(label: string): string[] {
-  if (label === "daily ingestion") {
-    return [DREAMING_DAILY_INGESTION_NAMESPACE];
-  }
-  if (label === "session ingestion") {
-    return [DREAMING_SESSION_INGESTION_FILES_NAMESPACE, DREAMING_SESSION_INGESTION_SEEN_NAMESPACE];
-  }
-  if (label === "short-term recall") {
-    return [SHORT_TERM_RECALL_NAMESPACE];
-  }
-  return [SHORT_TERM_PHASE_SIGNAL_NAMESPACE];
-}
-
 async function migrateSource(source: LegacySource): Promise<number> {
   if (source.label === "daily ingestion") {
     return await migrateDailyIngestion(source);
@@ -1174,17 +1202,29 @@ export const stateMigrations: PluginDoctorStateMigration[] = [
       configureMemoryCoreDreamingState(params.context.openPluginStateKeyedStore);
       const changes: string[] = [];
       const warnings: string[] = [];
+      const notices: string[] = [];
       for (const source of await collectLegacySources(params.config, params.env)) {
-        const targetHasRows = (
-          await Promise.all(
-            targetNamespacesForSource(source.label).map((namespace) =>
-              workspaceHasRows(namespace, source.workspaceDir),
-            ),
-          )
-        ).some(Boolean);
+        const targetHasRows = await dreamingStateComparison.targetHasRows(source);
         if (targetHasRows) {
+          let sourceAcknowledged: boolean;
+          try {
+            sourceAcknowledged = await dreamingStateComparison.sourceIsAcknowledged(source);
+          } catch (err) {
+            warnings.push(
+              `Skipped Memory Core ${source.label} import for ${source.workspaceDir} because the legacy source could not be compared: ${String(err)}`,
+            );
+            continue;
+          }
+          if (sourceAcknowledged) {
+            // Older releases may rewrite these rollback sources. The stored hash
+            // keeps unchanged sources informational; rewritten sources fail closed.
+            notices.push(
+              `Retained acknowledged Memory Core ${source.label} legacy source for rollback: ${source.filePath}`,
+            );
+            continue;
+          }
           warnings.push(
-            `Skipped Memory Core ${source.label} import for ${source.workspaceDir} because SQLite rows already exist; left legacy source in place`,
+            `Skipped Memory Core ${source.label} import for ${source.workspaceDir} because SQLite rows conflict with the legacy source; left legacy source in place`,
           );
           continue;
         }
@@ -1200,14 +1240,18 @@ export const stateMigrations: PluginDoctorStateMigration[] = [
         changes.push(
           `Migrated Memory Core ${source.label} -> SQLite plugin state (${imported} row(s))`,
         );
-        await archiveLegacySource({
+        await archiveLegacyStateSource({
           filePath: source.filePath,
-          label: source.label,
+          label: `Memory Core ${source.label}`,
           changes,
           warnings,
         });
       }
-      return { changes, warnings };
+      return {
+        changes,
+        warnings,
+        ...(notices.length > 0 ? { notices } : {}),
+      };
     },
   },
   {
@@ -1270,4 +1314,42 @@ export const stateMigrations: PluginDoctorStateMigration[] = [
       return { changes, warnings };
     },
   },
+  {
+    id: "memory-core-qmd-file-locks-to-sqlite-leases",
+    label: "Memory Core retired QMD file locks",
+    async detectLegacyState(params) {
+      const lockPaths = await collectRetiredQmdFileLocks(params.stateDir);
+      if (lockPaths.length === 0) {
+        return null;
+      }
+      return {
+        preview: lockPaths.map(
+          (lockPath) =>
+            `- Retired Memory Core QMD file lock: ${lockPath} -> remove only if definitely stale (coordination now uses SQLite leases)`,
+        ),
+      };
+    },
+    async migrateLegacyState(params) {
+      const changes: string[] = [];
+      const warnings: string[] = [];
+      for (const lockPath of await collectRetiredQmdFileLocks(params.stateDir)) {
+        try {
+          const result = await reclaimDefinitelyStaleFileLock(lockPath);
+          if (result === "removed") {
+            changes.push(`Removed retired Memory Core QMD file lock: ${lockPath}`);
+          } else if (result === "retained") {
+            warnings.push(
+              `Retained retired Memory Core QMD file lock because its owner is live or ambiguous: ${lockPath}`,
+            );
+          }
+        } catch (err) {
+          warnings.push(
+            `Failed removing retired Memory Core QMD file lock ${lockPath}: ${String(err)}`,
+          );
+        }
+      }
+      return { changes, warnings };
+    },
+  },
 ];
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

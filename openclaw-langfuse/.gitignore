@@ -1,2 +1,3 @@
-.omc
+.omc/
+/dist/
 scripts/verify-*.ts

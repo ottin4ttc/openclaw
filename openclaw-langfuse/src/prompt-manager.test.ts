@@ -1,9 +1,9 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type { LangfusePluginConfig } from "./config.js";
 import { PromptManager } from "./prompt-manager.js";
 
 // Minimal Langfuse mock factory — only getPrompt is needed
-function makeMockLangfuse(getPromptImpl?: () => Promise<{ prompt: string }>) {
+function makeMockLangfuse(getPromptImpl?: (...args: unknown[]) => Promise<{ prompt: string }>) {
   return {
     getPrompt: vi.fn(getPromptImpl ?? (() => Promise.resolve({ prompt: "Hello from Langfuse" }))),
   } as unknown as import("langfuse").default;
@@ -18,6 +18,10 @@ describe("PromptManager", () => {
 
   beforeEach(() => {
     mockLangfuse = makeMockLangfuse();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
   // 1. Returns undefined when no rules configured
@@ -41,8 +45,8 @@ describe("PromptManager", () => {
     expect(mockLangfuse.getPrompt).not.toHaveBeenCalled();
   });
 
-  // 3. Exact match returns correct prompt with prepend injection (default)
-  it("exact match returns prompt with prepend injection by default", async () => {
+  // 3. Exact match returns correct prompt with append injection (default)
+  it("exact match returns prompt with append injection by default", async () => {
     mockLangfuse = makeMockLangfuse(() => Promise.resolve({ prompt: "System guidance text" }));
     const pm = new PromptManager(
       mockLangfuse,
@@ -52,9 +56,9 @@ describe("PromptManager", () => {
     );
     const result = await pm.resolve("main", {});
     expect(result).toBeDefined();
-    expect(result!.injection.prependSystemContext).toBe("System guidance text");
+    expect(result!.injection.appendSystemContext).toBe("System guidance text");
     expect(result!.injection.systemPrompt).toBeUndefined();
-    expect(result!.injection.appendSystemContext).toBeUndefined();
+    expect(result!.injection.prependSystemContext).toBeUndefined();
     expect(result!.matchInfo.name).toBe("main-prompt");
     expect(result!.matchInfo.matchRule).toBe("main");
   });
@@ -107,27 +111,71 @@ describe("PromptManager", () => {
     );
     // First call fetches
     const first = await pm.resolve("main", {});
-    expect(first!.injection.prependSystemContext).toBe("Cached prompt text");
+    expect(first!.injection.appendSystemContext).toBe("Cached prompt text");
     expect(mockLangfuse.getPrompt).toHaveBeenCalledTimes(1);
 
     // Second call uses cache
     const second = await pm.resolve("main", {});
-    expect(second!.injection.prependSystemContext).toBe("Cached prompt text");
+    expect(second!.injection.appendSystemContext).toBe("Cached prompt text");
     expect(mockLangfuse.getPrompt).toHaveBeenCalledTimes(1);
   });
 
-  // 7. Cache miss after TTL expiry re-fetches from Langfuse
-  it("cache miss after TTL expiry re-fetches from Langfuse", async () => {
+  // 7. Zero TTL disables cache and returns the freshly fetched prompt
+  it("zero TTL disables cache and returns the freshly fetched prompt", async () => {
+    mockLangfuse = makeMockLangfuse(
+      vi
+        .fn()
+        .mockResolvedValueOnce({ prompt: "first prompt" })
+        .mockResolvedValueOnce({ prompt: "second prompt" }),
+    );
     const pm = new PromptManager(
       mockLangfuse,
       makeConfig({
         prompts: [{ match: "main", langfusePrompt: "ttl-prompt" }],
-        // 0ms TTL = always expired
+        // 0ms TTL disables the prompt cache.
         promptCacheTtlMs: 0,
       }),
     );
-    await pm.resolve("main", {});
-    await pm.resolve("main", {});
+    const first = await pm.resolve("main", {});
+    const second = await pm.resolve("main", {});
+
+    expect(first!.injection.appendSystemContext).toBe("first prompt");
+    expect(second!.injection.appendSystemContext).toBe("second prompt");
+    expect(mockLangfuse.getPrompt).toHaveBeenCalledTimes(2);
+    expect(pm.resolveSync("main", {})).toBeUndefined();
+  });
+
+  it("positive TTL keeps stale-while-refresh behavior after expiry", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    mockLangfuse = makeMockLangfuse(
+      vi
+        .fn()
+        .mockResolvedValueOnce({ prompt: "cached prompt" })
+        .mockResolvedValueOnce({ prompt: "refreshed prompt" }),
+    );
+    const pm = new PromptManager(
+      mockLangfuse,
+      makeConfig({
+        prompts: [{ match: "main", langfusePrompt: "ttl-prompt" }],
+        promptCacheTtlMs: 100,
+      }),
+    );
+
+    const first = await pm.resolve("main", {});
+    expect(first!.injection.appendSystemContext).toBe("cached prompt");
+    expect(mockLangfuse.getPrompt).toHaveBeenCalledTimes(1);
+
+    vi.setSystemTime(1_101);
+    const stale = await pm.resolve("main", {});
+    expect(stale!.injection.appendSystemContext).toBe("cached prompt");
+    expect(mockLangfuse.getPrompt).toHaveBeenCalledTimes(2);
+
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const refreshed = await pm.resolve("main", {});
+    expect(refreshed!.injection.appendSystemContext).toBe("refreshed prompt");
     expect(mockLangfuse.getPrompt).toHaveBeenCalledTimes(2);
   });
 
@@ -151,7 +199,7 @@ describe("PromptManager", () => {
       sessionKey: "sess-abc",
       trigger: "voice",
     });
-    expect(result!.injection.prependSystemContext).toBe(
+    expect(result!.injection.appendSystemContext).toBe(
       "Agent: agent-42, Channel: ch-99, Session: sess-abc, Trigger: voice",
     );
   });
@@ -168,16 +216,15 @@ describe("PromptManager", () => {
       }),
     );
     const result = await pm.resolve("main", { agentId: "bot" });
-    expect(result!.injection.prependSystemContext).toBe("Agent: bot, Unknown: ");
+    expect(result!.injection.appendSystemContext).toBe("Agent: bot, Unknown: ");
   });
 
   // 10. Fetch timeout returns undefined (graceful degradation)
   it("fetch timeout returns undefined gracefully", async () => {
-    mockLangfuse = makeMockLangfuse(
-      () =>
-        new Promise<{ prompt: string }>((_, reject) =>
-          setTimeout(() => reject(new Error("timeout")), 100),
-        ),
+    mockLangfuse = makeMockLangfuse((_name, _version, options) =>
+      Promise.reject(
+        new Error(`timeout:${(options as { fetchTimeoutMs?: number }).fetchTimeoutMs}`),
+      ),
     );
     const pm = new PromptManager(
       mockLangfuse,
@@ -187,6 +234,11 @@ describe("PromptManager", () => {
     );
     const result = await pm.resolve("main", {});
     expect(result).toBeUndefined();
+    expect(mockLangfuse.getPrompt).toHaveBeenCalledWith(
+      "slow-prompt",
+      undefined,
+      expect.objectContaining({ fetchTimeoutMs: 3000, type: "text" }),
+    );
   });
 
   // 11. Langfuse API error returns undefined (graceful degradation)

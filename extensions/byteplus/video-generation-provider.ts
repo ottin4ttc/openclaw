@@ -1,6 +1,7 @@
 /**
  * BytePlus Seedance video generation provider implementation.
  */
+import { toImageDataUrl } from "openclaw/plugin-sdk/image-generation";
 import { extensionForMime } from "openclaw/plugin-sdk/media-mime";
 import { isProviderApiKeyConfigured } from "openclaw/plugin-sdk/provider-auth";
 import { resolveApiKeyForProvider } from "openclaw/plugin-sdk/provider-auth-runtime";
@@ -30,7 +31,7 @@ import type {
 } from "openclaw/plugin-sdk/video-generation";
 import { BYTEPLUS_BASE_URL } from "./models.js";
 
-const DEFAULT_BYTEPLUS_VIDEO_MODEL = "seedance-1-0-lite-t2v-250428";
+const DEFAULT_BYTEPLUS_VIDEO_MODEL = "seedance-1-0-pro-250528";
 const DEFAULT_TIMEOUT_MS = 120_000;
 const POLL_INTERVAL_MS = 5_000;
 const MAX_POLL_ATTEMPTS = 120;
@@ -115,10 +116,6 @@ function resolveGeneratedVideoMaxBytes(req: VideoGenerationRequest): number {
   return DEFAULT_GENERATED_VIDEO_MAX_BYTES;
 }
 
-function toDataUrl(buffer: Buffer, mimeType: string): string {
-  return `data:${mimeType};base64,${buffer.toString("base64")}`;
-}
-
 function resolveBytePlusImageUrl(req: VideoGenerationRequest): string | undefined {
   const input = req.inputImages?.[0];
   if (!input) {
@@ -131,7 +128,7 @@ function resolveBytePlusImageUrl(req: VideoGenerationRequest): string | undefine
   if (!input.buffer) {
     throw new Error("BytePlus reference image is missing image data.");
   }
-  return toDataUrl(input.buffer, normalizeOptionalString(input.mimeType) ?? "image/png");
+  return toImageDataUrl({ ...input, buffer: input.buffer, defaultMimeType: "image/png" });
 }
 
 function resolveBytePlusSeed(value: unknown): number | undefined {
@@ -234,12 +231,7 @@ export function buildBytePlusVideoGenerationProvider(): VideoGenerationProvider 
     id: "byteplus",
     label: "BytePlus",
     defaultModel: DEFAULT_BYTEPLUS_VIDEO_MODEL,
-    models: [
-      DEFAULT_BYTEPLUS_VIDEO_MODEL,
-      "seedance-1-0-lite-i2v-250428",
-      "seedance-1-0-pro-250528",
-      "seedance-1-5-pro-251215",
-    ],
+    models: [DEFAULT_BYTEPLUS_VIDEO_MODEL, "seedance-1-5-pro-251215"],
     isConfigured: ({ agentDir }) =>
       isProviderApiKeyConfigured({
         provider: "byteplus",
@@ -305,16 +297,7 @@ export function buildBytePlusVideoGenerationProvider(): VideoGenerationProvider 
           capability: "video",
           transport: "http",
         });
-      // Seedance 1.0 has separate T2V and I2V model IDs (e.g. seedance-1-0-lite-t2v-250428 vs
-      // seedance-1-0-lite-i2v-250428). When input images are provided with a T2V model, auto-
-      // switch to the corresponding I2V variant so the API does not reject with task_type mismatch.
-      // 1.5 Pro uses a single model ID for both modes and is unaffected by this substitution.
-      const hasInputImages = (req.inputImages?.length ?? 0) > 0;
-      const requestedModel = normalizeOptionalString(req.model) || DEFAULT_BYTEPLUS_VIDEO_MODEL;
-      const resolvedModel =
-        hasInputImages && requestedModel.includes("-t2v-")
-          ? requestedModel.replace("-t2v-", "-i2v-")
-          : requestedModel;
+      const resolvedModel = normalizeOptionalString(req.model) || DEFAULT_BYTEPLUS_VIDEO_MODEL;
 
       const content: Array<Record<string, unknown>> = [{ type: "text", text: req.prompt }];
       const imageUrl = resolveBytePlusImageUrl(req);

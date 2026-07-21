@@ -1,0 +1,39 @@
+services:
+  litellm:
+    build:
+      context: .
+      dockerfile: Dockerfile.litellm-responses-compat
+    image: openclaw-codex-baidu-litellm:local
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    environment:
+      BAIDU_API_KEY: ${BAIDU_API_KEY:?BAIDU_API_KEY is required}
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?LITELLM_MASTER_KEY is required}
+    volumes:
+      - ./litellm-baidu-cache.yaml:/app/config.yaml:ro
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4000/health/liveliness')",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  responses-tool-compat:
+    build:
+      context: .
+      dockerfile: Dockerfile.responses-tool-compat
+    environment:
+      OPENCLAW_CODEX_RESPONSES_UPSTREAM_URL: http://litellm:4000/v1/responses
+      OPENCLAW_CODEX_RESPONSES_UPSTREAM_API_KEY: ${LITELLM_MASTER_KEY:?LITELLM_MASTER_KEY is required}
+      OPENCLAW_CODEX_RESPONSES_CLIENT_API_KEY: ${BAIDU_API_KEY:?BAIDU_API_KEY is required}
+    depends_on:
+      litellm:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8046:8046"
+    restart: unless-stopped

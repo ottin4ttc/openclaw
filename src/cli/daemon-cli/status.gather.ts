@@ -16,6 +16,7 @@ import type {
 } from "../../config/types.js";
 import { resolveSecretInputRef } from "../../config/types.secrets.js";
 import { readLastGatewayErrorLine } from "../../daemon/diagnostics.js";
+import { inspectGatewayHeapLimit, type GatewayHeapLimitReport } from "../../daemon/gateway-heap.js";
 import type { FindExtraGatewayServicesOptions } from "../../daemon/inspect.js";
 import type { StaleOpenClawUpdateLaunchdJob } from "../../daemon/launchd.js";
 import type { ServiceConfigAudit } from "../../daemon/service-audit.js";
@@ -46,6 +47,10 @@ import {
   readGatewayRestartHandoffSync,
   type GatewayRestartHandoff,
 } from "../../infra/restart-handoff.js";
+import {
+  inspectWindowsGatewayFirewall,
+  type WindowsGatewayFirewallDiagnostic,
+} from "../../infra/windows-gateway-firewall-diagnostics.js";
 import { resolveConfiguredLogFilePath } from "../../logging/log-file-path.js";
 import { loadInstalledPluginIndexInstallRecords } from "../../plugins/installed-plugin-index-record-reader.js";
 import {
@@ -77,6 +82,7 @@ type GatewayStatusSummary = {
   controlUiLinks?: { httpUrl: string; wsUrl: string };
   probeNote?: string;
   version?: string | null;
+  windowsFirewall?: WindowsGatewayFirewallDiagnostic;
 };
 
 type PortStatusSummary = {
@@ -290,6 +296,7 @@ export type DaemonStatus = {
     } | null;
     runtime?: GatewayServiceRuntime;
     configAudit?: ServiceConfigAudit;
+    gatewayHeap?: GatewayHeapLimitReport;
     restartHandoff?: GatewayRestartHandoff;
     staleUpdateLaunchdJobs?: StaleOpenClawUpdateLaunchdJob[];
   };
@@ -576,7 +583,7 @@ export async function gatherDaemonStatus(
       .catch((err: unknown) => ({ status: "unknown", detail: String(err) })),
   ]);
   const restartHandoff = opts.deep ? readGatewayRestartHandoffSync(serviceEnv) : null;
-  const configAudit = command
+  const configAudit: ServiceConfigAudit = command
     ? await loadServiceAuditModule().then(({ auditGatewayServiceConfig }) =>
         auditGatewayServiceConfig({
           env: process.env,
@@ -599,6 +606,16 @@ export async function gatherDaemonStatus(
     commandProgramArguments: command?.programArguments,
     rpcUrlOverride: opts.rpc.url,
   });
+  const shouldInspectLocalGateway = daemonCfg.gateway?.mode !== "remote" && !probeUrlOverride;
+  const windowsFirewall =
+    opts.deep === true && shouldInspectLocalGateway
+      ? await inspectWindowsGatewayFirewall({
+          bind: gateway.bindMode,
+          mode: "quick",
+          port: daemonPort,
+          platform: process.platform,
+        })
+      : undefined;
   const { portStatus, portCliStatus } = await inspectDaemonPortStatuses({
     daemonPort,
     cliPort,
@@ -718,8 +735,17 @@ export async function gatherDaemonStatus(
     : undefined;
 
   let lastError: string | undefined;
-  if (loaded && runtime?.status === "running" && portStatus && portStatus.status !== "busy") {
-    lastError = (await readLastGatewayErrorLine(mergedDaemonEnv as NodeJS.ProcessEnv)) ?? undefined;
+  if (
+    shouldInspectLocalGateway &&
+    loaded &&
+    runtime?.status === "running" &&
+    portStatus &&
+    (portStatus.status !== "busy" || rpc?.ok === false)
+  ) {
+    lastError =
+      (await readLastGatewayErrorLine(mergedDaemonEnv as NodeJS.ProcessEnv, {
+        requirePatternMatch: portStatus.status === "busy",
+      })) ?? undefined;
   }
 
   // Plugin version drift detection.
@@ -731,7 +757,7 @@ export async function gatherDaemonStatus(
   // diagnostics instead.
   // Best-effort: unreadable install records omit this advisory report.
   let pluginVersionDrift: PluginVersionDriftReport | undefined;
-  if (daemonCfg.gateway?.mode !== "remote" && !probeUrlOverride) {
+  if (shouldInspectLocalGateway) {
     try {
       const installRecords = await loadInstalledPluginIndexInstallRecords({
         env: mergedDaemonEnv as NodeJS.ProcessEnv,
@@ -757,6 +783,9 @@ export async function gatherDaemonStatus(
       command,
       runtime,
       configAudit,
+      ...(command
+        ? { gatewayHeap: inspectGatewayHeapLimit(command.environment?.NODE_OPTIONS) }
+        : {}),
       ...(restartHandoff ? { restartHandoff } : {}),
       ...(staleUpdateLaunchdJobs.length > 0 ? { staleUpdateLaunchdJobs } : {}),
     },
@@ -767,6 +796,7 @@ export async function gatherDaemonStatus(
     },
     gateway: {
       ...gateway,
+      ...(windowsFirewall?.applies ? { windowsFirewall } : {}),
       ...(opts.probe
         ? {
             version: gatewayVersion,
@@ -821,3 +851,4 @@ export function resolvePortListeningAddresses(status: DaemonStatus): string[] {
   );
   return addrs;
 }
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

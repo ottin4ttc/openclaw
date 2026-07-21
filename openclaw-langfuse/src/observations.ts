@@ -1,63 +1,54 @@
 /* eslint-disable @typescript-eslint/no-base-to-string, @typescript-eslint/restrict-template-expressions, @typescript-eslint/no-redundant-type-constituents */
 import type Langfuse from "langfuse";
-import type { LangfuseTraceClient, LangfuseSpanClient } from "langfuse";
-import { redactObject, redactText } from "./redact.js";
-import type { TraceContextEntry } from "./trace-context.js";
+import type { LangfuseGenerationClient, LangfuseTraceClient } from "langfuse";
+import { redactObject } from "./redact.js";
 import type { SessionEntry, MinimalLogger } from "./types.js";
 import {
   buildApiMessage,
   buildGenerationOutput,
   extractTextContent,
+  addUsageToTotals,
+  findAggregateOnlyUsageEntry,
   generateObservationId,
   hasNonZeroUsage,
   isToolCallBlock,
   qualifiedModel,
   truncatePayload,
+  usageDetailsFromUsage,
+  messageTimestamp,
+  assistantEndTimestamp,
+  isTraceContextInputEntry,
+  isTraceableAssistantEntry,
 } from "./utils.js";
 
-/**
- * Create Langfuse spans for tool calls found in session messages.
- */
-export function createToolSpansFromMessages(
-  messages: unknown[],
-  entry: TraceContextEntry,
-  redactEnabled: boolean,
-): void {
+function entryIndex(entries: SessionEntry[], entry: SessionEntry, fallback: number): number {
+  const index = entries.indexOf(entry);
+  return index >= 0 ? index : fallback;
+}
+
+function turnStartIndex(allEntries: SessionEntry[], turnEntries: SessionEntry[]): number {
+  const firstTurnEntry = turnEntries[0];
+  return firstTurnEntry ? entryIndex(allEntries, firstTurnEntry, 0) : 0;
+}
+
+export function countToolCallsFromMessages(messages: unknown[]): number {
+  const toolCallIds = new Set<string>();
   for (const msg of messages) {
     const m = msg as Record<string, unknown>;
     if (m.role === "assistant" && Array.isArray(m.content)) {
       for (const block of m.content) {
         const b = block as Record<string, unknown> | null;
-        if (!isToolCallBlock(b)) {
-          continue;
+        if (isToolCallBlock(b) && b.id) {
+          toolCallIds.add(String(b.id));
         }
-
-        entry.toolCallCount += 1;
-
-        // Find matching toolResult
-        const toolResultMsg = messages.find((r) => {
-          const rm = r as Record<string, unknown>;
-          return rm.role === "toolResult" && rm.toolCallId === b.id;
-        }) as Record<string, unknown> | undefined;
-
-        const toolInput = truncatePayload(b.input ?? b.args ?? b.arguments);
-        const toolOutput = toolResultMsg ? extractTextContent(toolResultMsg.content) : undefined;
-
-        entry.trace.span({
-          name: `tool:${String(b.name ?? "unknown")}`,
-          input: redactObject(toolInput, redactEnabled),
-          output: toolOutput
-            ? redactText(String(truncatePayload(toolOutput)), redactEnabled)
-            : undefined,
-          metadata: { toolCallId: b.id },
-        });
       }
     }
   }
+  return toolCallIds.size;
 }
 
 /**
- * Build Langfuse generation and span observations from session entries.
+ * Build Langfuse generation observations from session entries.
  * Extracted from agentEnd so the same logic can be used for startup recovery.
  * Returns aggregated counts and usage for trace metadata.
  */
@@ -77,7 +68,6 @@ export function buildObservationsFromEntries(
       total?: number;
     };
     promptClient?: unknown;
-    pendingSpans?: Map<string, LangfuseSpanClient>;
     lastModel?: string;
     lastProvider?: string;
     redactEnabled: boolean;
@@ -97,8 +87,9 @@ export function buildObservationsFromEntries(
     cacheWrite: number;
     total: number;
   };
+  completedGenerations: Map<number, LangfuseGenerationClient>;
 } {
-  const { entryTimestamp, storedUsage, promptClient, pendingSpans, redactEnabled } = options;
+  const { entryTimestamp, storedUsage, promptClient, redactEnabled } = options;
 
   let llmCallCount = 0;
   let toolCallCount = 0;
@@ -108,64 +99,70 @@ export function buildObservationsFromEntries(
   let prevTimestamp: number | undefined;
 
   const totalUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
-  let hasPerCallUsage = false;
+  const completedGenerations = new Map<number, LangfuseGenerationClient>();
+  let hasReportedUsage = false;
 
-  const assistantCount = turnEntries.filter((e) => e.message.role === "assistant").length;
+  const assistantEntries = turnEntries.filter(isTraceableAssistantEntry);
+  const assistantCount = assistantEntries.length;
+  const aggregateOnlyUsageEntry = findAggregateOnlyUsageEntry(assistantEntries, turnEntries);
+  const aggregateOnlyUsage = aggregateOnlyUsageEntry?.message.usage as
+    | Record<string, number>
+    | undefined;
+  if (hasNonZeroUsage(aggregateOnlyUsage)) {
+    hasReportedUsage = true;
+    addUsageToTotals(totalUsage, aggregateOnlyUsage);
+  }
+  const firstTurnEntryIndex = turnStartIndex(allEntries, turnEntries);
 
   // Create a generation for each assistant message in the turn
   for (const te of turnEntries) {
     const msg = te.message;
 
-    if (msg.role === "assistant") {
+    if (isTraceableAssistantEntry(te)) {
       llmCallCount += 1;
       const isLast = llmCallCount === assistantCount;
 
-      const assistantTs = te.timestamp;
+      const assistantTs = assistantEndTimestamp(te);
       const startTime = prevTimestamp ? new Date(prevTimestamp) : new Date(entryTimestamp);
       const endTime = new Date(assistantTs);
 
       // Build output (D3 format)
       const output = buildGenerationOutput(msg.content, redactEnabled);
 
-      // Build generation input matching LLM API structure: {model, messages}
-      // Use ALL session entries up to this assistant message as input.
+      // Build generation input as a delta: previous assistant response plus
+      // tool results since then, not the full accumulated session history.
       // System prompt is recorded once at trace level (metadata.system_prompt),
       // not duplicated in each generation input.
-      const allPriorEntries = allEntries.slice(0, allEntries.indexOf(te));
-      const accumulatedMessages = allPriorEntries.map((e) => buildApiMessage(e.message));
+      const currentIdx = entryIndex(allEntries, te, allEntries.length);
+      const prevAssistantEntry =
+        llmCallCount > 1 ? assistantEntries.at(llmCallCount - 2) : undefined;
+      const deltaStart = prevAssistantEntry
+        ? entryIndex(allEntries, prevAssistantEntry, firstTurnEntryIndex)
+        : firstTurnEntryIndex;
+      const deltaEntries = allEntries.slice(deltaStart, currentIdx);
+      const deltaMessages = deltaEntries
+        .filter(isTraceContextInputEntry)
+        .map((e) => buildApiMessage(e.message));
       const genInput = redactObject(
         {
           model: String(msg.model ?? options.lastModel ?? "unknown"),
-          messages: accumulatedMessages,
+          messages: deltaMessages,
         },
         redactEnabled,
       );
 
       // Extract per-call usage from JSONL assistant message
       const msgUsage = msg.usage as Record<string, number> | undefined;
-      let genUsage: { input?: number; output?: number; total?: number } | undefined;
+      const usageForGeneration = aggregateOnlyUsageEntry === te ? undefined : msgUsage;
+      let genUsage: Record<string, number> | undefined;
 
-      if (hasNonZeroUsage(msgUsage)) {
-        hasPerCallUsage = true;
-        genUsage = {
-          input: msgUsage?.input ?? 0,
-          output: msgUsage?.output ?? 0,
-          total: msgUsage?.totalTokens ?? msgUsage?.total ?? 0,
-          ...(msgUsage?.cacheRead ? { cache_read_input_tokens: msgUsage.cacheRead } : {}),
-          ...(msgUsage?.cacheWrite ? { cache_creation_input_tokens: msgUsage.cacheWrite } : {}),
-        };
-        totalUsage.input += msgUsage?.input ?? 0;
-        totalUsage.output += msgUsage?.output ?? 0;
-        totalUsage.cacheRead += msgUsage?.cacheRead ?? 0;
-        totalUsage.cacheWrite += msgUsage?.cacheWrite ?? 0;
-        totalUsage.total += msgUsage?.totalTokens ?? msgUsage?.total ?? 0;
-      } else if (isLast && storedUsage) {
+      if (hasNonZeroUsage(usageForGeneration)) {
+        hasReportedUsage = true;
+        genUsage = usageDetailsFromUsage(usageForGeneration);
+        addUsageToTotals(totalUsage, usageForGeneration);
+      } else if (isLast && storedUsage && !aggregateOnlyUsageEntry) {
         // Fall back to stored usage from llm_output for last generation
-        genUsage = {
-          input: storedUsage.input,
-          output: storedUsage.output,
-          total: storedUsage.total,
-        };
+        genUsage = usageDetailsFromUsage(storedUsage as Record<string, number>);
         totalUsage.input += storedUsage.input ?? 0;
         totalUsage.output += storedUsage.output ?? 0;
         totalUsage.cacheRead += storedUsage.cacheRead ?? 0;
@@ -220,7 +217,8 @@ export function buildObservationsFromEntries(
         ...(promptClient ? { prompt: promptClient as any } : {}),
       };
 
-      trace.generation(genData);
+      const generation = trace.generation(genData);
+      completedGenerations.set(llmCallCount, generation);
 
       // Track last assistant text for trace output
       const text = extractTextContent(msg.content);
@@ -233,108 +231,27 @@ export function buildObservationsFromEntries(
       // non-assistant entries (user, toolResult) are captured via allEntries
     }
 
-    prevTimestamp = te.timestamp;
+    if (isTraceableAssistantEntry(te)) {
+      prevTimestamp = assistantEndTimestamp(te);
+    } else if (isTraceContextInputEntry(te)) {
+      prevTimestamp = messageTimestamp(te);
+    }
   }
 
-  // Flush generations before creating tool spans to prevent oversized batches.
+  // Flush generations before final trace metadata updates to prevent oversized batches.
   // Generation inputs accumulate all prior messages and can be very large;
   // flushing here ensures they are sent in smaller batches rather than being
-  // bundled with tool spans into a single request that may exceed server limits.
+  // bundled into a single request that may exceed server limits.
   if (llmCallCount > 0 && options.langfuseClient) {
     options.langfuseClient.flushAsync().catch(() => {});
   }
 
-  // Create tool spans from JSONL toolCall/toolResult pairs
-  if (turnEntries.length > 0) {
-    const toolMap = new Map<
-      string,
-      {
-        callTs?: number;
-        resultTs?: number;
-        toolName?: string;
-        input?: unknown;
-        result?: unknown;
-        error?: string;
-      }
-    >();
-    for (const te of turnEntries) {
-      const msg = te.message;
-      if (msg.role === "assistant" && Array.isArray(msg.content)) {
-        for (const block of msg.content as Record<string, unknown>[]) {
-          if (isToolCallBlock(block) && block.id) {
-            const id = String(block.id);
-            const existing = toolMap.get(id) ?? {};
-            existing.callTs = te.timestamp;
-            existing.toolName = String(block.name ?? "unknown");
-            existing.input = block.input ?? block.args ?? block.arguments;
-            toolMap.set(id, existing);
-          }
-        }
-      }
-      if (msg.role === "toolResult" && msg.toolCallId) {
-        const id = String(msg.toolCallId);
-        const existing = toolMap.get(id) ?? {};
-        existing.resultTs = typeof msg.timestamp === "number" ? msg.timestamp : te.timestamp;
-        existing.toolName = existing.toolName ?? String(msg.toolName ?? "unknown");
-        existing.result = msg.content;
-        if (msg.isError) {
-          existing.error = extractTextContent(msg.content);
-        }
-        toolMap.set(id, existing);
-      }
-    }
+  toolCallCount = countToolCallsFromMessages(turnEntries.map((entry) => entry.message));
+  logger?.debug?.(`Langfuse: counted ${toolCallCount} tool call(s) from JSONL`);
 
-    logger?.debug?.(
-      `Langfuse: agentEnd toolMap has ${toolMap.size} tool calls, pendingSpans=${pendingSpans?.size ?? 0}`,
-    );
-    for (const [toolCallId, info] of toolMap) {
-      toolCallCount += 1;
-      const pendingSpan = pendingSpans?.get(toolCallId);
-      if (pendingSpan) {
-        const durationMs = info.callTs && info.resultTs ? info.resultTs - info.callTs : undefined;
-        pendingSpan.update({
-          endTime: info.resultTs ? new Date(info.resultTs) : undefined,
-          output: info.error
-            ? { error: info.error }
-            : redactObject(truncatePayload(info.result), redactEnabled),
-          statusMessage: info.error,
-          level: info.error ? "ERROR" : "DEFAULT",
-          metadata: durationMs != null ? { durationMs } : {},
-        });
-        pendingSpans?.delete(toolCallId);
-        logger?.debug?.(
-          `Langfuse: ended pending tool span ${info.toolName} (${toolCallId}) durationMs=${durationMs}`,
-        );
-      } else if (info.callTs && info.resultTs) {
-        const durationMs = info.resultTs - info.callTs;
-        logger?.debug?.(
-          `Langfuse: creating tool span ${info.toolName} (${toolCallId}) callTs=${info.callTs} resultTs=${info.resultTs} durationMs=${durationMs}`,
-        );
-        trace.span({
-          id: generateObservationId(traceId, "span", toolCallId),
-          name: `tool:${info.toolName ?? "unknown"}`,
-          startTime: new Date(info.callTs),
-          endTime: new Date(info.resultTs),
-          input: info.input ? redactObject(truncatePayload(info.input), redactEnabled) : undefined,
-          output: info.error
-            ? { error: info.error }
-            : redactObject(truncatePayload(info.result), redactEnabled),
-          statusMessage: info.error,
-          level: info.error ? "ERROR" : "DEFAULT",
-          metadata: { durationMs },
-        });
-      } else {
-        logger?.warn?.(
-          `Langfuse: tool span ${info.toolName} (${toolCallId}) missing timestamps — callTs=${info.callTs} resultTs=${info.resultTs}`,
-        );
-      }
-    }
-  }
-
-  // If no per-call usage was found, the totalUsage will remain zeros; caller
-  // should fall back to storedUsage via hasPerCallUsage check. We signal this
-  // by returning zero totalUsage when hasPerCallUsage is false.
-  if (!hasPerCallUsage) {
+  // If no provider or aggregate usage was found, signal the caller to use its
+  // stored turn-level fallback by returning zero totals.
+  if (!hasReportedUsage) {
     totalUsage.input = 0;
     totalUsage.output = 0;
     totalUsage.cacheRead = 0;
@@ -342,5 +259,13 @@ export function buildObservationsFromEntries(
     totalUsage.total = 0;
   }
 
-  return { llmCallCount, toolCallCount, lastAssistantText, lastProvider, lastModel, totalUsage };
+  return {
+    llmCallCount,
+    toolCallCount,
+    lastAssistantText,
+    lastProvider,
+    lastModel,
+    totalUsage,
+    completedGenerations,
+  };
 }

@@ -18,7 +18,7 @@ type AgentContext = {
   trigger?: string;
 };
 
-type PromptResolveResult = {
+export type PromptResolveResult = {
   injection: {
     systemPrompt?: string;
     prependSystemContext?: string;
@@ -52,21 +52,18 @@ export class PromptManager {
    * Fire-and-forget — errors are silently ignored per rule.
    */
   async warmCache(): Promise<void> {
+    if (!this.isCacheEnabled()) {
+      return;
+    }
+
     for (const rule of this.rules) {
       try {
-        const cacheKey = `${rule.langfusePrompt}:${rule.version ?? "latest"}:${rule.label ?? "default"}`;
+        const cacheKey = this.cacheKey(rule);
         if (this.cache.has(cacheKey)) {
           continue;
         }
         const { promptText, promptClient } = await this.fetchWithTimeout(rule);
-        this.cache.set(cacheKey, {
-          compiledPrompt: promptText,
-          fetchedAt: Date.now(),
-          promptName: rule.langfusePrompt,
-          version: rule.version,
-          label: rule.label,
-          promptClient,
-        });
+        this.setCacheEntry(rule, promptText, promptClient);
       } catch {
         // Silently skip — will retry on next resolve
       }
@@ -86,22 +83,11 @@ export class PromptManager {
     }
 
     // 2. Check cache
-    const cacheKey = `${rule.langfusePrompt}:${rule.version ?? "latest"}:${rule.label ?? "default"}`;
-    const cached = this.cache.get(cacheKey);
-    // If cache expired, still use stale data but trigger background refresh
-    if (cached && Date.now() - cached.fetchedAt >= this.cacheTtlMs) {
-      this.fetchWithTimeout(rule)
-        .then(({ promptText, promptClient }) =>
-          this.cache.set(cacheKey, {
-            compiledPrompt: promptText,
-            fetchedAt: Date.now(),
-            promptName: rule.langfusePrompt,
-            version: rule.version,
-            label: rule.label,
-            promptClient,
-          }),
-        )
-        .catch(() => {}); // silently ignore refresh failures
+    const cached = this.isCacheEnabled() ? this.cache.get(this.cacheKey(rule)) : undefined;
+    if (cached && this.isExpired(cached)) {
+      // Positive TTLs keep stale-while-refresh behavior: return the cached prompt
+      // for this hook while refreshing the cache for the next turn.
+      this.refreshCache(rule);
     }
     if (cached) {
       // compile with context vars
@@ -123,14 +109,7 @@ export class PromptManager {
     try {
       const { promptText, promptClient } = await this.fetchWithTimeout(rule);
       // Cache the raw template (before variable compilation)
-      this.cache.set(cacheKey, {
-        compiledPrompt: promptText,
-        fetchedAt: Date.now(),
-        promptName: rule.langfusePrompt,
-        version: rule.version,
-        label: rule.label,
-        promptClient,
-      });
+      this.setCacheEntry(rule, promptText, promptClient);
       const compiled = this.compileTemplate(promptText, ctx);
       return {
         injection: this.buildInjection(compiled, rule.inject),
@@ -160,26 +139,19 @@ export class PromptManager {
       return undefined;
     }
 
-    const cacheKey = `${rule.langfusePrompt}:${rule.version ?? "latest"}:${rule.label ?? "default"}`;
+    if (!this.isCacheEnabled()) {
+      return undefined;
+    }
+
+    const cacheKey = this.cacheKey(rule);
     const cached = this.cache.get(cacheKey);
     if (!cached) {
       return undefined;
     }
 
     // If cache expired, trigger background refresh but still return stale data
-    if (Date.now() - cached.fetchedAt >= this.cacheTtlMs) {
-      this.fetchWithTimeout(rule)
-        .then(({ promptText, promptClient }) =>
-          this.cache.set(cacheKey, {
-            compiledPrompt: promptText,
-            fetchedAt: Date.now(),
-            promptName: rule.langfusePrompt,
-            version: rule.version,
-            label: rule.label,
-            promptClient,
-          }),
-        )
-        .catch(() => {});
+    if (this.isExpired(cached)) {
+      this.refreshCache(rule);
     }
 
     const compiled = this.compileTemplate(cached.compiledPrompt, ctx);
@@ -199,18 +171,46 @@ export class PromptManager {
   private async fetchWithTimeout(
     rule: PromptRule,
   ): Promise<{ promptText: string; promptClient: unknown }> {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), this.fetchTimeoutMs);
-    try {
-      const promptClient = await this.langfuse.getPrompt(rule.langfusePrompt, rule.version, {
-        label: rule.label,
-        type: "text",
-      });
-      // .prompt is the raw template string on TextPromptClient
-      return { promptText: promptClient.prompt, promptClient };
-    } finally {
-      clearTimeout(timeout);
+    const promptClient = await this.langfuse.getPrompt(rule.langfusePrompt, rule.version, {
+      label: rule.label,
+      type: "text",
+      fetchTimeoutMs: this.fetchTimeoutMs,
+    });
+    // .prompt is the raw template string on TextPromptClient
+    return { promptText: promptClient.prompt, promptClient };
+  }
+
+  private isCacheEnabled(): boolean {
+    return this.cacheTtlMs > 0;
+  }
+
+  private isExpired(entry: CacheEntry): boolean {
+    return Date.now() - entry.fetchedAt >= this.cacheTtlMs;
+  }
+
+  private cacheKey(rule: PromptRule): string {
+    return `${rule.langfusePrompt}:${rule.version ?? "latest"}:${rule.label ?? "default"}`;
+  }
+
+  private setCacheEntry(rule: PromptRule, promptText: string, promptClient: unknown): void {
+    if (!this.isCacheEnabled()) {
+      return;
     }
+
+    this.cache.set(this.cacheKey(rule), {
+      compiledPrompt: promptText,
+      fetchedAt: Date.now(),
+      promptName: rule.langfusePrompt,
+      version: rule.version,
+      label: rule.label,
+      promptClient,
+    });
+  }
+
+  private refreshCache(rule: PromptRule): void {
+    this.fetchWithTimeout(rule)
+      .then(({ promptText, promptClient }) => this.setCacheEntry(rule, promptText, promptClient))
+      .catch(() => {}); // silently ignore refresh failures
   }
 
   private compileTemplate(template: string, ctx: AgentContext): string {

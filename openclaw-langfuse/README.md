@@ -6,7 +6,7 @@ Captures LLM call chains as structured Langfuse traces and optionally injects pr
 
 ## Features
 
-- **LLM Tracing** -- Every agent turn becomes a Langfuse trace with nested generations (LLM calls) and spans (tool calls), including token usage, latency, and model info.
+- **LLM Tracing** -- Every agent turn becomes a Langfuse trace with LLM generations, including tool-call content, token usage, latency, and model info.
 - **Prompt Management** -- Fetch prompts from Langfuse and inject them into agent system prompts. Supports prepend, append, or replace modes.
 - **Prompt Linking** -- Generations are linked to Langfuse prompts, so prompt usage is tracked in the Langfuse Prompts dashboard (Observations count).
 - **Content Redaction** -- Optionally redact prompt/completion content from traces for privacy compliance.
@@ -33,6 +33,10 @@ openclaw plugins install /path/to/openclaw-langfuse
 ```bash
 # Enable plugin
 openclaw config set plugins.entries.openclaw-langfuse.enabled true
+
+# Allow conversation hook access for LLM/tool tracing. Keep tracing.redact=true
+# unless you need full prompt/completion payloads in Langfuse.
+openclaw config set plugins.entries.openclaw-langfuse.hooks.allowConversationAccess true
 
 # Langfuse connection
 openclaw config set plugins.entries.openclaw-langfuse.config.baseUrl "https://cloud.langfuse.com"

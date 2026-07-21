@@ -2,23 +2,166 @@ import type Langfuse from "langfuse";
 /* eslint-disable @typescript-eslint/no-base-to-string, @typescript-eslint/restrict-template-expressions, @typescript-eslint/no-redundant-type-constituents */
 import type { PluginLogger } from "openclaw/plugin-sdk/plugin-entry";
 import { redactObject } from "./redact.js";
-import { writeObservationEvent, readObservationEvents } from "./session.js";
+import { writeObservationEvent } from "./session.js";
 import type { TraceContextEntry } from "./trace-context.js";
 import type { SessionEntry } from "./types.js";
 import {
   generateObservationId,
   isToolCallBlock,
   qualifiedModel,
-  extractTextContent,
   truncatePayload,
   buildApiMessage,
   buildGenerationOutput,
+  findAggregateOnlyUsageEntry,
+  usageDetailsFromUsage,
+  messageTimestamp,
+  assistantStartTimestamp,
+  assistantEndTimestamp,
+  isTraceContextInputEntry,
+  isTraceableAssistantEntry,
 } from "./utils.js";
+
+function entryIndex(entries: SessionEntry[], entry: SessionEntry, fallback: number): number {
+  const index = entries.indexOf(entry);
+  return index >= 0 ? index : fallback;
+}
+
+function turnStartIndex(allEntries: SessionEntry[], turnEntries: SessionEntry[]): number {
+  const firstTurnEntry = turnEntries[0];
+  return firstTurnEntry ? entryIndex(allEntries, firstTurnEntry, 0) : 0;
+}
+
+function toolResultEntriesById(turnEntries: SessionEntry[]): Map<string, SessionEntry> {
+  const resultEntries = new Map<string, SessionEntry>();
+  for (const entry of turnEntries) {
+    const msg = entry.message;
+    if (msg.role !== "toolResult" && msg.role !== "tool") {
+      continue;
+    }
+    const toolCallId =
+      typeof msg.toolCallId === "string"
+        ? msg.toolCallId
+        : typeof msg.tool_call_id === "string"
+          ? msg.tool_call_id
+          : undefined;
+    if (toolCallId && !resultEntries.has(toolCallId)) {
+      resultEntries.set(toolCallId, entry);
+    }
+  }
+  return resultEntries;
+}
+
+function toolResultOutput(msg: Record<string, unknown>): unknown {
+  if ("content" in msg) {
+    return msg.content;
+  }
+  if ("result" in msg) {
+    return msg.result;
+  }
+  return undefined;
+}
+
+function finalizeToolSpansFromEntries(
+  entry: TraceContextEntry,
+  turnEntries: SessionEntry[],
+  agentId: string,
+  sessionId: string,
+  redactEnabled: boolean,
+  ctx: FinalizeContext,
+): void {
+  const { logger, stateDir } = ctx;
+  const resultEntries = toolResultEntriesById(turnEntries);
+
+  for (const toolEntry of turnEntries) {
+    const msg = toolEntry.message;
+    if (msg.role !== "assistant" || !Array.isArray(msg.content)) {
+      continue;
+    }
+
+    for (const block of msg.content as Record<string, unknown>[]) {
+      if (!isToolCallBlock(block) || typeof block.id !== "string") {
+        continue;
+      }
+
+      const toolCallId = block.id;
+      if (entry.completedSpanToolCallIds.has(toolCallId)) {
+        continue;
+      }
+
+      const toolName = String(block.name ?? "unknown");
+      const spanId = generateObservationId(entry.traceId, "span", toolCallId);
+      const input = block.input ?? block.args ?? block.arguments ?? {};
+      let span = entry.pendingSpans.get(toolCallId);
+      if (!span) {
+        const startTime = new Date(messageTimestamp(toolEntry));
+        span = entry.trace.span({
+          id: spanId,
+          name: `tool:${toolName}`,
+          startTime,
+          input: redactObject(truncatePayload(input), redactEnabled),
+          metadata: {
+            toolName,
+            toolCallId,
+            source: "jsonl-finalize",
+          },
+        });
+        entry.pendingSpans.set(toolCallId, span);
+        writeObservationEvent(
+          stateDir,
+          agentId,
+          sessionId,
+          {
+            e: "span-start",
+            traceId: entry.traceId,
+            id: spanId,
+            tool: toolName,
+            toolCallId,
+            ts: startTime.toISOString(),
+          },
+          logger,
+        );
+      }
+
+      const resultEntry = resultEntries.get(toolCallId);
+      const endTime = new Date(
+        resultEntry ? messageTimestamp(resultEntry) : messageTimestamp(toolEntry),
+      );
+      const outputPayload = resultEntry ? toolResultOutput(resultEntry.message) : undefined;
+      const isError = resultEntry?.message.isError === true;
+      span.update({
+        endTime,
+        output: redactObject(truncatePayload(outputPayload), redactEnabled),
+        metadata: {
+          toolName,
+          toolCallId,
+          source: "jsonl-finalize",
+          ...(isError ? { isError: true } : {}),
+        },
+        ...(isError
+          ? {
+              level: "ERROR" as const,
+              statusMessage: "tool returned an error result",
+            }
+          : {}),
+      });
+      entry.pendingSpans.delete(toolCallId);
+      (entry.completedSpans ??= new Map()).set(toolCallId, span);
+      entry.completedSpanToolCallIds.add(toolCallId);
+      writeObservationEvent(
+        stateDir,
+        agentId,
+        sessionId,
+        { e: "span-end", traceId: entry.traceId, id: spanId, ts: endTime.toISOString() },
+        logger,
+      );
+    }
+  }
+}
 
 /**
  * Compute corrected startTimes for each generation from JSONL timeline.
  * gen-1 starts at entryTimestamp; gen-N starts after the last toolResult before it.
- * This ensures generations appear after the tool spans that feed them in Langfuse UI.
+ * This keeps the generation timeline aligned with the transcript order.
  */
 export function computeCorrectedStartTimes(
   assistantMsgs: SessionEntry[],
@@ -32,21 +175,25 @@ export function computeCorrectedStartTimes(
 
     // Find the last toolResult timestamp before this assistant message.
     // Scan all entries (no early break) to handle potentially out-of-order JSONL writes.
-    const assistantTs = assistantEntry.timestamp;
+    const assistantTs = assistantStartTimestamp(assistantEntry);
     let lastToolResultTs: number | undefined;
     for (const te of turnEntries) {
-      if (te.timestamp >= assistantTs) {
+      if (messageTimestamp(te) >= assistantTs) {
         continue;
       }
       if (te.message.role === "toolResult") {
-        const ts = typeof te.message.timestamp === "number" ? te.message.timestamp : te.timestamp;
+        const ts = messageTimestamp(te);
         if (!lastToolResultTs || ts > lastToolResultTs) {
           lastToolResultTs = ts;
         }
       }
     }
     // Fall back to previous assistant message timestamp if no toolResult found
-    return lastToolResultTs ?? assistantMsgs[i - 1]?.timestamp ?? entryTimestamp;
+    const previousAssistant = assistantMsgs[i - 1];
+    return (
+      lastToolResultTs ??
+      (previousAssistant ? assistantEndTimestamp(previousAssistant) : entryTimestamp)
+    );
   });
 }
 
@@ -58,9 +205,8 @@ export interface FinalizeContext {
 
 /**
  * Finalize incremental observations in agentEnd.
- * Completes orphan generations/spans from the incremental path (llmInput/llmOutput/
- * beforeToolCall/afterToolCall) and creates fallback spans for tool calls only
- * visible in JSONL.
+ * Completes orphan generations from the incremental path (llmInput/llmOutput)
+ * and keeps tool activity as generation content plus trace metadata only.
  */
 export function finalizeIncrementalObservations(
   entry: TraceContextEntry,
@@ -72,6 +218,10 @@ export function finalizeIncrementalObservations(
   ctx: FinalizeContext,
 ): void {
   const { logger, stateDir, langfuseClient } = ctx;
+  const assistantMsgs = turnEntries.filter(isTraceableAssistantEntry);
+  const aggregateOnlyUsageEntry = findAggregateOnlyUsageEntry(assistantMsgs, turnEntries);
+  const firstTurnEntryIndex = turnStartIndex(allEntries, turnEntries);
+  const orphanCompletedGenIdxs = new Set<number>();
 
   // 1. Complete orphan pending generations (llmOutput didn't fire)
   if (entry.pendingGenerations.size > 0) {
@@ -82,14 +232,13 @@ export function finalizeIncrementalObservations(
     // (extracted from genId like "traceId-gen-N"), not positional order.
     // This handles the case where some generations were completed by llmOutput
     // and only a subset remains as orphans.
-    const assistantEntries = turnEntries.filter((e) => e.message.role === "assistant");
     for (const [runId, pendingGen] of entry.pendingGenerations) {
       const genId = entry.pendingGenIds.get(runId);
       // Extract 0-based index from genId (e.g., "xxx-gen-1" → 0)
       const genNum = genId ? parseInt(genId.split("-gen-")[1] ?? "0", 10) : 0;
-      const assistantEntry = assistantEntries[genNum > 0 ? genNum - 1 : 0];
+      const assistantEntry = assistantMsgs[genNum > 0 ? genNum - 1 : 0];
       const msg = assistantEntry?.message;
-      const endTime = assistantEntry ? new Date(assistantEntry.timestamp) : new Date();
+      const endTime = assistantEntry ? new Date(assistantEndTimestamp(assistantEntry)) : new Date();
       // Use buildGenerationOutput to correctly format tool_use/toolCall content,
       // not just extractTextContent which drops tool calls.
       const output = msg?.content
@@ -98,30 +247,15 @@ export function finalizeIncrementalObservations(
           ? entry.storedOutput
           : undefined;
       const msgUsage = msg?.usage as Record<string, number> | undefined;
+      const usageForGeneration = aggregateOnlyUsageEntry === assistantEntry ? undefined : msgUsage;
+      const usageDetails = usageDetailsFromUsage(usageForGeneration);
       pendingGen.update({
         endTime,
         output:
           output !== undefined && output !== null && output !== ""
             ? truncatePayload(output)
             : undefined,
-        ...(msgUsage &&
-        (msgUsage.input ||
-          msgUsage.output ||
-          msgUsage.totalTokens ||
-          msgUsage.cacheRead ||
-          msgUsage.cacheWrite)
-          ? {
-              usageDetails: {
-                input: msgUsage.input ?? 0,
-                output: msgUsage.output ?? 0,
-                total: msgUsage.totalTokens ?? msgUsage.total ?? 0,
-                ...(msgUsage.cacheRead ? { cache_read_input_tokens: msgUsage.cacheRead } : {}),
-                ...(msgUsage.cacheWrite
-                  ? { cache_creation_input_tokens: msgUsage.cacheWrite }
-                  : {}),
-              },
-            }
-          : {}),
+        ...(usageDetails ? { usageDetails } : {}),
         metadata: {
           provider: String(msg?.provider ?? entry.lastProvider ?? ""),
           model: msg?.model ?? entry.lastModel,
@@ -129,6 +263,9 @@ export function finalizeIncrementalObservations(
         },
       });
       entry.pendingGenIds.delete(runId);
+      const completedGenIdx = genNum > 0 ? genNum : entry.completedGenerations.size + 1;
+      entry.completedGenerations.set(completedGenIdx, pendingGen);
+      orphanCompletedGenIdxs.add(completedGenIdx);
       if (genId) {
         writeObservationEvent(
           stateDir,
@@ -147,10 +284,8 @@ export function finalizeIncrementalObservations(
   // - Output: rebuilt from JSONL msg.content (fixes null output for tool_use responses)
   // - startTime: corrected from JSONL timestamps (fixes observation ordering)
   // - costDetails: only sent when non-zero (avoids overriding Langfuse auto-calculation)
-  const assistantMsgs = turnEntries.filter((e) => e.message.role === "assistant");
-  logger?.info?.(
-    `Langfuse: section 1b — turnEntries=${turnEntries.length} assistantMsgs=${assistantMsgs.length} completedGenerations=${entry.completedGenerations.size} llmCallCount=${entry.llmCallCount}`,
-  );
+  const providerRequestOwnsGenerations =
+    entry.hasProviderRequestGenerations || entry.providerRequestAugmentedHookGenerations;
 
   // Compute corrected startTimes from JSONL timeline so observations appear in correct order.
   // gen-1 starts at entry.timestamp; gen-N starts after the last toolResult before it.
@@ -162,26 +297,26 @@ export function finalizeIncrementalObservations(
 
   for (let i = 0; i < assistantMsgs.length; i++) {
     const genIdx = i + 1; // 1-based
-    const completedGen = entry.completedGenerations.get(genIdx);
-    if (!completedGen) {
-      logger?.info?.(`Langfuse: section 1b — SKIP genIdx=${genIdx} (not in completedGenerations)`);
+    if (providerRequestOwnsGenerations) {
       continue;
     }
-    logger?.info?.(`Langfuse: section 1b — FOUND genIdx=${genIdx}`);
+    if (orphanCompletedGenIdxs.has(genIdx)) {
+      continue;
+    }
+
+    const completedGen = entry.completedGenerations.get(genIdx);
+    if (!completedGen) {
+      continue;
+    }
 
     const msg = assistantMsgs[i].message;
     const msgUsage = msg.usage as Record<string, number> | undefined;
-    logger?.debug?.(
-      `Langfuse: usage correction genIdx=${genIdx} — msgUsage=${JSON.stringify(msgUsage ? { input: msgUsage.input, output: msgUsage.output, cacheRead: msgUsage.cacheRead, cacheWrite: msgUsage.cacheWrite, total: msgUsage.totalTokens ?? msgUsage.total } : null)}`,
-    );
+    const usageForGeneration = aggregateOnlyUsageEntry === assistantMsgs[i] ? undefined : msgUsage;
 
     // Rebuild output from JSONL ground truth — fixes null output for tool_use responses
     const correctedOutput = msg.content
       ? truncatePayload(buildGenerationOutput(msg.content, redactEnabled))
       : undefined;
-    logger?.info?.(
-      `Langfuse: finalize 1b genIdx=${genIdx} — msg.content=${msg.content ? "truthy" : "falsy"} correctedOutput=${correctedOutput !== undefined ? typeof correctedOutput : "undefined"}`,
-    );
 
     // Only send costDetails when provider returns real (non-zero) cost data
     const costObj = msgUsage?.cost as Record<string, number> | undefined;
@@ -192,21 +327,14 @@ export function finalizeIncrementalObservations(
 
     // Corrected startTime from JSONL timeline
     const correctedStart = correctedStartTimes[i];
+    const correctedEnd = assistantEndTimestamp(assistantMsgs[i]);
+    const usageDetails = usageDetailsFromUsage(usageForGeneration);
 
     completedGen.update({
       ...(correctedOutput !== undefined ? { output: correctedOutput } : {}),
       ...(correctedStart ? { startTime: new Date(correctedStart) } : {}),
-      ...(msgUsage && (msgUsage.input || msgUsage.output || msgUsage.totalTokens || msgUsage.total)
-        ? {
-            usageDetails: {
-              input: msgUsage.input ?? 0,
-              output: msgUsage.output ?? 0,
-              total: msgUsage.totalTokens ?? msgUsage.total ?? 0,
-              ...(msgUsage.cacheRead ? { cache_read_input_tokens: msgUsage.cacheRead } : {}),
-              ...(msgUsage.cacheWrite ? { cache_creation_input_tokens: msgUsage.cacheWrite } : {}),
-            },
-          }
-        : {}),
+      endTime: new Date(correctedEnd),
+      ...(usageDetails ? { usageDetails } : {}),
       ...(hasRealCost
         ? {
             costDetails: {
@@ -227,12 +355,11 @@ export function finalizeIncrementalObservations(
         : {}),
     });
   }
-  entry.completedGenerations.clear();
 
   // 1c. Gap fill: create generations for LLM calls where llmInput/llmOutput didn't fire.
   // In multi-tool-use turns the hook system may only fire for the first LLM call;
   // subsequent calls are only visible in JSONL assistant messages.
-  if (assistantMsgs.length > entry.llmCallCount) {
+  if (!providerRequestOwnsGenerations && assistantMsgs.length > entry.llmCallCount) {
     logger?.debug?.(
       `Langfuse: gap fill — ${assistantMsgs.length} assistant messages but only ${entry.llmCallCount} generation(s), creating ${assistantMsgs.length - entry.llmCallCount} missing generation(s)`,
     );
@@ -247,39 +374,36 @@ export function finalizeIncrementalObservations(
       const correctedStart = correctedStartTimes[i];
       const startTime = correctedStart
         ? new Date(correctedStart)
-        : new Date(i > 0 ? assistantMsgs[i - 1].timestamp : entry.timestamp);
-      const endTime = new Date(te.timestamp);
+        : new Date(i > 0 ? assistantEndTimestamp(assistantMsgs[i - 1]) : entry.timestamp);
+      const endTime = new Date(assistantEndTimestamp(te));
 
       const output = buildGenerationOutput(msg.content, redactEnabled);
 
-      // Build input: all session entries prior to this assistant message
-      const allPriorEntries = allEntries.slice(0, allEntries.indexOf(te));
-      const accumulatedMessages = allPriorEntries.map((e) => buildApiMessage(e.message));
+      // Build input as a delta: previous assistant response plus the tool results
+      // since then, not the full accumulated session history.
+      const currentIdx = entryIndex(allEntries, te, allEntries.length);
+      const deltaStart =
+        i > 0
+          ? entryIndex(allEntries, assistantMsgs[i - 1], firstTurnEntryIndex)
+          : firstTurnEntryIndex;
+      const deltaEntries = allEntries.slice(deltaStart, currentIdx);
+      const deltaMessages = deltaEntries
+        .filter(isTraceContextInputEntry)
+        .map((e) => buildApiMessage(e.message));
       const genInput = redactObject(
-        { model: String(msg.model ?? entry.lastModel ?? "unknown"), messages: accumulatedMessages },
+        { model: String(msg.model ?? entry.lastModel ?? "unknown"), messages: deltaMessages },
         redactEnabled,
       );
 
       const msgUsage = msg.usage as Record<string, number> | undefined;
-      let genUsage: Record<string, number> | undefined;
-      if (
-        msgUsage &&
-        (msgUsage.input || msgUsage.output || msgUsage.totalTokens || msgUsage.total)
-      ) {
-        genUsage = {
-          input: msgUsage.input ?? 0,
-          output: msgUsage.output ?? 0,
-          total: msgUsage.totalTokens ?? msgUsage.total ?? 0,
-          ...(msgUsage.cacheRead ? { cache_read_input_tokens: msgUsage.cacheRead } : {}),
-          ...(msgUsage.cacheWrite ? { cache_creation_input_tokens: msgUsage.cacheWrite } : {}),
-        };
-      }
+      const usageForGeneration = aggregateOnlyUsageEntry === te ? undefined : msgUsage;
+      const genUsage = usageDetailsFromUsage(usageForGeneration);
 
       const rawModel = String(msg.model ?? entry.lastModel ?? "unknown");
       const provider = String(msg.provider ?? entry.lastProvider ?? "");
       const model = qualifiedModel(provider, rawModel);
 
-      entry.trace.generation({
+      const generation = entry.trace.generation({
         id: genId,
         name: `llm-call-${genIdx}`,
         model,
@@ -318,6 +442,7 @@ export function finalizeIncrementalObservations(
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         ...(entry.promptClient ? { prompt: entry.promptClient as any } : {}),
       });
+      entry.completedGenerations.set(genIdx, generation);
 
       writeObservationEvent(
         stateDir,
@@ -348,114 +473,27 @@ export function finalizeIncrementalObservations(
         entry.lastModel = model;
       }
     }
-    // Flush gap-filled generations before creating tool spans
+    // Flush gap-filled generations before final trace metadata updates.
     langfuseClient?.flushAsync().catch((e: unknown) => {
       logger?.debug?.(`Langfuse: flushAsync failed (gap-fill): ${String(e)}`);
     });
   }
 
-  // Build toolResult map from JSONL once — reused by both orphan span completion and fallback spans
-  const toolResultMap = new Map<string, { ts: number; content: unknown; error?: string }>();
-  for (const te of turnEntries) {
-    const msg = te.message;
-    if (msg.role === "toolResult" && msg.toolCallId) {
-      const id = String(msg.toolCallId);
-      toolResultMap.set(id, {
-        ts: typeof msg.timestamp === "number" ? msg.timestamp : te.timestamp,
-        content: msg.content,
-        error: msg.isError ? extractTextContent(msg.content) : undefined,
-      });
-    }
-  }
-
-  // 2. Complete orphan pending spans (afterToolCall didn't fire)
-  const completedOrphanSpanIds = new Set<string>();
-  if (entry.pendingSpans.size > 0) {
-    logger?.debug?.(`Langfuse: agentEnd completing ${entry.pendingSpans.size} orphan span(s)`);
-    for (const [toolCallId, span] of entry.pendingSpans) {
-      const result = toolResultMap.get(toolCallId);
-      const endTime = result ? new Date(result.ts) : new Date();
-      span.update({
-        endTime,
-        output: result?.error
-          ? { error: result.error }
-          : result?.content
-            ? redactObject(truncatePayload(result.content), redactEnabled)
-            : undefined,
-        statusMessage: result?.error,
-        level: result?.error ? "ERROR" : "DEFAULT",
-      });
-      completedOrphanSpanIds.add(toolCallId);
-      const spanId = generateObservationId(entry.traceId, "span", toolCallId);
-      writeObservationEvent(
-        stateDir,
-        agentId,
-        sessionId,
-        { e: "span-end", traceId: entry.traceId, id: spanId, ts: endTime.toISOString() },
-        logger,
-      );
-    }
-    entry.pendingSpans.clear();
-  }
-
-  // 3. Create fallback spans for tool calls in JSONL not tracked by beforeToolCall
-  const { createdIds: existingSpanIds } = readObservationEvents(
-    stateDir,
-    agentId,
-    sessionId,
-    entry.traceId,
-    logger,
-  );
-  for (const toolCallId of entry.completedSpanToolCallIds) {
-    existingSpanIds.add(generateObservationId(entry.traceId, "span", toolCallId));
-  }
-  for (const toolCallId of completedOrphanSpanIds) {
-    existingSpanIds.add(generateObservationId(entry.traceId, "span", toolCallId));
-  }
-  let fallbackSpanCount = 0;
+  const toolCallIds = new Set<string>();
   for (const te of turnEntries) {
     const msg = te.message;
     if (msg.role === "assistant" && Array.isArray(msg.content)) {
       for (const block of msg.content as Record<string, unknown>[]) {
-        if (!isToolCallBlock(block) || !block.id) {
-          continue;
+        if (isToolCallBlock(block) && block.id) {
+          toolCallIds.add(String(block.id));
         }
-        const toolCallId = String(block.id);
-        const spanId = generateObservationId(entry.traceId, "span", toolCallId);
-        if (existingSpanIds.has(spanId)) {
-          continue;
-        } // already created
-
-        // Look up toolResult from shared map (O(1) instead of O(n) find)
-        const result = toolResultMap.get(toolCallId);
-        if (!result) {
-          continue;
-        }
-
-        const callTs = te.timestamp;
-
-        entry.trace.span({
-          id: spanId,
-          name: `tool:${String(block.name ?? "unknown")}`,
-          startTime: new Date(callTs),
-          endTime: new Date(result.ts),
-          input: block.input
-            ? redactObject(truncatePayload(block.input), redactEnabled)
-            : undefined,
-          output: result.error
-            ? { error: result.error }
-            : redactObject(truncatePayload(result.content), redactEnabled),
-          statusMessage: result.error,
-          level: result.error ? "ERROR" : "DEFAULT",
-          metadata: { durationMs: result.ts - callTs },
-        });
-        fallbackSpanCount++;
       }
     }
   }
-  if (fallbackSpanCount > 0) {
-    logger?.debug?.(
-      `Langfuse: agentEnd created ${fallbackSpanCount} fallback tool span(s) from JSONL`,
-    );
+  if (toolCallIds.size > entry.toolCallCount) {
+    entry.toolCallCount = toolCallIds.size;
+  }
+  if (!providerRequestOwnsGenerations) {
+    finalizeToolSpansFromEntries(entry, turnEntries, agentId, sessionId, redactEnabled, ctx);
   }
 }

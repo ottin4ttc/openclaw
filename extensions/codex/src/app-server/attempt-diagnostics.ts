@@ -12,7 +12,7 @@ import type { CodexAppServerRuntimeOptions, resolveCodexPluginsPolicy } from "./
 type TrustedDiagnosticEventInput = Parameters<typeof emitTrustedDiagnosticEventWithPrivateData>[0];
 
 /** Reads a tool schema field in either app-server or OpenClaw naming. */
-export function readCodexDiagnosticToolParameters(tool: {
+function readCodexDiagnosticToolParameters(tool: {
   inputSchema?: unknown;
   parameters?: unknown;
 }): unknown {
@@ -20,7 +20,7 @@ export function readCodexDiagnosticToolParameters(tool: {
 }
 
 /** Builds compact diagnostic tool definitions for trusted private telemetry. */
-export function buildCodexDiagnosticToolDefinitions(
+function buildCodexDiagnosticToolDefinitions(
   tools: readonly {
     name: string;
     description: string;
@@ -73,6 +73,7 @@ export function buildCodexPluginThreadConfigEligibilityLogData(params: {
     enabled: params.pluginThreadConfigRequired,
     policyConfigured: params.resolvedPluginPolicy?.configured === true,
     policyEnabled: params.resolvedPluginPolicy?.enabled === true,
+    allowAllPlugins: params.resolvedPluginPolicy?.allowAllPlugins === true,
     pluginConfigKeys: params.resolvedPluginPolicy?.pluginPolicies
       .map((plugin) => plugin.configKey)
       .toSorted(),
@@ -163,6 +164,7 @@ export function createCodexModelCallDiagnosticEmitter(params: {
           type: "model.call.completed",
           ...params.baseFields,
           durationMs: Math.max(0, now() - startedAt),
+          usageSource: "turn-aggregate",
           ...requestPayloadBytesField(),
         } as TrustedDiagnosticEventInput,
         privateData({
@@ -188,6 +190,7 @@ export function createCodexModelCallDiagnosticEmitter(params: {
           ...params.baseFields,
           durationMs: Math.max(0, now() - startedAt),
           errorCategory: fields.failureKind ?? "error",
+          usageSource: "unknown",
           ...(fields.failureKind ? { failureKind: fields.failureKind } : {}),
           ...requestPayloadBytesField(),
         } as TrustedDiagnosticEventInput,

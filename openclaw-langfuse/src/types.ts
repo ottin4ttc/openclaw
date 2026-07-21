@@ -4,6 +4,8 @@
 // locally because they are not re-exported from openclaw/plugin-sdk.
 // ---------------------------------------------------------------------------
 
+export type MaybePromise<T> = T | Promise<T>;
+
 export type AgentCtx = {
   runId?: string;
   agentId?: string;
@@ -100,6 +102,7 @@ export type AfterToolCallEvent = {
   toolCallId?: string;
   result?: unknown;
   error?: string;
+  isError?: boolean;
   durationMs?: number;
 };
 
@@ -110,7 +113,12 @@ export type SessionEndEvent = {
   durationMs?: number;
 };
 
-export type SessionEntry = { timestamp: number; message: Record<string, unknown> };
+export type SessionEntry = {
+  id?: string;
+  parentId?: string;
+  timestamp: number;
+  message: Record<string, unknown>;
+};
 
 export type IncompleteTraceInfo = {
   traceId: string;

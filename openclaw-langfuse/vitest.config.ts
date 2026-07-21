@@ -7,28 +7,37 @@ export default defineConfig({
   resolve: {
     alias: [
       {
+        find: "openclaw/plugin-sdk/session-transcript-runtime",
+        replacement: path.join(repoRoot, "src", "plugin-sdk", "session-transcript-runtime.ts"),
+      },
+      {
         find: "openclaw/plugin-sdk/plugin-entry",
         replacement: path.join(repoRoot, "src", "plugin-sdk", "plugin-entry.ts"),
       },
       {
-        find: "openclaw/plugin-sdk/diagnostics-otel",
-        replacement: path.join(repoRoot, "src", "plugin-sdk", "diagnostics-otel.ts"),
+        find: "openclaw/plugin-sdk/diagnostic-runtime",
+        replacement: path.join(repoRoot, "src", "plugin-sdk", "diagnostic-runtime.ts"),
       },
       {
-        find: "openclaw/plugin-sdk",
+        find: /^openclaw\/plugin-sdk\/(.+)$/,
+        replacement: path.join(repoRoot, "src", "plugin-sdk", "$1.ts"),
+      },
+      {
+        find: /^openclaw\/plugin-sdk$/,
         replacement: path.join(repoRoot, "src", "plugin-sdk", "index.ts"),
       },
       {
-        find: /^@openclaw\/normalization-core\/(.+)$/,
-        replacement: path.join(repoRoot, "packages", "normalization-core", "src", "$1.ts"),
+        find: /^@openclaw\/(?!(?:crabline|fs-safe|libterminal|proxyline|uirouter)(?:\/|$))([^/]+)\/(.+)$/,
+        replacement: path.join(repoRoot, "packages", "$1", "src", "$2.ts"),
       },
       {
-        find: "@openclaw/normalization-core",
-        replacement: path.join(repoRoot, "packages", "normalization-core", "src", "index.ts"),
+        find: /^@openclaw\/(?!(?:crabline|fs-safe|libterminal|proxyline|uirouter)$)([^/]+)$/,
+        replacement: path.join(repoRoot, "packages", "$1", "src", "index.ts"),
       },
     ],
   },
   test: {
     include: ["src/**/*.test.ts"],
+    testTimeout: 15_000,
   },
 });

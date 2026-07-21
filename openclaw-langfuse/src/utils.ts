@@ -1,6 +1,6 @@
 /* eslint-disable @typescript-eslint/no-base-to-string, @typescript-eslint/restrict-template-expressions, @typescript-eslint/no-redundant-type-constituents */
 import { createHash } from "node:crypto";
-import { redactText } from "./redact.js";
+import { redactObject, redactText } from "./redact.js";
 import type { SessionEntry } from "./types.js";
 
 export const MAX_PAYLOAD_BYTES = 100 * 1024; // 100KB
@@ -41,6 +41,38 @@ export function generateObservationId(
 }
 
 /**
+ * Return the timestamp embedded in the persisted message when available.
+ * For user/toolResult rows this is the event time. For assistant rows this is
+ * the model-call start time in current OpenClaw session JSONL.
+ */
+export function messageTimestamp(entry: SessionEntry): number {
+  const raw = entry.message.timestamp;
+  if (typeof raw === "number" && Number.isFinite(raw)) {
+    return raw;
+  }
+  if (typeof raw === "string") {
+    const parsed = Date.parse(raw);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+  return entry.timestamp;
+}
+
+/**
+ * Assistant rows carry two useful times:
+ * - message.timestamp: model call start
+ * - outer row timestamp: assistant response persisted/completed
+ */
+export function assistantStartTimestamp(entry: SessionEntry): number {
+  return messageTimestamp(entry);
+}
+
+export function assistantEndTimestamp(entry: SessionEntry): number {
+  return entry.timestamp;
+}
+
+/**
  * Truncate a payload to MAX_PAYLOAD_BYTES. Returns original object if small
  * enough, otherwise a truncated string with a size notice.
  */
@@ -48,28 +80,93 @@ export function truncatePayload(obj: unknown): unknown {
   if (obj === undefined || obj === null) {
     return obj;
   }
-  const serialized = JSON.stringify(obj);
+  let serialized = safeJsonStringify(obj);
+  let payload = obj;
+  if (serialized === undefined) {
+    try {
+      payload = normalizeJsonPayload(obj, new WeakSet<object>());
+      serialized = JSON.stringify(payload);
+    } catch {
+      payload = "[unserializable: payload]";
+      serialized = JSON.stringify(payload);
+    }
+  }
   if (!serialized) {
-    return obj;
+    return payload;
   }
   const byteLength = Buffer.byteLength(serialized, "utf-8");
   if (byteLength <= MAX_PAYLOAD_BYTES) {
-    return obj;
+    return payload;
   }
-  // Truncate by characters but respect the byte budget.
-  // Binary-search for the character count that fits within MAX_PAYLOAD_BYTES.
+  const originalKb = Math.round(byteLength / 1024);
+  const notice = `\n[truncated: original size ${originalKb}kb]`;
   let lo = 0;
   let hi = serialized.length;
   while (lo < hi) {
     const mid = (lo + hi + 1) >>> 1;
-    if (Buffer.byteLength(serialized.slice(0, mid), "utf-8") <= MAX_PAYLOAD_BYTES) {
+    const candidate = serialized.slice(0, mid) + notice;
+    if (Buffer.byteLength(JSON.stringify(candidate), "utf-8") <= MAX_PAYLOAD_BYTES) {
       lo = mid;
     } else {
       hi = mid - 1;
     }
   }
-  const originalKb = Math.round(byteLength / 1024);
-  return serialized.slice(0, lo) + `\n[truncated: original size ${originalKb}kb]`;
+  // Never split a UTF-16 surrogate pair at the truncation boundary.
+  if (lo > 0 && lo < serialized.length) {
+    const previous = serialized.charCodeAt(lo - 1);
+    const next = serialized.charCodeAt(lo);
+    if (previous >= 0xd800 && previous <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) {
+      lo -= 1;
+    }
+  }
+  return serialized.slice(0, lo) + notice;
+}
+
+function safeJsonStringify(obj: unknown): string | undefined {
+  try {
+    return JSON.stringify(obj);
+  } catch {
+    return undefined;
+  }
+}
+
+function normalizeJsonPayload(value: unknown, seen: WeakSet<object>): unknown {
+  if (typeof value === "bigint") {
+    return "[unserializable: bigint]";
+  }
+  if (typeof value === "function") {
+    return "[unserializable: function]";
+  }
+  if (typeof value === "symbol") {
+    return "[unserializable: symbol]";
+  }
+  if (!value || typeof value !== "object") {
+    return value;
+  }
+  if (seen.has(value)) {
+    return "[unserializable: circular]";
+  }
+  if (value instanceof Date) {
+    return Number.isFinite(value.getTime()) ? value.toISOString() : String(value);
+  }
+
+  seen.add(value);
+  if (Array.isArray(value)) {
+    const normalized = value.map((item) => normalizeJsonPayload(item, seen));
+    seen.delete(value);
+    return normalized;
+  }
+
+  const normalized: Record<string, unknown> = {};
+  for (const key of Object.keys(value)) {
+    try {
+      normalized[key] = normalizeJsonPayload((value as Record<string, unknown>)[key], seen);
+    } catch {
+      normalized[key] = "[unserializable: property]";
+    }
+  }
+  seen.delete(value);
+  return normalized;
 }
 
 /**
@@ -84,21 +181,107 @@ export function isToolCallBlock(block: unknown): block is Record<string, unknown
 }
 
 /**
+ * Codex app-server mirrors reasoning items as assistant transcript rows with
+ * a stable `${turnId}:reasoning` identity. User-visible assistant text can
+ * legitimately start with "Codex reasoning:", so text alone is not a marker.
+ */
+export function isReasoningOnlyAssistantMessage(msg: SessionEntry["message"]): boolean {
+  if (msg.role !== "assistant") {
+    return false;
+  }
+  const openclaw = (msg as Record<string, unknown>).__openclaw as
+    | Record<string, unknown>
+    | undefined;
+  const mirrorIdentity = openclaw?.mirrorIdentity;
+  if (typeof mirrorIdentity === "string" && mirrorIdentity.endsWith(":reasoning")) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Codex app-server mirrors native tool calls as assistant transcript rows so
+ * OpenClaw history can show tool progress. They are not separate model calls;
+ * the turn-level token usage is attached to the final `${turnId}:assistant`.
+ */
+export function isCodexToolCallMirrorMessage(msg: SessionEntry["message"]): boolean {
+  if (msg.role !== "assistant") {
+    return false;
+  }
+  const openclaw = (msg as Record<string, unknown>).__openclaw as
+    | Record<string, unknown>
+    | undefined;
+  const mirrorIdentity = openclaw?.mirrorIdentity;
+  if (
+    typeof mirrorIdentity !== "string" ||
+    !mirrorIdentity.includes(":tool:") ||
+    !mirrorIdentity.endsWith(":call")
+  ) {
+    return false;
+  }
+  if (!Array.isArray(msg.content) || !msg.content.some((block) => isToolCallBlock(block))) {
+    return false;
+  }
+  return !hasNonZeroUsage(msg.usage as Record<string, number> | undefined);
+}
+
+export function isTranscriptOnlyAssistantMessage(msg: SessionEntry["message"]): boolean {
+  return isReasoningOnlyAssistantMessage(msg) || isCodexToolCallMirrorMessage(msg);
+}
+
+export function isTraceableAssistantEntry(entry: SessionEntry): boolean {
+  return entry.message.role === "assistant" && !isTranscriptOnlyAssistantMessage(entry.message);
+}
+
+export function isTraceContextInputEntry(entry: SessionEntry): boolean {
+  return !isTranscriptOnlyAssistantMessage(entry.message);
+}
+
+const MAX_TEXT_CONTENT_DEPTH = 32;
+
+/**
  * Extract text content from a message content field.
  * Handles both plain string content and content-block arrays.
  */
 export function extractTextContent(content: unknown): string {
+  return extractTextContentInner(content, 0, new WeakSet<object>());
+}
+
+function extractTextContentInner(content: unknown, depth: number, seen: WeakSet<object>): string {
+  if (depth > MAX_TEXT_CONTENT_DEPTH) {
+    return "";
+  }
   if (typeof content === "string") {
     return content;
   }
   if (Array.isArray(content)) {
-    return content
-      .filter(
-        (b): b is Record<string, unknown> =>
-          b !== null && typeof b === "object" && (b as Record<string, unknown>).type === "text",
-      )
-      .map((b) => String(b.text ?? ""))
+    if (seen.has(content)) {
+      return "";
+    }
+    seen.add(content);
+    const extracted = content
+      .map((block) => extractTextContentInner(block, depth + 1, seen))
+      .filter(Boolean)
       .join("\n");
+    seen.delete(content);
+    return extracted;
+  }
+  if (content && typeof content === "object") {
+    if (seen.has(content)) {
+      return "";
+    }
+    seen.add(content);
+    const block = content as Record<string, unknown>;
+    if (typeof block.text === "string") {
+      seen.delete(content);
+      return block.text;
+    }
+    if ("content" in block) {
+      const extracted = extractTextContentInner(block.content, depth + 1, seen);
+      seen.delete(content);
+      return extracted;
+    }
+    seen.delete(content);
   }
   return "";
 }
@@ -300,7 +483,9 @@ export function buildGenerationOutput(content: unknown, redactEnabled: boolean):
           type: "function",
           function: {
             name: String(block.name ?? "unknown"),
-            arguments: JSON.stringify(block.input ?? block.args ?? block.arguments ?? {}),
+            arguments: JSON.stringify(
+              redactObject(block.input ?? block.args ?? block.arguments ?? {}, redactEnabled),
+            ),
           },
         });
       }
@@ -328,13 +513,17 @@ export function extractUserMessageText(content: unknown): string {
     return "";
   }
 
-  // Look for the last line after the metadata JSON block wrapper
-  // Pattern: everything after the last "]" followed by newlines + actual text
-  const lastClosingBracket = text.lastIndexOf("```");
-  if (lastClosingBracket !== -1) {
-    const afterBlock = text.slice(lastClosingBracket + 3).trim();
+  const senderSentinel = "Sender (untrusted metadata):";
+  const senderStart = text.indexOf(senderSentinel);
+  if (senderStart !== -1) {
+    const fenceStart = text.indexOf("```json", senderStart + senderSentinel.length);
+    const fenceEnd = fenceStart === -1 ? -1 : text.indexOf("```", fenceStart + 7);
+    if (fenceEnd === -1) {
+      return text;
+    }
+    const afterBlock = text.slice(fenceEnd + 3).trim();
     // Find text after the timestamp line like "[Wed 2026-03-25 17:00 GMT+8]"
-    const tsMatch = afterBlock.match(/\[.+?\]\s*([\s\S]+)/);
+    const tsMatch = afterBlock.match(/^\[[^\]]+\]\s*([\s\S]+)/);
     if (tsMatch?.[1]?.trim()) {
       return tsMatch[1].trim();
     }
@@ -353,4 +542,82 @@ export function hasNonZeroUsage(usage: Record<string, number> | undefined): bool
     return false;
   }
   return Object.values(usage).some((v) => typeof v === "number" && v > 0);
+}
+
+export type UsageTotals = {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  total: number;
+};
+
+export function usageDetailsFromUsage(
+  usage: Record<string, number> | undefined,
+): Record<string, number> | undefined {
+  if (!hasNonZeroUsage(usage)) {
+    return undefined;
+  }
+
+  const total = usageTotalFromUsage(usage);
+  return {
+    ...(typeof usage.input === "number" ? { input: usage.input } : {}),
+    ...(typeof usage.output === "number" ? { output: usage.output } : {}),
+    ...(typeof total === "number" ? { total } : {}),
+    ...(typeof usage.cacheRead === "number" ? { cache_read_input_tokens: usage.cacheRead } : {}),
+    ...(typeof usage.cacheWrite === "number"
+      ? { cache_creation_input_tokens: usage.cacheWrite }
+      : {}),
+    ...(typeof usage.reasoningTokens === "number"
+      ? { reasoning_tokens: usage.reasoningTokens }
+      : {}),
+  };
+}
+
+export function addUsageToTotals(
+  totals: UsageTotals,
+  usage: Record<string, number> | undefined,
+): void {
+  if (!usage) {
+    return;
+  }
+
+  totals.input += usage.input ?? 0;
+  totals.output += usage.output ?? 0;
+  totals.cacheRead += usage.cacheRead ?? 0;
+  totals.cacheWrite += usage.cacheWrite ?? 0;
+  totals.total += usageTotalFromUsage(usage) ?? 0;
+}
+
+function usageTotalFromUsage(usage: Record<string, number>): number | undefined {
+  const explicitTotal = usage.totalTokens ?? usage.total;
+  if (typeof explicitTotal === "number") {
+    return explicitTotal;
+  }
+  if (typeof usage.input === "number" || typeof usage.output === "number") {
+    return (usage.input ?? 0) + (usage.output ?? 0);
+  }
+  return undefined;
+}
+
+export function findAggregateOnlyUsageEntry(
+  assistantEntries: SessionEntry[],
+  turnEntries: SessionEntry[],
+): SessionEntry | undefined {
+  if (assistantEntries.length <= 1) {
+    return undefined;
+  }
+
+  const usageEntries = assistantEntries.filter((entry) =>
+    hasNonZeroUsage(entry.message.usage as Record<string, number> | undefined),
+  );
+  if (usageEntries.length !== 1 || usageEntries[0] !== assistantEntries.at(-1)) {
+    return undefined;
+  }
+
+  const aggregateIndex = turnEntries.indexOf(usageEntries[0]);
+  const hasPriorToolResult = turnEntries
+    .slice(0, aggregateIndex)
+    .some((entry) => entry.message.role === "toolResult");
+  return hasPriorToolResult ? usageEntries[0] : undefined;
 }
