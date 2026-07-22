@@ -581,6 +581,49 @@ describe("OpenResponses HTTP API (e2e)", () => {
     }
   });
 
+  it("reconciles streamed tool narration to the final assistant payload", async () => {
+    const port = enabledPort;
+    const narration = "I'll help you create this document. Let me check the skill first.";
+    const finalAnswer = "文档已创建成功\n\nhttps://example.test/docx/final";
+
+    agentCommand.mockClear();
+    agentCommand.mockImplementationOnce((async (opts: unknown) => {
+      const runId = (opts as { runId?: string }).runId ?? "";
+      emitAgentEvent({ runId, stream: "assistant", data: { delta: narration } });
+      emitAgentEvent({ runId, stream: "assistant", data: { delta: finalAnswer } });
+      // The embedded runner can finish its lifecycle before the command promise
+      // resolves with the authoritative final payload.
+      emitAgentEvent({ runId, stream: "lifecycle", data: { phase: "end" } });
+      return { payloads: [{ text: finalAnswer }] };
+    }) as never);
+
+    const response = await postResponses(port, {
+      stream: true,
+      model: "openclaw",
+      input: "create a document",
+    });
+    expect(response.status).toBe(200);
+
+    const events = parseSseEvents(await response.text());
+    const replacement = events.find((event) => event.event === "response.output_text.replaced");
+    expect(replacement).toBeDefined();
+    expect(JSON.parse(replacement?.data ?? "{}") as Record<string, unknown>).toMatchObject({
+      content: finalAnswer,
+      reason: "assistant_reconciliation",
+    });
+
+    const done = events.find((event) => event.event === "response.output_text.done");
+    expect(JSON.parse(done?.data ?? "{}") as Record<string, unknown>).toMatchObject({
+      text: finalAnswer,
+    });
+
+    const completed = events.find((event) => event.event === "response.completed");
+    const completedPayload = JSON.parse(completed?.data ?? "{}") as {
+      response?: { output?: Array<{ content?: Array<{ text?: string }> }> };
+    };
+    expect(completedPayload.response?.output?.[0]?.content?.[0]?.text).toBe(finalAnswer);
+  });
+
   it("blocks unsafe URL-based file/image inputs", async () => {
     const port = enabledPort;
     agentCommand.mockClear();

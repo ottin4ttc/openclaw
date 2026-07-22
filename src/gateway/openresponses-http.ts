@@ -184,6 +184,18 @@ function extractUsageFromResult(result: unknown): Usage {
   );
 }
 
+function extractFinalPayloadText(result: unknown): string | undefined {
+  const payloads = (result as { payloads?: Array<{ text?: string }> } | null)?.payloads;
+  if (!Array.isArray(payloads)) {
+    return undefined;
+  }
+  const text = payloads
+    .map((payload) => (typeof payload.text === "string" ? payload.text : ""))
+    .filter(Boolean)
+    .join("\n\n");
+  return text || undefined;
+}
+
 type PendingToolCall = { id: string; name: string; arguments: string };
 
 function resolveStopReasonAndPendingToolCalls(meta: unknown): {
@@ -621,6 +633,12 @@ export async function handleOpenResponsesHttpRequest(
     maybeFinalize();
   };
 
+  const replaceRequestedFinalText = (text: string) => {
+    if (finalizeRequested) {
+      finalizeRequested.text = text;
+    }
+  };
+
   // Send initial events
   const initialResponse = createResponseResource({
     id: responseId,
@@ -709,6 +727,20 @@ export async function handleOpenResponsesHttpRequest(
         messageChannel,
         deps,
       });
+
+      const finalPayloadText = extractFinalPayloadText(result);
+      if (sawAssistantDelta && finalPayloadText && finalPayloadText !== accumulatedText) {
+        accumulatedText = finalPayloadText;
+        replaceRequestedFinalText(finalPayloadText);
+        writeSseEvent(res, {
+          type: "response.output_text.replaced",
+          item_id: outputItemId,
+          output_index: 0,
+          content_index: 0,
+          content: finalPayloadText,
+          reason: "assistant_reconciliation",
+        });
+      }
 
       finalUsage = extractUsageFromResult(result);
       maybeFinalize();
