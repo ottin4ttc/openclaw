@@ -458,7 +458,7 @@ describe("OpenResponses HTTP API (e2e)", () => {
       expect(usageJson.usage).toEqual({ input_tokens: 3, output_tokens: 5, total_tokens: 10 });
       await ensureResponseConsumed(resUsage);
 
-      mockAgentOnce([{ text: "hello" }]);
+      mockAgentOnce([{ text: "Let me check the skill." }, { text: "hello" }]);
       const resShape = await postResponses(port, {
         stream: false,
         model: "openclaw",
@@ -542,7 +542,7 @@ describe("OpenResponses HTTP API (e2e)", () => {
 
       agentCommand.mockClear();
       agentCommand.mockResolvedValueOnce({
-        payloads: [{ text: "hello" }],
+        payloads: [{ text: "Let me check the skill." }, { text: "hello" }],
       } as never);
 
       const resFallback = await postResponses(port, {
@@ -554,6 +554,7 @@ describe("OpenResponses HTTP API (e2e)", () => {
       const fallbackText = await resFallback.text();
       expect(fallbackText).toContain("[DONE]");
       expect(fallbackText).toContain("hello");
+      expect(fallbackText).not.toContain("Let me check the skill.");
 
       agentCommand.mockClear();
       agentCommand.mockResolvedValueOnce({
@@ -594,7 +595,9 @@ describe("OpenResponses HTTP API (e2e)", () => {
       // The embedded runner can finish its lifecycle before the command promise
       // resolves with the authoritative final payload.
       emitAgentEvent({ runId, stream: "lifecycle", data: { phase: "end" } });
-      return { payloads: [{ text: finalAnswer }] };
+      // The embedded runner returns one payload per assistant message, including
+      // tool-call preambles. The Responses adapter must select the final reply.
+      return { payloads: [{ text: narration }, { text: finalAnswer }] };
     }) as never);
 
     const response = await postResponses(port, {
