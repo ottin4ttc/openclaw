@@ -88,6 +88,8 @@ export type EmbeddedPiSubscribeContext = {
   blockChunker: EmbeddedBlockChunker | null;
   hookRunner?: HookRunner;
   noteLastAssistant: (msg: AgentMessage) => void;
+  noteAgentEnd: () => void;
+  queueToolEventTask: (toolCallId: string, task: () => Promise<void>) => void;
 
   shouldEmitToolResult: () => boolean;
   shouldEmitToolOutput: () => boolean;
