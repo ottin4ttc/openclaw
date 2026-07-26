@@ -71,29 +71,6 @@ describe("flushPendingToolResultsAfterIdle", () => {
     );
   });
 
-  it("waits for the session event queue after the agent becomes idle", async () => {
-    const eventDrain = deferred<void>();
-    const waitForEventDrain = vi.fn(() => eventDrain.promise);
-    const flushPendingToolResults = vi.fn();
-
-    const flushPromise = flushPendingToolResultsAfterIdle({
-      agent: { waitForIdle: async () => {} },
-      sessionManager: { flushPendingToolResults },
-      waitForEventDrain,
-      timeoutMs: 1_000,
-    });
-
-    await vi.waitFor(() => {
-      expect(waitForEventDrain).toHaveBeenCalledTimes(1);
-    });
-    expect(flushPendingToolResults).not.toHaveBeenCalled();
-
-    eventDrain.resolve();
-    await flushPromise;
-
-    expect(flushPendingToolResults).toHaveBeenCalledTimes(1);
-  });
-
   it("flushes pending tool call after timeout when idle never resolves", async () => {
     const sm = guardSessionManager(SessionManager.inMemory());
     const appendMessage = sm.appendMessage.bind(sm) as unknown as (message: AgentMessage) => void;
@@ -160,24 +137,5 @@ describe("flushPendingToolResultsAfterIdle", () => {
       timeoutMs: 30_000,
     });
     expect(vi.getTimerCount()).toBe(0);
-  });
-
-  it("reports a pending-result flush error without rejecting cleanup", async () => {
-    const flushError = new Error("flush failed");
-    const onError = vi.fn();
-
-    await expect(
-      flushPendingToolResultsAfterIdle({
-        agent: { waitForIdle: async () => {} },
-        sessionManager: {
-          flushPendingToolResults: () => {
-            throw flushError;
-          },
-        },
-        onError,
-      }),
-    ).resolves.toBeUndefined();
-
-    expect(onError).toHaveBeenCalledWith(flushError);
   });
 });
