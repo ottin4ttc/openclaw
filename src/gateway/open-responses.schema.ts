@@ -348,6 +348,15 @@ export const OutputTextDoneEventSchema = z.object({
   text: z.string(),
 });
 
+export const OutputTextReplacedEventSchema = z.object({
+  type: z.literal("response.output_text.replaced"),
+  item_id: z.string(),
+  output_index: z.number().int().nonnegative(),
+  content_index: z.number().int().nonnegative(),
+  content: z.string(),
+  reason: z.string(),
+});
+
 export type StreamingEvent =
   | z.infer<typeof ResponseCreatedEventSchema>
   | z.infer<typeof ResponseInProgressEventSchema>
@@ -358,4 +367,5 @@ export type StreamingEvent =
   | z.infer<typeof ContentPartAddedEventSchema>
   | z.infer<typeof ContentPartDoneEventSchema>
   | z.infer<typeof OutputTextDeltaEventSchema>
+  | z.infer<typeof OutputTextReplacedEventSchema>
   | z.infer<typeof OutputTextDoneEventSchema>;

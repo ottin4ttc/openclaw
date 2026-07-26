@@ -34,18 +34,30 @@ export function createEmbeddedPiSessionEventHandler(ctx: EmbeddedPiSubscribeCont
       case "tool_execution_start":
         // Async handler - best-effort typing indicator, avoids blocking tool summaries.
         // Catch rejections to avoid unhandled promise rejection crashes.
-        handleToolExecutionStart(ctx, evt as never).catch((err) => {
-          ctx.log.debug(`tool_execution_start handler failed: ${String(err)}`);
-        });
+        ctx.queueToolEventTask(
+          String(
+            (evt as Extract<EmbeddedPiSubscribeEvent, { type: "tool_execution_start" }>).toolCallId,
+          ),
+          () =>
+            handleToolExecutionStart(ctx, evt as never).catch((err) => {
+              ctx.log.debug(`tool_execution_start handler failed: ${String(err)}`);
+            }),
+        );
         return;
       case "tool_execution_update":
         handleToolExecutionUpdate(ctx, evt as never);
         return;
       case "tool_execution_end":
         // Async handler - best-effort, non-blocking
-        handleToolExecutionEnd(ctx, evt as never).catch((err) => {
-          ctx.log.debug(`tool_execution_end handler failed: ${String(err)}`);
-        });
+        ctx.queueToolEventTask(
+          String(
+            (evt as Extract<EmbeddedPiSubscribeEvent, { type: "tool_execution_end" }>).toolCallId,
+          ),
+          () =>
+            handleToolExecutionEnd(ctx, evt as never).catch((err) => {
+              ctx.log.debug(`tool_execution_end handler failed: ${String(err)}`);
+            }),
+        );
         return;
       case "agent_start":
         handleAgentStart(ctx);
@@ -57,6 +69,7 @@ export function createEmbeddedPiSessionEventHandler(ctx: EmbeddedPiSubscribeCont
         handleAutoCompactionEnd(ctx, evt as never);
         return;
       case "agent_end":
+        ctx.noteAgentEnd();
         handleAgentEnd(ctx);
         return;
       default:

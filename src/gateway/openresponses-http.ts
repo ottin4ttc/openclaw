@@ -184,6 +184,32 @@ function extractUsageFromResult(result: unknown): Usage {
   );
 }
 
+function extractFinalPayloadText(result: unknown): string | undefined {
+  const payloads = (result as { payloads?: Array<{ text?: string; isError?: boolean }> } | null)
+    ?.payloads;
+  if (!Array.isArray(payloads)) {
+    return undefined;
+  }
+
+  // The embedded runner returns one payload per assistant message in the tool
+  // loop. Earlier payloads are tool-call preambles; the last non-error text is
+  // the user-facing final assistant reply.
+  for (let index = payloads.length - 1; index >= 0; index -= 1) {
+    const payload = payloads[index];
+    if (payload?.isError !== true && typeof payload?.text === "string" && payload.text) {
+      return payload.text;
+    }
+  }
+
+  for (let index = payloads.length - 1; index >= 0; index -= 1) {
+    const text = payloads[index]?.text;
+    if (typeof text === "string" && text) {
+      return text;
+    }
+  }
+  return undefined;
+}
+
 type PendingToolCall = { id: string; name: string; arguments: string };
 
 function resolveStopReasonAndPendingToolCalls(meta: unknown): {
@@ -483,7 +509,6 @@ export async function handleOpenResponsesHttpRequest(
         deps,
       });
 
-      const payloads = (result as { payloads?: Array<{ text?: string }> } | null)?.payloads;
       const usage = extractUsageFromResult(result);
       const meta = (result as { meta?: unknown } | null)?.meta;
       const { stopReason, pendingToolCalls } = resolveStopReasonAndPendingToolCalls(meta);
@@ -511,13 +536,7 @@ export async function handleOpenResponsesHttpRequest(
         return true;
       }
 
-      const content =
-        Array.isArray(payloads) && payloads.length > 0
-          ? payloads
-              .map((p) => (typeof p.text === "string" ? p.text : ""))
-              .filter(Boolean)
-              .join("\n\n")
-          : "No response from OpenClaw.";
+      const content = extractFinalPayloadText(result) ?? "No response from OpenClaw.";
 
       const response = createResponseResource({
         id: responseId,
@@ -621,6 +640,12 @@ export async function handleOpenResponsesHttpRequest(
     maybeFinalize();
   };
 
+  const replaceRequestedFinalText = (text: string) => {
+    if (finalizeRequested) {
+      finalizeRequested.text = text;
+    }
+  };
+
   // Send initial events
   const initialResponse = createResponseResource({
     id: responseId,
@@ -710,6 +735,20 @@ export async function handleOpenResponsesHttpRequest(
         deps,
       });
 
+      const finalPayloadText = extractFinalPayloadText(result);
+      if (sawAssistantDelta && finalPayloadText && finalPayloadText !== accumulatedText) {
+        accumulatedText = finalPayloadText;
+        replaceRequestedFinalText(finalPayloadText);
+        writeSseEvent(res, {
+          type: "response.output_text.replaced",
+          item_id: outputItemId,
+          output_index: 0,
+          content_index: 0,
+          content: finalPayloadText,
+          reason: "assistant_reconciliation",
+        });
+      }
+
       finalUsage = extractUsageFromResult(result);
       maybeFinalize();
 
@@ -719,8 +758,7 @@ export async function handleOpenResponsesHttpRequest(
 
       // Fallback: if no streaming deltas were received, send the full response
       if (!sawAssistantDelta) {
-        const resultAny = result as { payloads?: Array<{ text?: string }>; meta?: unknown };
-        const payloads = resultAny.payloads;
+        const resultAny = result as { meta?: unknown };
         const meta = resultAny.meta;
         const { stopReason, pendingToolCalls } = resolveStopReasonAndPendingToolCalls(meta);
 
@@ -789,13 +827,7 @@ export async function handleOpenResponsesHttpRequest(
           return;
         }
 
-        const content =
-          Array.isArray(payloads) && payloads.length > 0
-            ? payloads
-                .map((p) => (typeof p.text === "string" ? p.text : ""))
-                .filter(Boolean)
-                .join("\n\n")
-            : "No response from OpenClaw.";
+        const content = extractFinalPayloadText(result) ?? "No response from OpenClaw.";
 
         accumulatedText = content;
         sawAssistantDelta = true;
