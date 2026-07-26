@@ -1072,7 +1072,6 @@ export async function runEmbeddedAttempt(
 
     let sessionManager: ReturnType<typeof guardSessionManager> | undefined;
     let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
-    let subscription: ReturnType<typeof subscribeEmbeddedPiSession> | undefined;
     let removeToolResultContextGuard: (() => void) | undefined;
     try {
       await repairSessionFileIfNeeded({
@@ -1514,7 +1513,7 @@ export async function runEmbeddedAttempt(
         });
       };
 
-      const activeSubscription = subscribeEmbeddedPiSession({
+      const subscription = subscribeEmbeddedPiSession({
         session: activeSession,
         runId: params.runId,
         hookRunner: getGlobalHookRunner() ?? undefined,
@@ -1539,11 +1538,11 @@ export async function runEmbeddedAttempt(
         sessionId: params.sessionId,
         agentId: sessionAgentId,
       });
-      subscription = activeSubscription;
 
       const {
         assistantTexts,
         toolMetas,
+        unsubscribe,
         waitForCompactionRetry,
         isCompactionInFlight,
         getMessagingToolSentTexts,
@@ -1554,14 +1553,14 @@ export async function runEmbeddedAttempt(
         getLastToolError,
         getUsageTotals,
         getCompactionCount,
-      } = activeSubscription;
+      } = subscription;
 
       const queueHandle: EmbeddedPiQueueHandle = {
         queueMessage: async (text: string) => {
           await activeSession.steer(text);
         },
         isStreaming: () => activeSession.isStreaming,
-        isCompacting: () => activeSubscription.isCompacting(),
+        isCompacting: () => subscription.isCompacting(),
         abort: abortRun,
       };
       setActiveEmbeddedRun(params.sessionId, queueHandle, params.sessionKey);
@@ -1578,7 +1577,7 @@ export async function runEmbeddedAttempt(
           if (
             shouldFlagCompactionTimeout({
               isTimeout: true,
-              isCompactionPendingOrRetrying: activeSubscription.isCompacting(),
+              isCompactionPendingOrRetrying: subscription.isCompacting(),
               isCompactionInFlight: activeSession.isCompacting,
             })
           ) {
@@ -1609,7 +1608,7 @@ export async function runEmbeddedAttempt(
         if (
           shouldFlagCompactionTimeout({
             isTimeout: timeout,
-            isCompactionPendingOrRetrying: activeSubscription.isCompacting(),
+            isCompactionPendingOrRetrying: subscription.isCompacting(),
             isCompactionInFlight: activeSession.isCompacting,
           })
         ) {
@@ -2003,6 +2002,16 @@ export async function runEmbeddedAttempt(
             `run cleanup: runId=${params.runId} sessionId=${params.sessionId} aborted=${aborted} timedOut=${timedOut}`,
           );
         }
+        try {
+          unsubscribe();
+        } catch (err) {
+          // unsubscribe() should never throw; if it does, it indicates a serious bug.
+          // Log at error level to ensure visibility, but don't rethrow in finally block
+          // as it would mask any exception from the try block above.
+          log.error(
+            `CRITICAL: unsubscribe failed, possible resource leak: runId=${params.runId} ${String(err)}`,
+          );
+        }
         clearActiveEmbeddedRun(params.sessionId, queueHandle, params.sessionKey);
         params.abortSignal?.removeEventListener?.("abort", onAbort);
       }
@@ -2082,45 +2091,15 @@ export async function runEmbeddedAttempt(
       // flushPendingToolResults() fires while tools are still executing, inserting
       // synthetic "missing tool result" errors and causing silent agent failures.
       // See: https://github.com/openclaw/openclaw/issues/8643
-      try {
-        removeToolResultContextGuard?.();
-      } catch (err) {
-        log.warn(`tool result context guard cleanup failed: runId=${params.runId} ${String(err)}`);
-      }
-      const sessionToDrain = session;
-      const subscriptionToDrain = subscription;
-      try {
-        await flushPendingToolResultsAfterIdle({
-          agent: sessionToDrain?.agent,
-          sessionManager,
-          waitForEventDrain: subscriptionToDrain
-            ? () => subscriptionToDrain.waitForEventDrain()
-            : undefined,
-          clearPendingOnTimeout: true,
-          onError: (err) => {
-            log.warn(`pending tool result cleanup failed: runId=${params.runId} ${String(err)}`);
-          },
-        });
-      } finally {
-        try {
-          subscriptionToDrain?.unsubscribe();
-        } catch (err) {
-          // Log at error level without masking the original attempt result.
-          log.error(
-            `CRITICAL: unsubscribe failed, possible resource leak: runId=${params.runId} ${String(err)}`,
-          );
-        } finally {
-          try {
-            session?.dispose();
-          } finally {
-            try {
-              releaseWsSession(params.sessionId);
-            } finally {
-              await sessionLock.release();
-            }
-          }
-        }
-      }
+      removeToolResultContextGuard?.();
+      await flushPendingToolResultsAfterIdle({
+        agent: session?.agent,
+        sessionManager,
+        clearPendingOnTimeout: true,
+      });
+      session?.dispose();
+      releaseWsSession(params.sessionId);
+      await sessionLock.release();
     }
   } finally {
     restoreSkillEnv?.();

@@ -14,7 +14,6 @@ import {
 import { createEmbeddedPiSessionEventHandler } from "./pi-embedded-subscribe.handlers.js";
 import type {
   EmbeddedPiSubscribeContext,
-  EmbeddedPiSubscribeEvent,
   EmbeddedPiSubscribeState,
 } from "./pi-embedded-subscribe.handlers.types.js";
 import { filterToolResultMediaUrls } from "./pi-embedded-subscribe.tools.js";
@@ -89,11 +88,6 @@ export function subscribeEmbeddedPiSession(params: SubscribeEmbeddedPiSessionPar
     total: 0,
   };
   let compactionCount = 0;
-  let emittedAgentEndCount = 0;
-  let processedAgentEndCount = 0;
-  const eventDrainWaiters = new Map<number, Set<() => void>>();
-  const pendingEventTasks = new Set<Promise<void>>();
-  const toolEventTaskTails = new Map<string, Promise<void>>();
 
   const assistantTexts = state.assistantTexts;
   const toolMetas = state.toolMetas;
@@ -614,88 +608,6 @@ export function subscribeEmbeddedPiSession(params: SubscribeEmbeddedPiSessionPar
       state.lastAssistant = msg;
     }
   };
-  const noteAgentEnd = () => {
-    processedAgentEndCount += 1;
-    for (const [targetCount, waiters] of eventDrainWaiters) {
-      if (targetCount > processedAgentEndCount) {
-        continue;
-      }
-      eventDrainWaiters.delete(targetCount);
-      for (const resolve of waiters) {
-        resolve();
-      }
-    }
-  };
-  const waitForAgentEnd = (targetCount: number): Promise<void> => {
-    if (processedAgentEndCount >= targetCount || state.unsubscribed) {
-      return Promise.resolve();
-    }
-    return new Promise<void>((resolve) => {
-      const waiters = eventDrainWaiters.get(targetCount) ?? new Set<() => void>();
-      waiters.add(resolve);
-      eventDrainWaiters.set(targetCount, waiters);
-    });
-  };
-  const getSessionEventQueue = (): Promise<unknown> | undefined =>
-    (
-      params.session as unknown as {
-        _agentEventQueue?: Promise<unknown>;
-      }
-    )._agentEventQueue;
-  const trackEventTask = (task: Promise<void>) => {
-    pendingEventTasks.add(task);
-    void task.finally(() => {
-      pendingEventTasks.delete(task);
-    });
-  };
-  const queueToolEventTask = (toolCallId: string, taskFactory: () => Promise<void>) => {
-    if (!params.onBlockReplyFlush) {
-      trackEventTask(taskFactory());
-      return;
-    }
-    const previousTask = toolEventTaskTails.get(toolCallId);
-    const task = previousTask ? previousTask.catch(() => {}).then(taskFactory) : taskFactory();
-    toolEventTaskTails.set(toolCallId, task);
-    trackEventTask(task);
-    void task.then(
-      () => {
-        if (toolEventTaskTails.get(toolCallId) === task) {
-          toolEventTaskTails.delete(toolCallId);
-        }
-      },
-      () => {
-        if (toolEventTaskTails.get(toolCallId) === task) {
-          toolEventTaskTails.delete(toolCallId);
-        }
-      },
-    );
-  };
-  const waitForEventDrain = async (): Promise<void> => {
-    if (state.unsubscribed) {
-      return;
-    }
-    while (!state.unsubscribed) {
-      // pi-coding-agent 0.57.1 exposes no public queue-drain API. Waiting for
-      // its actual queue tail is necessary because retry/compaction runs after
-      // AgentSession broadcasts agent_end to subscribers.
-      const queueTail = getSessionEventQueue();
-      if (queueTail) {
-        await queueTail;
-      } else {
-        await waitForAgentEnd(emittedAgentEndCount);
-      }
-      while (pendingEventTasks.size > 0) {
-        await Promise.allSettled(Array.from(pendingEventTasks));
-      }
-      if (
-        getSessionEventQueue() === queueTail &&
-        processedAgentEndCount >= emittedAgentEndCount &&
-        pendingEventTasks.size === 0
-      ) {
-        return;
-      }
-    }
-  };
 
   const ctx: EmbeddedPiSubscribeContext = {
     params,
@@ -705,8 +617,6 @@ export function subscribeEmbeddedPiSession(params: SubscribeEmbeddedPiSessionPar
     blockChunker,
     hookRunner: params.hookRunner,
     noteLastAssistant,
-    noteAgentEnd,
-    queueToolEventTask,
     shouldEmitToolResult,
     shouldEmitToolOutput,
     emitToolSummary,
@@ -732,16 +642,6 @@ export function subscribeEmbeddedPiSession(params: SubscribeEmbeddedPiSessionPar
   };
 
   const sessionUnsubscribe = params.session.subscribe(createEmbeddedPiSessionEventHandler(ctx));
-  const agentUnsubscribe =
-    (
-      params.session as unknown as {
-        agent?: { subscribe?: (listener: (event: EmbeddedPiSubscribeEvent) => void) => () => void };
-      }
-    ).agent?.subscribe?.((event) => {
-      if (event.type === "agent_end") {
-        emittedAgentEndCount += 1;
-      }
-    }) ?? (() => {});
 
   const unsubscribe = () => {
     if (state.unsubscribed) {
@@ -773,24 +673,13 @@ export function subscribeEmbeddedPiSession(params: SubscribeEmbeddedPiSessionPar
         log.warn(`unsubscribe: compaction abort failed runId=${params.runId} err=${String(err)}`);
       }
     }
-    for (const waiters of eventDrainWaiters.values()) {
-      for (const resolve of waiters) {
-        resolve();
-      }
-    }
-    eventDrainWaiters.clear();
-    try {
-      sessionUnsubscribe();
-    } finally {
-      agentUnsubscribe();
-    }
+    sessionUnsubscribe();
   };
 
   return {
     assistantTexts,
     toolMetas,
     unsubscribe,
-    waitForEventDrain,
     isCompacting: () => state.compactionInFlight || state.pendingCompactionRetry > 0,
     isCompactionInFlight: () => state.compactionInFlight,
     getMessagingToolSentTexts: () => messagingToolSentTexts.slice(),

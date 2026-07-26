@@ -9,26 +9,27 @@ type ToolResultFlushManager = {
 
 export const DEFAULT_WAIT_FOR_IDLE_TIMEOUT_MS = 30_000;
 
-async function waitForPromiseBestEffort(
-  waitForPromise: (() => Promise<void>) | undefined,
+async function waitForAgentIdleBestEffort(
+  agent: IdleAwareAgent | null | undefined,
   timeoutMs: number,
 ): Promise<boolean> {
-  if (!waitForPromise) {
+  const waitForIdle = agent?.waitForIdle;
+  if (typeof waitForIdle !== "function") {
     return false;
   }
 
-  const resolved = Symbol("resolved");
-  const timedOut = Symbol("timeout");
+  const idleResolved = Symbol("idle");
+  const idleTimedOut = Symbol("timeout");
   let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
   try {
     const outcome = await Promise.race([
-      waitForPromise().then(() => resolved),
+      waitForIdle.call(agent).then(() => idleResolved),
       new Promise<symbol>((resolve) => {
-        timeoutHandle = setTimeout(() => resolve(timedOut), timeoutMs);
+        timeoutHandle = setTimeout(() => resolve(idleTimedOut), timeoutMs);
         timeoutHandle.unref?.();
       }),
     ]);
-    return outcome === timedOut;
+    return outcome === idleTimedOut;
   } catch {
     // Best-effort during cleanup.
     return false;
@@ -42,37 +43,16 @@ async function waitForPromiseBestEffort(
 export async function flushPendingToolResultsAfterIdle(opts: {
   agent: IdleAwareAgent | null | undefined;
   sessionManager: ToolResultFlushManager | null | undefined;
-  waitForEventDrain?: () => Promise<void>;
   timeoutMs?: number;
   clearPendingOnTimeout?: boolean;
-  onError?: (error: unknown) => void;
 }): Promise<void> {
-  const timeoutMs = opts.timeoutMs ?? DEFAULT_WAIT_FOR_IDLE_TIMEOUT_MS;
-  const waitForIdle = opts.agent?.waitForIdle;
-  let timedOut = await waitForPromiseBestEffort(
-    typeof waitForIdle === "function" ? () => waitForIdle.call(opts.agent) : undefined,
-    timeoutMs,
+  const timedOut = await waitForAgentIdleBestEffort(
+    opts.agent,
+    opts.timeoutMs ?? DEFAULT_WAIT_FOR_IDLE_TIMEOUT_MS,
   );
-  if (!timedOut) {
-    timedOut = await waitForPromiseBestEffort(opts.waitForEventDrain, timeoutMs);
-  }
-  const runFlushAction = (action: (() => void) | undefined) => {
-    if (!action) {
-      return;
-    }
-    try {
-      action();
-    } catch (error) {
-      try {
-        opts.onError?.(error);
-      } catch {
-        // Cleanup remains best-effort even if its observer fails.
-      }
-    }
-  };
   if (timedOut && opts.clearPendingOnTimeout && opts.sessionManager?.clearPendingToolResults) {
-    runFlushAction(() => opts.sessionManager?.clearPendingToolResults?.());
+    opts.sessionManager.clearPendingToolResults();
     return;
   }
-  runFlushAction(() => opts.sessionManager?.flushPendingToolResults?.());
+  opts.sessionManager?.flushPendingToolResults?.();
 }
