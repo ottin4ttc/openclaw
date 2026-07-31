@@ -88,6 +88,7 @@ export async function activateCodexAttemptTurn(
       trajectoryRecorder,
       onNativeToolResultRecorded: maybeAnnounceFastModeAutoOff,
       upstreamUserText: turnState.codexTurnPromptText,
+      suppressNativeToolLifecycleDiagnostics: Boolean(connection.rolloutTraceRoot),
       onContextCompacted: () => {
         computerContextEpoch.value += 1;
         delete computerContextEpoch.frameToolCallId;

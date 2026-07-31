@@ -1867,6 +1867,51 @@ describe("native hook relay registry", () => {
     expect(onPreToolUseFailure).toHaveBeenCalledTimes(1);
   });
 
+  it("settles pending native pre-tool failure projections on demand", async () => {
+    let releaseProjection: () => void = () => undefined;
+    const projectionPending = new Promise<void>((resolve) => {
+      releaseProjection = resolve;
+    });
+    const onPreToolUseFailure = vi.fn(() => projectionPending);
+    const beforeToolCall = vi.fn(async () => {
+      throw new Error("hook crashed");
+    });
+    initializeGlobalHookRunner(
+      createMockPluginRegistry([{ hookName: "before_tool_call", handler: beforeToolCall }]),
+    );
+    const relay = registerNativeHookRelay({
+      provider: "codex",
+      sessionId: "session-1",
+      runId: "run-1",
+      onPreToolUseFailure,
+    });
+
+    await expect(
+      invokeNativeHookRelay({
+        provider: "codex",
+        relayId: relay.relayId,
+        event: "pre_tool_use",
+        rawPayload: {
+          hook_event_name: "PreToolUse",
+          tool_name: "exec_command",
+          tool_use_id: "native-settle-projection",
+          tool_input: { cmd: "pnpm test" },
+        },
+      }),
+    ).resolves.toMatchObject({ failureDisposition: "failed" });
+
+    let settled = false;
+    const settle = relay.settlePreToolUseFailureProjections().then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    releaseProjection();
+    await settle;
+    expect(settled).toBe(true);
+  });
+
   it("leaves report-mode pre-tool failure projection to the approval owner", async () => {
     const onPreToolUseFailure = vi.fn();
     const beforeToolCall = vi.fn(async () => {

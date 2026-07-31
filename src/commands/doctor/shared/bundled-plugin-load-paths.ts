@@ -52,6 +52,7 @@ export function scanBundledPluginLoadPathMigrations(
   }
 
   const bundledPathMap = new Map<string, { pluginId: string; toPath: string }>();
+  const samePackageRootAliasMap = new Map<string, { pluginId: string; toPath: string }>();
   const packagedBundledLeafMap = new Map<string, { pluginId: string; toPath: string }>();
   for (const source of bundled.values()) {
     for (const alias of buildBundledPluginLoadPathAliases(source.localPath)) {
@@ -61,6 +62,16 @@ export function scanBundledPluginLoadPathMigrations(
       });
     }
     const packaged = parsePackagedBundledPluginPath(source.localPath);
+    const sourceLayout = packaged ?? parseLegacyBundledPluginPath(source.localPath);
+    if (sourceLayout) {
+      samePackageRootAliasMap.set(
+        normalizeBundledLookupPath(path.join(sourceLayout.packageRoot, sourceLayout.bundledLeaf)),
+        {
+          pluginId: source.pluginId,
+          toPath: source.localPath,
+        },
+      );
+    }
     if (packaged) {
       packagedBundledLeafMap.set(normalizeBundledLookupPath(packaged.bundledLeaf), {
         pluginId: source.pluginId,
@@ -75,7 +86,7 @@ export function scanBundledPluginLoadPathMigrations(
       continue;
     }
     const normalized = normalizeBundledLookupPath(resolveUserPath(rawPath, env));
-    const match = bundledPathMap.get(normalized);
+    const match = bundledPathMap.get(normalized) ?? samePackageRootAliasMap.get(normalized);
     if (!match) {
       const oldPackaged = parsePackagedBundledPluginPath(normalized);
       const oldLegacy = oldPackaged ? null : parseLegacyBundledPluginPath(normalized);

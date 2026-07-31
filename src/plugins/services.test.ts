@@ -514,6 +514,14 @@ describe("startPluginServices", () => {
 
     expect(conversationAuthorizedContexts[0]?.internalDiagnostics?.onEvent).toBeTypeOf("function");
     expect(conversationAuthorizedContexts[0]?.internalDiagnostics?.emit).toBeTypeOf("function");
+    const internalDelivery = conversationAuthorizedContexts[0]?.internalDiagnostics as
+      | {
+          captureDeliveryCursor?: unknown;
+          waitForDeliveryCursor?: unknown;
+        }
+      | undefined;
+    expect(internalDelivery?.captureDeliveryCursor).toBeTypeOf("function");
+    expect(internalDelivery?.waitForDeliveryCursor).toBeTypeOf("function");
 
     const untrustedContexts: OpenClawPluginServiceContext[] = [];
     const untrustedService = createTrackingService("diagnostics-otel", {

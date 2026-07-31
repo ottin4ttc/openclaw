@@ -84,6 +84,18 @@ describe("Codex ring-zero thread config", () => {
   });
 });
 
+describe("Codex thread source", () => {
+  it("marks user-initiated threads like Codex CLI and TUI", () => {
+    const start = buildThreadStartParams(createAttemptParams({ provider: "openai" }), {
+      appServer: createAppServerOptions() as never,
+      cwd: "/repo",
+      dynamicTools: [],
+    });
+
+    expect(start.threadSource).toBe("user");
+  });
+});
+
 describe("Codex delegation capability", () => {
   it("disables native delegation on start and resume without disabling other tools", () => {
     const params = createAttemptParams({ provider: "openai" });
@@ -1438,6 +1450,51 @@ describe("Codex app-server model provider selection", () => {
 
     expect(request.model).toBe("local-model");
     expect(request.modelProvider).toBe("lmstudio");
+  });
+
+  it("splits configured custom providers after the Codex provider folds into openai", () => {
+    const params = createAttemptParams({
+      provider: "openai",
+      modelId: "clawos/gpt-5.6-sol",
+    });
+    params.config = {
+      models: {
+        providers: {
+          clawos: {
+            baseUrl: "https://relay.example.test/v1",
+            models: [],
+          },
+        },
+      },
+    };
+
+    const request = buildThreadStartParams(params, {
+      cwd: "/repo",
+      dynamicTools: [],
+      appServer: createAppServerOptions() as never,
+      developerInstructions: "test instructions",
+    });
+
+    expect(request.model).toBe("gpt-5.6-sol");
+    expect(request.modelProvider).toBe("clawos");
+  });
+
+  it("keeps unconfigured OpenAI slashy model ids on the openai provider", () => {
+    const request = buildThreadStartParams(
+      createAttemptParams({
+        provider: "openai",
+        modelId: "owner/slashy-model",
+      }),
+      {
+        cwd: "/repo",
+        dynamicTools: [],
+        appServer: createAppServerOptions() as never,
+        developerInstructions: "test instructions",
+      },
+    );
+
+    expect(request.model).toBe("owner/slashy-model");
+    expect(request.modelProvider).toBe("openai");
   });
 
   it("uses provider-qualified model refs for thread capability selection", () => {

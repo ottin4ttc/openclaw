@@ -67,6 +67,7 @@ type EmbeddedAttemptPromptContext = {
   currentUserTimestampOverride?: CurrentUserTimestampOverride;
   effectivePrompt: string;
   hookMessagesForCurrentPrompt: AgentMessage[];
+  priorMessagesForHook: AgentMessage[];
   llmBoundaryPromptForPrecheck: string;
   prePromptMessageCount: number;
   promptForModel: string;
@@ -258,6 +259,7 @@ export function prepareEmbeddedAttemptPromptContext(input: {
     ...(currentUserTimestampOverride ? { currentUserTimestampOverride } : {}),
     effectivePrompt: input.prompt.effectivePrompt,
     hookMessagesForCurrentPrompt,
+    priorMessagesForHook: sessionMessages,
     llmBoundaryPromptForPrecheck,
     prePromptMessageCount,
     promptForModel,

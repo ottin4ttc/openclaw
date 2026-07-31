@@ -8,10 +8,13 @@ import {
 } from "openclaw/plugin-sdk/agent-harness-runtime";
 import {
   onInternalDiagnosticEvent,
+  waitForDiagnosticEventsDrained,
   type DiagnosticEventPayload,
 } from "openclaw/plugin-sdk/diagnostic-runtime";
+import { initializeGlobalHookRunner } from "openclaw/plugin-sdk/hook-runtime";
 import {
   createEmptyPluginRegistry,
+  createMockPluginRegistry,
   setActivePluginRegistry,
 } from "openclaw/plugin-sdk/plugin-test-runtime";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -808,6 +811,185 @@ describe("runCodexAppServerAttempt native hook relay", () => {
     expect(startConfig?.["hooks.PostToolUse"]).toEqual([]);
     expect(startConfig?.["hooks.PermissionRequest"]).toEqual([]);
     expect(startConfig?.["hooks.Stop"]).toEqual([]);
+  });
+
+  it("settles late item-less native failures before capturing the diagnostic barrier", async () => {
+    initializeGlobalHookRunner(
+      createMockPluginRegistry([
+        {
+          hookName: "before_tool_call",
+          handler: async () => {
+            throw new Error("hook crashed");
+          },
+        },
+      ]),
+    );
+    const sessionFile = path.join(tempDir, "session.jsonl");
+    const workspaceDir = path.join(tempDir, "workspace");
+    const diagnosticEvents: DiagnosticEventPayload[] = [];
+    const unsubscribeDiagnostics = onInternalDiagnosticEvent((event) =>
+      diagnosticEvents.push(event),
+    );
+    const capture = vi.fn(() => ({}));
+    const params = createParams(sessionFile, workspaceDir);
+    (
+      params as typeof params & {
+        internalDiagnosticDelivery: {
+          capture: () => unknown;
+          fail: () => void;
+          waitFor: () => Promise<{ ok: true; deliveredEvents: number }>;
+        };
+      }
+    ).internalDiagnosticDelivery = {
+      capture,
+      fail: vi.fn(),
+      waitFor: async () => {
+        await waitForDiagnosticEventsDrained();
+        return { ok: true, deliveredEvents: 1 };
+      },
+    };
+    const harness = createStartedThreadHarness();
+    const run = runCodexAppServerAttempt(params, {
+      nativeHookRelay: { enabled: true },
+    });
+    await harness.waitForMethod("turn/start");
+    const startRequest = harness.requests.find((request) => request.method === "thread/start");
+    const relayId = extractRelayIdFromThreadRequest(startRequest?.params);
+    const registration = nativeHookRelayTesting.getNativeHookRelayRegistrationForTests(relayId);
+    const projectFailure = registration?.onPreToolUseFailure;
+    if (!registration || !projectFailure) {
+      throw new Error("Expected native hook relay failure projection");
+    }
+    let releaseProjection: () => void = () => undefined;
+    const projectionPending = new Promise<void>((resolve) => {
+      releaseProjection = resolve;
+    });
+    const projectionStarted = vi.fn();
+    registration.onPreToolUseFailure = async (failure) => {
+      projectionStarted();
+      await projectionPending;
+      await projectFailure(failure);
+    };
+
+    try {
+      await expect(
+        invokeNativeHookRelay({
+          provider: "codex",
+          relayId,
+          event: "pre_tool_use",
+          rawPayload: {
+            hook_event_name: "PreToolUse",
+            tool_name: "exec_command",
+            tool_use_id: "native-late-no-item",
+            tool_input: { cmd: "pnpm test" },
+          },
+        }),
+      ).resolves.toMatchObject({ failureDisposition: "failed" });
+      expect(projectionStarted).toHaveBeenCalledTimes(1);
+
+      await harness.completeTurn({ threadId: "thread-1", turnId: "turn-1" });
+      await new Promise<void>((resolve) => {
+        setImmediate(resolve);
+      });
+      expect(capture).not.toHaveBeenCalled();
+
+      releaseProjection();
+      await run;
+      await waitForDiagnosticEventsDrained();
+    } finally {
+      releaseProjection();
+      unsubscribeDiagnostics();
+    }
+
+    expect(capture).toHaveBeenCalledTimes(1);
+    expect(diagnosticEvents).toContainEqual(
+      expect.objectContaining({
+        type: "tool.execution.error",
+        toolName: "exec",
+        toolCallId: "native-late-no-item",
+        errorCategory: "before_tool_call",
+        terminalReason: "failed",
+      }),
+    );
+  });
+
+  it("fails diagnostic delivery instead of hanging on an unsettled native failure projection", async () => {
+    initializeGlobalHookRunner(
+      createMockPluginRegistry([
+        {
+          hookName: "before_tool_call",
+          handler: async () => {
+            throw new Error("hook crashed");
+          },
+        },
+      ]),
+    );
+    const sessionFile = path.join(tempDir, "session.jsonl");
+    const workspaceDir = path.join(tempDir, "workspace");
+    const capture = vi.fn(() => ({}));
+    const fail = vi.fn();
+    const params = createParams(sessionFile, workspaceDir);
+    (
+      params as typeof params & {
+        internalDiagnosticDelivery: {
+          capture: () => unknown;
+          fail: () => void;
+          waitFor: () => Promise<{ ok: true; deliveredEvents: number }>;
+        };
+      }
+    ).internalDiagnosticDelivery = {
+      capture,
+      fail,
+      waitFor: async () => ({ ok: true, deliveredEvents: 0 }),
+    };
+    const harness = createStartedThreadHarness();
+    const run = runCodexAppServerAttempt(params, {
+      nativeHookRelay: { enabled: true },
+    });
+    await harness.waitForMethod("turn/start");
+    const startRequest = harness.requests.find((request) => request.method === "thread/start");
+    const relayId = extractRelayIdFromThreadRequest(startRequest?.params);
+    const registration = nativeHookRelayTesting.getNativeHookRelayRegistrationForTests(relayId);
+    const projectFailure = registration?.onPreToolUseFailure;
+    if (!registration || !projectFailure) {
+      throw new Error("Expected native hook relay failure projection");
+    }
+    let releaseProjection: () => void = () => undefined;
+    const projectionPending = new Promise<void>((resolve) => {
+      releaseProjection = resolve;
+    });
+    registration.onPreToolUseFailure = async (failure) => {
+      await projectionPending;
+      await projectFailure(failure);
+    };
+
+    try {
+      await expect(
+        invokeNativeHookRelay({
+          provider: "codex",
+          relayId,
+          event: "pre_tool_use",
+          rawPayload: {
+            hook_event_name: "PreToolUse",
+            tool_name: "exec_command",
+            tool_use_id: "native-never-settled",
+            tool_input: { cmd: "pnpm test" },
+          },
+        }),
+      ).resolves.toMatchObject({ failureDisposition: "failed" });
+
+      await harness.completeTurn({ threadId: "thread-1", turnId: "turn-1" });
+      await expect(run).resolves.toBeDefined();
+    } finally {
+      releaseProjection();
+      await new Promise<void>((resolve) => {
+        setImmediate(resolve);
+      });
+      await waitForDiagnosticEventsDrained();
+    }
+
+    expect(fail).toHaveBeenCalledTimes(1);
+    expect(capture).toHaveBeenCalledTimes(1);
   });
 
   it("cleans up native hook relay state when turn/start fails", async () => {

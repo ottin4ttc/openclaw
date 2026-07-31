@@ -361,6 +361,7 @@ describe("Codex native hook relay config", () => {
           sessionKey: "agent:main:session-1",
           runId: "run-1",
           toolName: "exec",
+          toolOwner: "codex-native-tool-lifecycle",
           toolCallId: "native-no-item",
           durationMs: 5,
           errorCategory: "before_tool_call",
@@ -392,6 +393,7 @@ function createRelay(options?: {
           : ""
       }${commandOptions?.timeoutMs ? ` --timeout ${commandOptions.timeoutMs}` : ""}`,
     renew: () => undefined,
+    settlePreToolUseFailureProjections: async () => undefined,
     unregister: () => undefined,
   };
 }

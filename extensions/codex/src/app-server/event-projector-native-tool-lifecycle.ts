@@ -2,7 +2,10 @@ import type {
   BeforeToolCallFailureDisposition,
   EmbeddedRunAttemptParams,
 } from "openclaw/plugin-sdk/agent-harness-runtime";
-import { emitTrustedDiagnosticEvent } from "openclaw/plugin-sdk/diagnostic-runtime";
+import {
+  emitTrustedDiagnosticEvent,
+  type DiagnosticEventPayload,
+} from "openclaw/plugin-sdk/diagnostic-runtime";
 import { asDateTimestampMs } from "openclaw/plugin-sdk/number-runtime";
 import { resolveCodexToolAbortTerminalReason } from "./dynamic-tool-execution.js";
 import {
@@ -15,7 +18,7 @@ import {
 } from "./event-projector-items.js";
 import { readItem, readString } from "./event-projector-values.js";
 import {
-  emitCodexNativePreToolUseFailureDiagnostic,
+  CODEX_NATIVE_TOOL_LIFECYCLE_OWNER,
   type CodexNativePreToolUseFailure,
 } from "./native-hook-relay.js";
 import {
@@ -37,12 +40,18 @@ type CodexNativeToolLifecycleContext = Pick<
 
 type CodexNativeToolLifecycleProjectorOptions = {
   runAbortSignal?: AbortSignal;
+  suppressNativeToolLifecycleDiagnostics?: boolean;
 };
 
 type CodexNativePreToolUseFailureRecord = {
   failure: CodexNativePreToolUseFailure;
   terminalReason: CodexNativePreToolUseFailure["disposition"];
 };
+
+type WithoutDiagnosticSequence<T> = T extends unknown ? Omit<T, "seq" | "ts"> : never;
+type CodexNativeToolDiagnosticEvent = WithoutDiagnosticSequence<
+  Extract<DiagnosticEventPayload, { type: `tool.execution.${string}` }>
+>;
 
 /** Projects metadata-only lifecycle diagnostics for native tool items. */
 export class CodexNativeToolLifecycleProjector {
@@ -61,6 +70,8 @@ export class CodexNativeToolLifecycleProjector {
     Exclude<BeforeToolCallFailureDisposition, "blocked">
   >();
   private readonly preToolUseFailureByItem = new Map<string, CodexNativePreToolUseFailureRecord>();
+  private readonly suppressedDiagnostics: CodexNativeToolDiagnosticEvent[] = [];
+  private resolvedRolloutLifecycleKeys: ReadonlySet<string> | undefined;
   private finalized = false;
 
   constructor(
@@ -172,8 +183,8 @@ export class CodexNativeToolLifecycleProjector {
           : failure.disposition,
     };
     if (this.finalized) {
-      // Relay subprocesses can settle after result construction. Emit the
-      // item-less fallback here because no later notification drain remains.
+      // Relay subprocesses can settle after result construction. Keep the
+      // item-less fallback eligible for rollout reconciliation even when it is late.
       this.completedItemIds.add(failure.toolCallId);
       this.emitPreToolUseFailure(record, failure.toolName, failure.durationMs);
       return;
@@ -279,13 +290,29 @@ export class CodexNativeToolLifecycleProjector {
               type: "tool.execution.completed" as const,
               durationMs,
             };
-    emitTrustedDiagnosticEvent({
+    const diagnosticEvent = {
       ...this.buildBase(toolCallId, toolName),
       ...terminalEvent,
       ...(options.sourceTimestampMs !== undefined
         ? { sourceTimestampMs: options.sourceTimestampMs }
         : {}),
-    });
+    } satisfies CodexNativeToolDiagnosticEvent;
+    this.emitOrSuppress(diagnosticEvent);
+  }
+
+  resolveSuppressedDiagnostics(rolloutLifecycleKeys: ReadonlySet<string> = new Set()): void {
+    const resolvedRolloutLifecycleKeys = new Set(this.resolvedRolloutLifecycleKeys);
+    for (const lifecycleKey of rolloutLifecycleKeys) {
+      resolvedRolloutLifecycleKeys.add(lifecycleKey);
+    }
+    this.resolvedRolloutLifecycleKeys = resolvedRolloutLifecycleKeys;
+    const diagnostics = this.suppressedDiagnostics.splice(0);
+    for (const diagnostic of diagnostics) {
+      if (this.isCoveredByRollout(diagnostic)) {
+        continue;
+      }
+      emitTrustedDiagnosticEvent(diagnostic);
+    }
   }
 
   finalizeActive(runWasAborted = this.options.runAbortSignal?.aborted === true): void {
@@ -319,15 +346,15 @@ export class CodexNativeToolLifecycleProjector {
     durationMs: number,
     sourceTimestampMs?: number,
   ): void {
-    emitCodexNativePreToolUseFailureDiagnostic({
-      agentId: this.context.agentId,
-      sessionId: this.context.sessionId,
-      sessionKey: this.context.sessionKey,
-      runId: this.context.runId,
-      failure: { ...record.failure, toolName, durationMs },
+    const diagnosticEvent = {
+      type: "tool.execution.error",
+      ...this.buildBase(record.failure.toolCallId, toolName),
+      durationMs,
+      errorCategory: "before_tool_call",
       terminalReason: record.terminalReason,
-      sourceTimestampMs,
-    });
+      ...(sourceTimestampMs !== undefined ? { sourceTimestampMs } : {}),
+    } satisfies CodexNativeToolDiagnosticEvent;
+    this.emitOrSuppress(diagnosticEvent);
   }
 
   private recordSnapshotItem(item: CodexThreadItem): void {
@@ -357,11 +384,35 @@ export class CodexNativeToolLifecycleProjector {
     }
     this.startedAtByItem.set(toolCallId, sourceTimestampMs ?? Date.now());
     this.activeItems.set(toolCallId, { toolName, unfinishedStatus });
-    emitTrustedDiagnosticEvent({
+    const diagnosticEvent = {
       type: "tool.execution.started",
       ...this.buildBase(toolCallId, toolName),
       ...(sourceTimestampMs !== undefined ? { sourceTimestampMs } : {}),
-    });
+    } satisfies CodexNativeToolDiagnosticEvent;
+    this.emitOrSuppress(diagnosticEvent);
+  }
+
+  private emitOrSuppress(diagnosticEvent: CodexNativeToolDiagnosticEvent): void {
+    if (!this.options.suppressNativeToolLifecycleDiagnostics) {
+      emitTrustedDiagnosticEvent(diagnosticEvent);
+      return;
+    }
+    if (!this.resolvedRolloutLifecycleKeys) {
+      this.suppressedDiagnostics.push(diagnosticEvent);
+      return;
+    }
+    if (this.isCoveredByRollout(diagnosticEvent)) {
+      return;
+    }
+    emitTrustedDiagnosticEvent(diagnosticEvent);
+  }
+
+  private isCoveredByRollout(diagnosticEvent: CodexNativeToolDiagnosticEvent): boolean {
+    if (!diagnosticEvent.toolCallId || !this.resolvedRolloutLifecycleKeys) {
+      return false;
+    }
+    const phase = diagnosticEvent.type === "tool.execution.started" ? "started" : "terminal";
+    return this.resolvedRolloutLifecycleKeys.has(`${phase}:${diagnosticEvent.toolCallId}`);
   }
 
   private buildBase(toolCallId: string, toolName: string) {
@@ -371,6 +422,7 @@ export class CodexNativeToolLifecycleProjector {
       sessionId: this.context.sessionId,
       sessionKey: this.context.sessionKey,
       toolName,
+      toolOwner: CODEX_NATIVE_TOOL_LIFECYCLE_OWNER,
       toolCallId,
     };
   }

@@ -7,9 +7,11 @@
 import { createHash } from "node:crypto";
 import { normalizeOptionalString as normalizeTrimmedString } from "@openclaw/normalization-core/string-coerce";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
+import { resolveBlockMessage } from "../../plugins/hook-decision-types.js";
 import { getGlobalHookRunner } from "../../plugins/hook-runner-global.js";
 import type {
   PluginHookAgentEndEvent,
+  PluginHookBeforeAgentRunEvent,
   PluginHookBeforeAgentFinalizeEvent,
   PluginHookBeforeAgentFinalizeResult,
   PluginHookLlmInputEvent,
@@ -29,6 +31,47 @@ type FinalizeRetryBudget = Map<string, Map<string, number>>;
 /** Returns the current global hook runner for harness lifecycle hooks. */
 export function getAgentHarnessHookRunner(): AgentHarnessHookRunner {
   return getGlobalHookRunner();
+}
+
+export type AgentHarnessBeforeAgentRunOutcome =
+  | { action: "continue" }
+  | { action: "block"; pluginId: string; reason: string };
+
+/** Runs the fail-closed pre-inference gate for native harnesses. */
+export async function runAgentHarnessBeforeAgentRunHook(params: {
+  event: PluginHookBeforeAgentRunEvent;
+  ctx: AgentHarnessHookContext;
+  hookRunner?: AgentHarnessHookRunner;
+}): Promise<AgentHarnessBeforeAgentRunOutcome> {
+  const hookRunner = params.hookRunner ?? getGlobalHookRunner();
+  if (!hookRunner?.hasHooks("before_agent_run")) {
+    return { action: "continue" };
+  }
+  try {
+    const result = await hookRunner.runBeforeAgentRun(
+      params.event,
+      buildAgentHookContext(params.ctx),
+    );
+    if (result?.decision.outcome !== "block") {
+      return { action: "continue" };
+    }
+    return {
+      action: "block",
+      pluginId: result.pluginId,
+      reason: resolveBlockMessage(result.decision, { blockedBy: result.pluginId }),
+    };
+  } catch (error) {
+    log.warn(`before_agent_run hook failed: ${String(error)}`);
+    const pluginId = "before_agent_run";
+    return {
+      action: "block",
+      pluginId,
+      reason: resolveBlockMessage(
+        { outcome: "block", reason: "before_agent_run hook failed" },
+        { blockedBy: pluginId },
+      ),
+    };
+  }
 }
 
 function getFinalizeRetryBudget(): FinalizeRetryBudget {

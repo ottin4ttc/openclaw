@@ -8,6 +8,11 @@ import { fingerprintCodexLogValue } from "./attempt-diagnostics.js";
 import type { CodexAppServerClient } from "./client.js";
 
 type TrustedDiagnosticEventInput = Parameters<typeof emitTrustedDiagnosticEventWithPrivateData>[0];
+type ModelCallStartedInput = Extract<TrustedDiagnosticEventInput, { type: "model.call.started" }>;
+type RolloutTraceModelBaseFields = Omit<
+  ModelCallStartedInput,
+  "callId" | "scope" | "startTimeMs" | "type"
+>;
 
 type RolloutTraceLog = {
   debug(message: string, data?: Record<string, unknown>): void;
@@ -44,6 +49,7 @@ type RawTracePayload = {
   request_payload?: unknown;
   response_payload?: unknown;
   partial_response_payload?: unknown;
+  response_id?: unknown;
   upstream_request_id?: unknown;
   error?: unknown;
   reason?: unknown;
@@ -51,6 +57,8 @@ type RawTracePayload = {
   invocation_payload?: unknown;
   result_payload?: unknown;
   status?: unknown;
+  duration_ms?: unknown;
+  durationMs?: unknown;
 };
 
 type RawTraceEvent = {
@@ -73,6 +81,7 @@ type InferenceTerminal = {
   payload: RawTracePayload;
   callId: string;
   kind: "completed" | "failed" | "cancelled";
+  responseId?: string;
   responsePayloadRef?: RawPayloadRef;
   upstreamRequestId?: string;
 };
@@ -91,16 +100,18 @@ type ToolTerminal = {
 };
 
 const CODEX_PROVIDER_REQUEST_ID_HASH_NAMESPACE = "openclaw:codex:provider-request-id:v1";
+const CODEX_RESPONSE_ID_HASH_NAMESPACE = "openclaw:codex:response-id:v1";
 const PROCESSED_ROLLOUT_TURN_TTL_MS = 10 * 60 * 1000;
 const PROCESSED_ROLLOUT_TURN_MAX_ENTRIES = 512;
 type ProcessedRolloutTurn = {
   completed: boolean;
   emittedEventKeys: Set<string>;
+  emittedToolLifecycleKeys: Set<string>;
   updatedAt: number;
 };
 const processedRolloutTurns = new Map<string, ProcessedRolloutTurn>();
 const ROLLOUT_TRACE_READ_STATE_TTL_MS = 60 * 60 * 1000;
-const ROLLOUT_TRACE_READ_STATE_MAX_ENTRIES = 32;
+const ROLLOUT_TRACE_READ_STATE_MAX_ENTRIES = 128;
 const ROLLOUT_TRACE_PENDING_TURN_MAX_ENTRIES = 64;
 const ROLLOUT_TRACE_MAX_EVENTS_PER_TURN = 2048;
 const ROLLOUT_TRACE_MAX_EVENT_BYTES_PER_TURN = 4 * 1024 * 1024;
@@ -134,6 +145,10 @@ type RolloutTraceReadState = {
   updatedAt: number;
 };
 const rolloutTraceReadStates = new Map<string, RolloutTraceReadState>();
+// Reserve bytes across concurrent bundle reads before advancing offsets. Budget pressure may
+// evict idle caches, including active monitors; their append-only trace files remain authoritative.
+const rolloutTraceReadsInFlight = new Map<string, number>();
+let rolloutTraceReservedReadBytes = 0;
 const preparedRolloutTraceRoots = new Set<string>();
 const rolloutTracePruneTimers = new Map<string, ReturnType<typeof setTimeout>>();
 type RolloutTraceBackgroundDrain = {
@@ -141,6 +156,9 @@ type RolloutTraceBackgroundDrain = {
   cancelled: boolean;
 };
 const rolloutTraceBackgroundDrains = new Map<string, RolloutTraceBackgroundDrain>();
+const rolloutTraceDrainChains = new Map<string, Promise<unknown>>();
+const activeRolloutTraceTurns = new Map<string, number>();
+const activeRolloutTraceRoots = new Map<string, Map<string, number>>();
 const activeRolloutTraceBundleOwners = new Map<string, Set<CodexAppServerClient>>();
 const liveRolloutTraceClientsByThread = new Map<string, Set<CodexAppServerClient>>();
 const rolloutTraceClientBundles = new WeakMap<
@@ -156,13 +174,29 @@ type RolloutTraceDiagnosticsParams = {
   traceRoot?: string;
   threadId: string;
   turnId: string;
-  baseFields: Record<string, unknown>;
+  baseFields: RolloutTraceModelBaseFields;
   capture?: RolloutTraceContentCapture;
   log?: RolloutTraceLog;
 };
 
 type RolloutTraceDrainOptions = {
   allowBackgroundDrain?: boolean;
+};
+
+export type CodexRolloutTraceMonitor = {
+  finalDrain(): Promise<CodexRolloutTraceFinalDrainResult>;
+  stop(): void;
+};
+
+export type CodexRolloutTraceFinalDrainResult = Readonly<{
+  emitted: number;
+  complete: boolean;
+  reason?: "incomplete_rollout" | "read_error" | "trace_unavailable";
+  emittedToolLifecycleKeys?: readonly string[];
+}>;
+
+type CodexRolloutTraceDiagnosticsPassResult = CodexRolloutTraceFinalDrainResult & {
+  settled: boolean;
 };
 
 export function resolveCodexRolloutTraceRootDir(agentDir: string): string {
@@ -237,24 +271,28 @@ function scheduleCodexRolloutTracePrune(traceRoot: string): void {
   if (rolloutTracePruneTimers.has(traceRoot)) {
     return;
   }
-  const timer = setTimeout(async () => {
-    rolloutTracePruneTimers.delete(traceRoot);
-    try {
-      await fs.access(traceRoot);
-    } catch {
-      preparedRolloutTraceRoots.delete(traceRoot);
-      return;
-    }
-    try {
-      await pruneCodexRolloutTraceBundles(traceRoot);
-    } catch {
-      // Cleanup is best-effort and must never make the Codex runtime unstable.
-    } finally {
-      scheduleCodexRolloutTracePrune(traceRoot);
-    }
+  const timer = setTimeout(() => {
+    void runCodexRolloutTracePrune(traceRoot);
   }, ROLLOUT_TRACE_PRUNE_INTERVAL_MS);
   timer.unref();
   rolloutTracePruneTimers.set(traceRoot, timer);
+}
+
+async function runCodexRolloutTracePrune(traceRoot: string): Promise<void> {
+  rolloutTracePruneTimers.delete(traceRoot);
+  try {
+    await fs.access(traceRoot);
+  } catch {
+    preparedRolloutTraceRoots.delete(traceRoot);
+    return;
+  }
+  try {
+    await pruneCodexRolloutTraceBundles(traceRoot);
+  } catch {
+    // Cleanup is best-effort and must never make the Codex runtime unstable.
+  } finally {
+    scheduleCodexRolloutTracePrune(traceRoot);
+  }
 }
 
 /** Retains current traces and removes old crash remnants or excess completed bundles. */
@@ -444,13 +482,154 @@ function traceEventPayloadType(line: string): string | undefined {
 export async function emitCodexRolloutTraceProviderRequestDiagnostics(
   params: RolloutTraceDiagnosticsParams,
 ): Promise<number> {
-  return (await emitCodexRolloutTraceProviderRequestDiagnosticsPass(params)).emitted;
+  return serialCodexRolloutTraceDrain(params, async () => {
+    return (await emitCodexRolloutTraceProviderRequestDiagnosticsPass(params)).emitted;
+  });
 }
 
 export async function drainCodexRolloutTraceProviderRequestDiagnostics(
   params: RolloutTraceDiagnosticsParams,
   options: RolloutTraceDrainOptions = {},
 ): Promise<number> {
+  return serialCodexRolloutTraceDrain(
+    params,
+    async () =>
+      (await drainCodexRolloutTraceProviderRequestDiagnosticsUnserialized(params, options)).emitted,
+  );
+}
+
+export async function finalizeCodexRolloutTraceProviderRequestDiagnostics(
+  params: RolloutTraceDiagnosticsParams,
+): Promise<CodexRolloutTraceFinalDrainResult> {
+  const activeKey = registerActiveRolloutTraceTurn(params);
+  try {
+    return await serialCodexRolloutTraceDrain(params, () =>
+      drainCodexRolloutTraceProviderRequestDiagnosticsUnserialized(params, {
+        allowBackgroundDrain: false,
+      }),
+    );
+  } catch (error) {
+    params.log?.debug("codex rollout trace final drain failed", {
+      error: formatTraceError(error),
+      traceRoot: params.traceRoot,
+      threadId: params.threadId,
+      turnId: params.turnId,
+    });
+    return {
+      emitted: 0,
+      complete: false,
+      reason: "read_error",
+      ...rolloutTraceToolLifecycleCoverage(params),
+    };
+  } finally {
+    releaseActiveRolloutTraceTurn(params, activeKey);
+  }
+}
+
+export function startCodexRolloutTraceMonitor(
+  params: RolloutTraceDiagnosticsParams & { intervalMs?: number },
+): CodexRolloutTraceMonitor {
+  let stopped = false;
+  let draining = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let finalDrainPromise: Promise<CodexRolloutTraceFinalDrainResult> | undefined;
+  const activeKey = registerActiveRolloutTraceTurn(params);
+  let activeReleased = false;
+  const releaseActive = () => {
+    if (activeReleased) {
+      return;
+    }
+    activeReleased = true;
+    releaseActiveRolloutTraceTurn(params, activeKey);
+  };
+  const intervalMs = params.intervalMs ?? ROLLOUT_TRACE_BACKGROUND_SETTLE_INITIAL_INTERVAL_MS;
+  const poll = async () => {
+    if (stopped || draining) {
+      return;
+    }
+    draining = true;
+    try {
+      await emitCodexRolloutTraceProviderRequestDiagnostics(params);
+    } catch (error) {
+      params.log?.debug("codex rollout trace monitor poll skipped", {
+        error: formatTraceError(error),
+        traceRoot: params.traceRoot,
+        threadId: params.threadId,
+        turnId: params.turnId,
+      });
+    } finally {
+      draining = false;
+      if (!stopped) {
+        timer = setTimeout(() => {
+          void poll();
+        }, intervalMs);
+        timer.unref();
+      }
+    }
+  };
+  timer = setTimeout(() => {
+    void poll();
+  }, intervalMs);
+  timer.unref();
+  const stopPolling = () => {
+    stopped = true;
+    if (timer) {
+      clearTimeout(timer);
+      timer = undefined;
+    }
+  };
+  return {
+    async finalDrain() {
+      if (finalDrainPromise) {
+        return finalDrainPromise;
+      }
+      if (stopped) {
+        releaseActive();
+        return {
+          emitted: 0,
+          complete: false,
+          reason: "trace_unavailable",
+          ...rolloutTraceToolLifecycleCoverage(params),
+        };
+      }
+      // Establish the producer boundary before waiting behind an in-flight poll.
+      // Otherwise that poll could schedule more work after this final drain.
+      stopPolling();
+      finalDrainPromise = serialCodexRolloutTraceDrain(params, () =>
+        drainCodexRolloutTraceProviderRequestDiagnosticsUnserialized(params, {
+          allowBackgroundDrain: false,
+        }),
+      )
+        .catch((error: unknown): CodexRolloutTraceFinalDrainResult => {
+          params.log?.debug("codex rollout trace monitor final drain skipped", {
+            error: formatTraceError(error),
+            traceRoot: params.traceRoot,
+            threadId: params.threadId,
+            turnId: params.turnId,
+          });
+          return {
+            emitted: 0,
+            complete: false,
+            reason: "read_error",
+            ...rolloutTraceToolLifecycleCoverage(params),
+          };
+        })
+        .finally(releaseActive);
+      return finalDrainPromise;
+    },
+    stop() {
+      stopPolling();
+      if (!finalDrainPromise) {
+        releaseActive();
+      }
+    },
+  };
+}
+
+async function drainCodexRolloutTraceProviderRequestDiagnosticsUnserialized(
+  params: RolloutTraceDiagnosticsParams,
+  options: RolloutTraceDrainOptions = {},
+): Promise<CodexRolloutTraceFinalDrainResult> {
   const deadline = Date.now() + ROLLOUT_TRACE_SETTLE_TIMEOUT_MS;
   const allowBackgroundDrain = options.allowBackgroundDrain ?? true;
   const drainKey = codexRolloutTraceBackgroundDrainKey(params);
@@ -459,34 +638,90 @@ export async function drainCodexRolloutTraceProviderRequestDiagnostics(
   }
   let emitted = 0;
   while (true) {
-    const result = await emitCodexRolloutTraceProviderRequestDiagnosticsPass(params);
+    const finalDrain = !allowBackgroundDrain;
+    const result = await emitCodexRolloutTraceProviderRequestDiagnosticsPass(params, {
+      allowEmptyTurnCompletion: finalDrain,
+      sealCompletedTurn: finalDrain,
+    });
     emitted += result.emitted;
     if (result.settled) {
-      if (!allowBackgroundDrain && drainKey) {
-        tombstoneCodexRolloutTraceDrain(params, drainKey);
-      }
-      return emitted;
+      return {
+        emitted,
+        complete: result.complete,
+        ...(result.emittedToolLifecycleKeys
+          ? { emittedToolLifecycleKeys: result.emittedToolLifecycleKeys }
+          : {}),
+        ...(result.reason ? { reason: result.reason } : {}),
+      };
     }
     if (Date.now() >= deadline) {
+      if (!allowBackgroundDrain && result.reason === "incomplete_rollout") {
+        const reconciled = await emitCodexRolloutTraceProviderRequestDiagnosticsPass(params, {
+          allowEmptyTurnCompletion: true,
+          sealCompletedTurn: true,
+          reconcileMissingToolTerminals: true,
+        });
+        emitted += reconciled.emitted;
+        if (reconciled.settled) {
+          return {
+            emitted,
+            complete: reconciled.complete,
+            ...(reconciled.emittedToolLifecycleKeys
+              ? { emittedToolLifecycleKeys: reconciled.emittedToolLifecycleKeys }
+              : {}),
+            ...(reconciled.reason ? { reason: reconciled.reason } : {}),
+          };
+        }
+      }
       if (allowBackgroundDrain) {
         scheduleCodexRolloutTraceBackgroundDrain(params);
-      } else if (drainKey) {
-        tombstoneCodexRolloutTraceDrain(params, drainKey);
       }
-      return emitted;
+      return {
+        emitted,
+        complete: false,
+        reason: result.reason ?? "incomplete_rollout",
+        ...(result.emittedToolLifecycleKeys
+          ? { emittedToolLifecycleKeys: result.emittedToolLifecycleKeys }
+          : {}),
+      };
     }
-    await new Promise((resolve) => setTimeout(resolve, ROLLOUT_TRACE_SETTLE_INTERVAL_MS));
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, ROLLOUT_TRACE_SETTLE_INTERVAL_MS);
+    });
+  }
+}
+
+async function serialCodexRolloutTraceDrain<T>(
+  params: RolloutTraceDiagnosticsParams,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const key = params.traceRoot?.trim() ? path.resolve(params.traceRoot) : undefined;
+  if (!key) {
+    return operation();
+  }
+  const previous = rolloutTraceDrainChains.get(key) ?? Promise.resolve();
+  const next = previous.catch(() => undefined).then(operation);
+  rolloutTraceDrainChains.set(key, next);
+  try {
+    return await next;
+  } finally {
+    if (rolloutTraceDrainChains.get(key) === next) {
+      rolloutTraceDrainChains.delete(key);
+    }
   }
 }
 
 export async function waitForCodexAttemptDiagnosticEventsDrained(
-  waitForDrain: () => Promise<void>,
+  waitForDrain: (timeoutMs: number) => Promise<void>,
   timeoutMs = CODEX_ATTEMPT_DIAGNOSTIC_DRAIN_TIMEOUT_MS,
 ): Promise<boolean> {
   let timeout: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([
-      waitForDrain().then(() => true),
+      waitForDrain(timeoutMs).then(
+        () => true,
+        () => false,
+      ),
       new Promise<boolean>((resolve) => {
         timeout = setTimeout(() => resolve(false), timeoutMs);
         timeout.unref();
@@ -510,33 +745,46 @@ function scheduleCodexRolloutTraceBackgroundDrain(params: RolloutTraceDiagnostic
   const deadline = Date.now() + ROLLOUT_TRACE_BACKGROUND_SETTLE_TIMEOUT_MS;
   let intervalMs = ROLLOUT_TRACE_BACKGROUND_SETTLE_INITIAL_INTERVAL_MS;
   const scheduleNext = () => {
-    const timer = setTimeout(async () => {
-      const drain = rolloutTraceBackgroundDrains.get(key);
-      if (!drain || drain.cancelled) {
-        return;
-      }
-      try {
-        const result = await emitCodexRolloutTraceProviderRequestDiagnosticsPass(params);
-        const currentDrain = rolloutTraceBackgroundDrains.get(key);
-        if (!currentDrain || currentDrain.cancelled) {
-          return;
-        }
-        if (result.settled || Date.now() >= deadline) {
-          rolloutTraceBackgroundDrains.delete(key);
-          return;
-        }
-      } catch {
-        if (Date.now() >= deadline) {
-          rolloutTraceBackgroundDrains.delete(key);
-          return;
-        }
-      }
-      intervalMs = Math.min(intervalMs * 2, ROLLOUT_TRACE_BACKGROUND_SETTLE_MAX_INTERVAL_MS);
-      scheduleNext();
+    const timer = setTimeout(() => {
+      void runCodexRolloutTraceBackgroundDrain(params, key, deadline, () => {
+        intervalMs = Math.min(intervalMs * 2, ROLLOUT_TRACE_BACKGROUND_SETTLE_MAX_INTERVAL_MS);
+        scheduleNext();
+      });
     }, intervalMs);
     timer.unref();
     rolloutTraceBackgroundDrains.set(key, { timer, cancelled: false });
   };
+  scheduleNext();
+}
+
+async function runCodexRolloutTraceBackgroundDrain(
+  params: RolloutTraceDiagnosticsParams,
+  key: string,
+  deadline: number,
+  scheduleNext: () => void,
+): Promise<void> {
+  const drain = rolloutTraceBackgroundDrains.get(key);
+  if (!drain || drain.cancelled) {
+    return;
+  }
+  try {
+    const result = await serialCodexRolloutTraceDrain(params, () =>
+      emitCodexRolloutTraceProviderRequestDiagnosticsPass(params),
+    );
+    const currentDrain = rolloutTraceBackgroundDrains.get(key);
+    if (!currentDrain || currentDrain.cancelled) {
+      return;
+    }
+    if (result.settled || Date.now() >= deadline) {
+      rolloutTraceBackgroundDrains.delete(key);
+      return;
+    }
+  } catch {
+    if (Date.now() >= deadline) {
+      rolloutTraceBackgroundDrains.delete(key);
+      return;
+    }
+  }
   scheduleNext();
 }
 
@@ -549,6 +797,85 @@ function codexRolloutTraceBackgroundDrainKey(
   return `${path.resolve(params.traceRoot)}:${params.threadId}:${params.turnId}`;
 }
 
+function rolloutTraceToolLifecycleCoverage(
+  params: RolloutTraceDiagnosticsParams,
+): Pick<CodexRolloutTraceFinalDrainResult, "emittedToolLifecycleKeys"> {
+  const turnKey = codexRolloutTraceBackgroundDrainKey(params);
+  const keys = turnKey ? processedRolloutTurns.get(turnKey)?.emittedToolLifecycleKeys : undefined;
+  return keys && keys.size > 0 ? { emittedToolLifecycleKeys: [...keys] } : {};
+}
+
+function registerActiveRolloutTraceTurn(params: RolloutTraceDiagnosticsParams): string | undefined {
+  const key = codexRolloutTraceBackgroundDrainKey(params);
+  if (!key || !params.traceRoot?.trim()) {
+    return undefined;
+  }
+  const traceRoot = path.resolve(params.traceRoot);
+  const turnKey = rolloutTraceTurnKey(params.threadId, params.turnId);
+  activeRolloutTraceTurns.set(key, (activeRolloutTraceTurns.get(key) ?? 0) + 1);
+  const activeTurns = activeRolloutTraceRoots.get(traceRoot) ?? new Map<string, number>();
+  activeTurns.set(turnKey, (activeTurns.get(turnKey) ?? 0) + 1);
+  activeRolloutTraceRoots.set(traceRoot, activeTurns);
+  return key;
+}
+
+function releaseActiveRolloutTraceTurn(
+  params: RolloutTraceDiagnosticsParams,
+  key: string | undefined,
+): void {
+  if (!key || !params.traceRoot?.trim()) {
+    return;
+  }
+  const activeCount = activeRolloutTraceTurns.get(key) ?? 0;
+  if (activeCount <= 1) {
+    activeRolloutTraceTurns.delete(key);
+  } else {
+    activeRolloutTraceTurns.set(key, activeCount - 1);
+  }
+  const traceRoot = path.resolve(params.traceRoot);
+  const activeTurns = activeRolloutTraceRoots.get(traceRoot);
+  const turnKey = rolloutTraceTurnKey(params.threadId, params.turnId);
+  const rootActiveCount = activeTurns?.get(turnKey) ?? 0;
+  if (rootActiveCount <= 1) {
+    activeTurns?.delete(turnKey);
+  } else {
+    activeTurns?.set(turnKey, rootActiveCount - 1);
+  }
+  if (activeTurns?.size === 0) {
+    activeRolloutTraceRoots.delete(traceRoot);
+  }
+}
+
+export function activeRolloutTraceTurnRegistrationCountForTest(
+  params: RolloutTraceDiagnosticsParams,
+): number {
+  const key = codexRolloutTraceBackgroundDrainKey(params);
+  return key ? (activeRolloutTraceTurns.get(key) ?? 0) : 0;
+}
+
+function isActiveRolloutTraceReadState(stateKey: string): boolean {
+  const state = rolloutTraceReadStates.get(stateKey);
+  if (!state) {
+    return false;
+  }
+  for (const [traceRoot, activeTurns] of activeRolloutTraceRoots) {
+    if (stateKey !== traceRoot && !stateKey.startsWith(`${traceRoot}${path.sep}`)) {
+      continue;
+    }
+    for (const turnKey of activeTurns.keys()) {
+      if (
+        state.eventsByTurn.has(turnKey) ||
+        state.skippedTurns.has(turnKey) ||
+        state.skippedPayloadRefsByTurn.has(turnKey) ||
+        state.skippedPayloadRefOverflowTurns.has(turnKey)
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 function cancelCodexRolloutTraceBackgroundDrain(key: string): void {
   const drain = rolloutTraceBackgroundDrains.get(key);
   if (!drain) {
@@ -559,25 +886,21 @@ function cancelCodexRolloutTraceBackgroundDrain(key: string): void {
   rolloutTraceBackgroundDrains.delete(key);
 }
 
-function tombstoneCodexRolloutTraceDrain(
-  params: RolloutTraceDiagnosticsParams,
-  turnKey: string,
-): void {
-  processedRolloutTurns.set(turnKey, {
-    completed: true,
-    emittedEventKeys: processedRolloutTurns.get(turnKey)?.emittedEventKeys ?? new Set<string>(),
-    updatedAt: Date.now(),
-  });
-  if (params.traceRoot?.trim()) {
-    releaseRolloutTraceTurnEvents(params.traceRoot, params.threadId, params.turnId);
-  }
-}
-
 async function emitCodexRolloutTraceProviderRequestDiagnosticsPass(
   params: RolloutTraceDiagnosticsParams,
-): Promise<{ emitted: number; settled: boolean }> {
+  options: {
+    allowEmptyTurnCompletion?: boolean;
+    sealCompletedTurn?: boolean;
+    reconcileMissingToolTerminals?: boolean;
+  } = {},
+): Promise<CodexRolloutTraceDiagnosticsPassResult> {
   if (!params.traceRoot?.trim()) {
-    return { emitted: 0, settled: true };
+    return {
+      emitted: 0,
+      settled: true,
+      complete: false,
+      reason: "trace_unavailable",
+    };
   }
   const traceRoot = params.traceRoot;
   const turnKey = `${path.resolve(traceRoot)}:${params.threadId}:${params.turnId}`;
@@ -585,10 +908,16 @@ async function emitCodexRolloutTraceProviderRequestDiagnosticsPass(
   const turnState = processedRolloutTurns.get(turnKey) ?? {
     completed: false,
     emittedEventKeys: new Set<string>(),
+    emittedToolLifecycleKeys: new Set<string>(),
     updatedAt: Date.now(),
   };
   if (turnState.completed) {
-    return { emitted: 0, settled: true };
+    return {
+      emitted: 0,
+      settled: true,
+      complete: true,
+      ...rolloutTraceToolLifecycleCoverage(params),
+    };
   }
   processedRolloutTurns.set(turnKey, turnState);
   let emitted = 0;
@@ -596,16 +925,25 @@ async function emitCodexRolloutTraceProviderRequestDiagnosticsPass(
   let complete = true;
   let readFailed = false;
   let unreadBundle = false;
+  let backpressured = false;
   try {
     const bundleDirs = await listTraceBundleDirs(traceRoot);
     for (const bundleDir of bundleDirs) {
-      let result: { emitted: number; observed: boolean; complete: boolean };
+      let result: {
+        emitted: number;
+        observed: boolean;
+        complete: boolean;
+        backpressured: boolean;
+      };
       try {
         result = await emitTraceBundleDiagnostics({
           ...params,
           traceRoot,
           bundleDir,
+          allowEmptyTurnCompletion: options.allowEmptyTurnCompletion,
+          reconcileMissingToolTerminals: options.reconcileMissingToolTerminals,
           emittedEventKeys: turnState.emittedEventKeys,
+          emittedToolLifecycleKeys: turnState.emittedToolLifecycleKeys,
         });
       } catch (error) {
         const associated = rolloutTraceBundleHasTurnAssociation({
@@ -626,12 +964,15 @@ async function emitCodexRolloutTraceProviderRequestDiagnosticsPass(
         continue;
       }
       emitted += result.emitted;
+      backpressured ||= result.backpressured;
       if (result.observed) {
         observed = true;
         complete &&= result.complete;
       }
     }
   } catch (error) {
+    readFailed = true;
+    unreadBundle ||= isMissingTraceFileError(error);
     params.log?.debug("codex rollout trace diagnostics skipped", {
       error: formatTraceError(error),
       traceRoot: params.traceRoot,
@@ -639,14 +980,29 @@ async function emitCodexRolloutTraceProviderRequestDiagnosticsPass(
       turnId: params.turnId,
     });
   }
-  turnState.completed = observed && complete && !readFailed;
+  const now = Date.now();
+  const passComplete = observed && complete && !readFailed && !backpressured;
+  // Polling can observe codex_turn_ended before every lifecycle append becomes readable.
+  // Only the explicit final drain establishes the producer boundary and seals dedupe state.
+  turnState.completed = options.sealCompletedTurn === true && passComplete;
   if (turnState.completed) {
     releaseRolloutTraceTurnEvents(traceRoot, params.threadId, params.turnId);
   }
-  turnState.updatedAt = Date.now();
+  turnState.updatedAt = now;
   return {
     emitted,
-    settled: turnState.completed || (!observed && !readFailed && !unreadBundle),
+    settled: passComplete || (!observed && !readFailed && !unreadBundle && !backpressured),
+    complete: passComplete,
+    ...rolloutTraceToolLifecycleCoverage(params),
+    ...(!passComplete
+      ? {
+          reason: readFailed
+            ? ("read_error" as const)
+            : observed || backpressured
+              ? ("incomplete_rollout" as const)
+              : ("trace_unavailable" as const),
+        }
+      : {}),
   };
 }
 
@@ -677,6 +1033,9 @@ function rolloutTraceBundleHasTurnAssociation(params: {
 
 function pruneProcessedRolloutTurns(now = Date.now()): void {
   for (const [key, state] of processedRolloutTurns) {
+    if (activeRolloutTraceTurns.has(key)) {
+      continue;
+    }
     if (
       now - state.updatedAt > PROCESSED_ROLLOUT_TURN_TTL_MS ||
       processedRolloutTurns.size > PROCESSED_ROLLOUT_TURN_MAX_ENTRIES
@@ -691,22 +1050,38 @@ async function emitTraceBundleDiagnostics(params: {
   bundleDir: string;
   threadId: string;
   turnId: string;
-  baseFields: Record<string, unknown>;
+  baseFields: RolloutTraceModelBaseFields;
   capture?: RolloutTraceContentCapture;
   log?: RolloutTraceLog;
+  allowEmptyTurnCompletion?: boolean;
+  reconcileMissingToolTerminals?: boolean;
   emittedEventKeys: Set<string>;
-}): Promise<{ emitted: number; observed: boolean; complete: boolean }> {
-  const events = await readTraceEvents(params.bundleDir, params.threadId, params.turnId);
+  emittedToolLifecycleKeys: Set<string>;
+}): Promise<{
+  emitted: number;
+  observed: boolean;
+  complete: boolean;
+  backpressured: boolean;
+}> {
+  const readResult = await readTraceEvents(params.bundleDir, params.threadId, params.turnId);
+  const events = readResult.events;
   const startedByCallId = new Map<string, InferenceStarted>();
   const terminalByCallId = new Map<string, InferenceTerminal>();
   const toolStartedByCallId = new Map<string, ToolStarted>();
   const toolTerminalByCallId = new Map<string, ToolTerminal>();
+  let turnEndedEvent: RawTraceEvent | undefined;
   for (const event of events) {
     const payload = asObject(event.payload) as RawTracePayload | undefined;
     if (!payload || !matchesTraceTurn(event, payload, params.threadId, params.turnId)) {
       continue;
     }
     const type = stringValue(payload.type);
+    if (
+      type === "codex_turn_ended" &&
+      (!turnEndedEvent || eventSeq(event) > eventSeq(turnEndedEvent))
+    ) {
+      turnEndedEvent = event;
+    }
     const callId = stringValue(payload.inference_call_id);
     if (callId && type === "inference_started") {
       startedByCallId.set(callId, {
@@ -721,6 +1096,7 @@ async function emitTraceBundleDiagnostics(params: {
         payload,
         callId,
         kind: "completed",
+        responseId: stringValue(payload.response_id),
         responsePayloadRef: asPayloadRef(payload.response_payload),
         upstreamRequestId: stringValue(payload.upstream_request_id),
       });
@@ -756,26 +1132,58 @@ async function emitTraceBundleDiagnostics(params: {
     }
   }
 
-  const turnEnded = events.some((event) => {
-    const payload = asObject(event.payload) as RawTracePayload | undefined;
-    return (
-      payload &&
-      matchesTraceTurn(event, payload, params.threadId, params.turnId) &&
-      stringValue(payload.type) === "codex_turn_ended"
-    );
-  });
+  const turnEnded = turnEndedEvent !== undefined;
   const skipped = rolloutTraceBundleHasSkippedTurn(
     params.bundleDir,
     params.threadId,
     params.turnId,
   );
   const observed = startedByCallId.size > 0 || toolStartedByCallId.size > 0 || turnEnded || skipped;
-  const complete =
+  const observedAnyLifecycle =
+    observed || terminalByCallId.size > 0 || toolTerminalByCallId.size > 0;
+  const inferenceCallIds = new Set([...startedByCallId.keys(), ...terminalByCallId.keys()]);
+  const toolCallIds = new Set([...toolStartedByCallId.keys(), ...toolTerminalByCallId.keys()]);
+  const state = rolloutTraceReadStates.get(path.resolve(params.bundleDir));
+  const turnKey = rolloutTraceTurnKey(params.threadId, params.turnId);
+  const hasEvictedLifecycleRecords = Boolean(
+    state?.skippedPayloadRefsByTurn.has(turnKey) ||
+    state?.skippedPayloadRefOverflowTurns.has(turnKey),
+  );
+  // Terminal-only records are complete lifecycle records because emission synthesizes
+  // their missing starts below. Only an explicit final drain may seal an empty turn:
+  // regular polling can observe the turn boundary before the final lifecycle append.
+  const hasLifecycleRecords =
+    inferenceCallIds.size > 0 || toolCallIds.size > 0 || hasEvictedLifecycleRecords;
+  const inferenceLifecycleComplete = [...inferenceCallIds].every((callId) =>
+    terminalByCallId.has(callId),
+  );
+  const missingToolTerminalCallIds = [...toolStartedByCallId.keys()].filter(
+    (callId) => !toolTerminalByCallId.has(callId),
+  );
+  const reconcileMissingToolTerminals =
+    params.reconcileMissingToolTerminals === true &&
+    !readResult.backpressured &&
+    !skipped &&
     turnEnded &&
-    [...startedByCallId.keys()].every((callId) => terminalByCallId.has(callId)) &&
-    [...terminalByCallId.keys()].every((callId) => startedByCallId.has(callId)) &&
-    [...toolStartedByCallId.keys()].every((callId) => toolTerminalByCallId.has(callId)) &&
-    [...toolTerminalByCallId.keys()].every((callId) => toolStartedByCallId.has(callId));
+    inferenceLifecycleComplete;
+  const complete =
+    !readResult.backpressured &&
+    !skipped &&
+    turnEnded &&
+    (hasLifecycleRecords || params.allowEmptyTurnCompletion === true) &&
+    inferenceLifecycleComplete &&
+    [...toolCallIds].every(
+      (callId) => toolTerminalByCallId.has(callId) || reconcileMissingToolTerminals,
+    );
+  const providerRequestIndexes = new Map(
+    [...inferenceCallIds]
+      .toSorted((left, right) => {
+        const leftEvent = startedByCallId.get(left)?.event ?? terminalByCallId.get(left)?.event;
+        const rightEvent = startedByCallId.get(right)?.event ?? terminalByCallId.get(right)?.event;
+        return eventSeq(leftEvent ?? {}) - eventSeq(rightEvent ?? {});
+      })
+      .map((callId, index) => [callId, index + 1]),
+  );
 
   let emitted = 0;
   const bundleKey = path.resolve(params.bundleDir);
@@ -793,16 +1201,17 @@ async function emitTraceBundleDiagnostics(params: {
       }
       const started = startedByCallId.get(callId);
       const terminal = terminalByCallId.get(callId);
-      if (!started || !terminal) {
-        break;
+      if (!started) {
+        continue;
       }
-      const requestPayload = shouldReadRequestPayload(params.capture)
-        ? await readPayloadJson(params.bundleDir, started.requestPayloadRef)
-        : undefined;
+      // Request form is lifecycle provenance, not optional content capture. Read the
+      // bounded local payload for classification, then export content only per capture.
+      const requestPayload = await readPayloadJson(params.bundleDir, started.requestPayloadRef);
       const startedContent = buildTraceModelContent({
         capture: params.capture,
         requestPayload,
       });
+      const requestEvidence = providerRequestEvidence(requestPayload);
       const baseFields = buildProviderRequestBaseFields({
         baseFields: params.baseFields,
         callId,
@@ -814,6 +1223,9 @@ async function emitTraceBundleDiagnostics(params: {
           type: "model.call.started",
           ...baseFields,
           startTimeMs: eventWallTimeMs(started.event),
+          providerRequestIndex: providerRequestIndexes.get(callId),
+          ...requestEvidence,
+          rolloutSourceOrder: rolloutTraceSourceOrder(started.event),
         } as TrustedDiagnosticEventInput,
         modelContentPrivateData(startedContent),
       );
@@ -833,17 +1245,32 @@ async function emitTraceBundleDiagnostics(params: {
         continue;
       }
       const started = startedByCallId.get(terminal.callId);
-      if (!started) {
-        break;
+      const terminalStart = resolveTerminalOnlyStart(terminal.event, terminal.payload);
+      const startEvent = started?.event;
+      const syntheticStartEventKey = `${bundleKey}:inference-started:${terminal.callId}`;
+      if (!started && !params.emittedEventKeys.has(syntheticStartEventKey)) {
+        const baseFields = buildProviderRequestBaseFields({
+          baseFields: params.baseFields,
+          callId: terminal.callId,
+          started,
+          terminal,
+        });
+        emitTrustedDiagnosticEventWithPrivateData({
+          type: "model.call.started",
+          ...baseFields,
+          startTimeMs: terminalStart.startTimeMs,
+          syntheticStart: true,
+          startTimeSource: terminalStart.startTimeSource,
+          providerRequestIndex: providerRequestIndexes.get(terminal.callId),
+          rolloutSourceOrder: rolloutTraceSourceOrder(terminal.event),
+        } as TrustedDiagnosticEventInput);
+        params.emittedEventKeys.add(syntheticStartEventKey);
+        emitted += 1;
       }
-      const requestPayload = shouldReadRequestPayload(params.capture)
-        ? await readPayloadJson(params.bundleDir, started.requestPayloadRef)
-        : undefined;
       const responsePayload = await readPayloadJson(params.bundleDir, terminal.responsePayloadRef);
       const usage = extractTraceTokenUsage(responsePayload);
       const completedContent = buildTraceModelContent({
         capture: params.capture,
-        requestPayload,
         responsePayload,
       });
       const baseFields = buildProviderRequestBaseFields({
@@ -856,10 +1283,22 @@ async function emitTraceBundleDiagnostics(params: {
         {
           type: terminal.kind === "completed" ? "model.call.completed" : "model.call.error",
           ...baseFields,
-          startTimeMs: eventWallTimeMs(started.event),
+          startTimeMs: startEvent ? eventWallTimeMs(startEvent) : terminalStart.startTimeMs,
           endTimeMs: eventWallTimeMs(terminal.event),
-          durationMs: traceDurationMs(started.event, terminal.event),
+          durationMs: startEvent
+            ? traceDurationMs(startEvent, terminal.event)
+            : terminalStart.durationMs,
           usageSource: usage ? "provider" : "unknown",
+          providerRequestIndex: providerRequestIndexes.get(terminal.callId),
+          ...(terminal.responseId
+            ? {
+                responseIdHash: fingerprintCodexLogValue(
+                  CODEX_RESPONSE_ID_HASH_NAMESPACE,
+                  terminal.responseId,
+                ),
+              }
+            : {}),
+          rolloutSourceOrder: rolloutTraceSourceOrder(terminal.event),
           ...(terminal.kind === "completed"
             ? {}
             : {
@@ -876,9 +1315,37 @@ async function emitTraceBundleDiagnostics(params: {
     }
     if (type === "tool_call_started") {
       const toolCallId = stringValue(payload.tool_call_id);
-      if (toolCallId && !toolTerminalByCallId.has(toolCallId)) {
-        break;
+      if (!toolCallId) {
+        continue;
       }
+      const eventKey = `${bundleKey}:tool-started:${toolCallId}`;
+      if (params.emittedEventKeys.has(eventKey)) {
+        continue;
+      }
+      const toolStarted = toolStartedByCallId.get(toolCallId);
+      if (!toolStarted) {
+        continue;
+      }
+      const invocationPayload = await readPayloadJson(
+        params.bundleDir,
+        toolStarted.invocationPayloadRef,
+      );
+      const tool = parseToolInvocation(invocationPayload) ?? fallbackToolInvocation();
+      emitTrustedDiagnosticEventWithPrivateData(
+        {
+          ...toolStartedDiagnosticFields({
+            baseFields: params.baseFields,
+            tool,
+            toolCallId,
+            event: toolStarted.event,
+          }),
+          rolloutSourceOrder: rolloutTraceSourceOrder(toolStarted.event),
+        } as TrustedDiagnosticEventInput,
+        toolStartedPrivateData(params.capture, tool),
+      );
+      params.emittedEventKeys.add(eventKey);
+      params.emittedToolLifecycleKeys.add(`started:${toolCallId}`);
+      emitted += 1;
       continue;
     }
     if (type !== "tool_call_ended") {
@@ -891,20 +1358,45 @@ async function emitTraceBundleDiagnostics(params: {
     }
     const toolTerminal = toolCallId ? toolTerminalByCallId.get(toolCallId) : undefined;
     const toolStarted = toolCallId ? toolStartedByCallId.get(toolCallId) : undefined;
-    if (!toolTerminal || !toolStarted) {
-      break;
+    if (!toolTerminal || !toolCallId) {
+      continue;
     }
+    const terminalStart = resolveTerminalOnlyStart(toolTerminal.event, payload);
+    const startEvent = toolStarted?.event;
     const invocationPayload = await readPayloadJson(
       params.bundleDir,
-      toolStarted.invocationPayloadRef,
+      toolStarted?.invocationPayloadRef,
     );
-    const tool = parseToolInvocation(invocationPayload);
-    if (!tool) {
-      continue;
+    const tool = parseToolInvocation(invocationPayload) ?? fallbackToolInvocation();
+    const startedEventKey = `${bundleKey}:tool-started:${toolCallId}`;
+    if (!params.emittedEventKeys.has(startedEventKey)) {
+      emitTrustedDiagnosticEventWithPrivateData(
+        {
+          ...toolStartedDiagnosticFields({
+            baseFields: params.baseFields,
+            tool,
+            toolCallId,
+            event: startEvent,
+          }),
+          syntheticStart: !toolStarted,
+          startTimeSource: toolStarted ? "source" : terminalStart.startTimeSource,
+          startTimeMs: startEvent ? eventWallTimeMs(startEvent) : terminalStart.startTimeMs,
+          sourceTimestampMs: startEvent ? eventWallTimeMs(startEvent) : terminalStart.startTimeMs,
+          rolloutSourceOrder: rolloutTraceSourceOrder(toolStarted?.event ?? toolTerminal.event),
+        } as TrustedDiagnosticEventInput,
+        toolStartedPrivateData(params.capture, tool),
+      );
+      params.emittedEventKeys.add(startedEventKey);
+      // Langfuse tool spans cannot replace their start after a terminal update.
+      // Treat this synthetic start as coverage so native fallback cannot replay out of order.
+      params.emittedToolLifecycleKeys.add(`started:${toolCallId}`);
+      emitted += 1;
     }
     const resultPayload = await readPayloadJson(params.bundleDir, toolTerminal.resultPayloadRef);
     const toolOutput = parseToolOutput(resultPayload);
-    const durationMs = traceDurationMs(toolStarted.event, toolTerminal.event);
+    const durationMs = startEvent
+      ? traceDurationMs(startEvent, toolTerminal.event)
+      : terminalStart.durationMs;
     const baseFields = toolDiagnosticBaseFields(params.baseFields);
     const toolContent = {
       ...(params.capture?.toolInputs ? { toolInput: tool.input } : {}),
@@ -918,9 +1410,11 @@ async function emitTraceBundleDiagnostics(params: {
       toolOwner: "codex-rollout-trace",
       toolCallId: toolTerminal.callId,
       paramsSummary: summarizeToolInput(tool.input),
-      startTimeMs: eventWallTimeMs(toolStarted.event),
+      startTimeMs: startEvent ? eventWallTimeMs(startEvent) : terminalStart.startTimeMs,
       endTimeMs: eventWallTimeMs(toolTerminal.event),
+      sourceTimestampMs: eventWallTimeMs(toolTerminal.event),
       durationMs,
+      rolloutSourceOrder: rolloutTraceSourceOrder(toolTerminal.event),
     };
     if (toolTerminal.status === "completed") {
       emitTrustedDiagnosticEventWithPrivateData(
@@ -940,9 +1434,68 @@ async function emitTraceBundleDiagnostics(params: {
     if (eventKey) {
       params.emittedEventKeys.add(eventKey);
     }
+    params.emittedToolLifecycleKeys.add(`terminal:${toolCallId}`);
     emitted += 1;
   }
-  if (complete) {
+  if (reconcileMissingToolTerminals && turnEndedEvent) {
+    for (const toolCallId of missingToolTerminalCallIds.toSorted((left, right) => {
+      return (
+        eventSeq(toolStartedByCallId.get(left)?.event ?? {}) -
+        eventSeq(toolStartedByCallId.get(right)?.event ?? {})
+      );
+    })) {
+      const eventKey = `${bundleKey}:tool-terminal:${toolCallId}`;
+      if (params.emittedEventKeys.has(eventKey)) {
+        continue;
+      }
+      const toolStarted = toolStartedByCallId.get(toolCallId);
+      if (!toolStarted) {
+        continue;
+      }
+      const invocationPayload = await readPayloadJson(
+        params.bundleDir,
+        toolStarted.invocationPayloadRef,
+      );
+      const tool = parseToolInvocation(invocationPayload) ?? fallbackToolInvocation();
+      const toolContent = {
+        ...(params.capture?.toolInputs ? { toolInput: tool.input } : {}),
+        ...(params.capture?.toolOutputs
+          ? {
+              toolOutput: {
+                status: "error",
+                errorCode: "tool_terminal_missing",
+              },
+            }
+          : {}),
+      };
+      emitTrustedDiagnosticEventWithPrivateData(
+        {
+          type: "tool.execution.error",
+          ...toolDiagnosticBaseFields(params.baseFields),
+          toolName: tool.name,
+          toolSource: "core",
+          toolOwner: "codex-rollout-trace",
+          toolCallId,
+          paramsSummary: summarizeToolInput(tool.input),
+          startTimeMs: eventWallTimeMs(toolStarted.event),
+          endTimeMs: eventWallTimeMs(turnEndedEvent),
+          sourceTimestampMs: eventWallTimeMs(turnEndedEvent),
+          durationMs: traceDurationMs(toolStarted.event, turnEndedEvent),
+          rolloutSourceOrder: rolloutTraceSourceOrder(turnEndedEvent),
+          errorCategory: "codex_native_tool_missing_terminal",
+          errorCode: "tool_terminal_missing",
+          terminalReason: "failed",
+        } as TrustedDiagnosticEventInput,
+        Object.keys(toolContent).length > 0 ? { toolContent } : undefined,
+      );
+      params.emittedEventKeys.add(eventKey);
+      params.emittedToolLifecycleKeys.add(`terminal:${toolCallId}`);
+      emitted += 1;
+    }
+  }
+  if (complete || (skipped && turnEnded)) {
+    // A skipped turn cannot be reconstructed after its terminal boundary.
+    // Keep the incomplete result, but release payload files that no retry can consume.
     await removeTraceTurnPayloads({
       bundleDir: params.bundleDir,
       events,
@@ -951,7 +1504,12 @@ async function emitTraceBundleDiagnostics(params: {
       log: params.log,
     });
   }
-  return { emitted, observed, complete };
+  return {
+    emitted,
+    observed: observedAnyLifecycle,
+    complete,
+    backpressured: readResult.backpressured,
+  };
 }
 
 async function removeTraceTurnPayloads(params: {
@@ -1117,7 +1675,7 @@ function collectRawPayloadPaths(bundleDir: string, value: unknown, paths: Set<st
   }
 }
 
-function toolDiagnosticBaseFields(baseFields: Record<string, unknown>) {
+function toolDiagnosticBaseFields(baseFields: RolloutTraceModelBaseFields) {
   const runId = stringValue(baseFields.runId);
   const sessionKey = stringValue(baseFields.sessionKey);
   const sessionId = stringValue(baseFields.sessionId);
@@ -1126,6 +1684,35 @@ function toolDiagnosticBaseFields(baseFields: Record<string, unknown>) {
     ...(sessionKey ? { sessionKey } : {}),
     ...(sessionId ? { sessionId } : {}),
   };
+}
+
+function toolStartedDiagnosticFields(params: {
+  baseFields: RolloutTraceModelBaseFields;
+  tool: { name: string; input: unknown };
+  toolCallId: string;
+  event?: RawTraceEvent;
+}) {
+  const startTimeMs = params.event ? eventWallTimeMs(params.event) : undefined;
+  return {
+    type: "tool.execution.started" as const,
+    ...toolDiagnosticBaseFields(params.baseFields),
+    toolName: params.tool.name,
+    toolSource: "core" as const,
+    toolOwner: "codex-rollout-trace",
+    toolCallId: params.toolCallId,
+    paramsSummary: summarizeToolInput(params.tool.input),
+    ...(startTimeMs !== undefined ? { startTimeMs, sourceTimestampMs: startTimeMs } : {}),
+  };
+}
+
+function toolStartedPrivateData(
+  capture: RolloutTraceContentCapture | undefined,
+  tool: { input: unknown },
+) {
+  if (!capture?.toolInputs) {
+    return undefined;
+  }
+  return { toolContent: { toolInput: tool.input } };
 }
 
 function parseToolInvocation(value: unknown): { name: string; input: unknown } | undefined {
@@ -1149,6 +1736,13 @@ function parseToolInvocation(value: unknown): { name: string; input: unknown } |
   return {
     name: namespace ? `${namespace}.${toolName}` : toolName,
     input,
+  };
+}
+
+function fallbackToolInvocation(): { name: string; input: unknown } {
+  return {
+    name: "codex.native_tool",
+    input: undefined,
   };
 }
 
@@ -1246,70 +1840,103 @@ async function listTraceBundleDirs(traceRoot: string): Promise<string[]> {
       }
     }
   }
-  return bundleDirs.sort();
+  return bundleDirs.toSorted();
 }
 
 async function readTraceEvents(
   bundleDir: string,
   threadId: string,
   turnId: string,
-): Promise<RawTraceEvent[]> {
+): Promise<{ events: RawTraceEvent[]; backpressured: boolean }> {
   const traceFile = path.join(bundleDir, "trace.jsonl");
   const stateKey = path.resolve(bundleDir);
-  pruneRolloutTraceReadStates();
-  const state = rolloutTraceReadStates.get(stateKey) ?? {
-    offset: 0,
-    partialLine: Buffer.alloc(0),
-    eventsByTurn: new Map(),
-    eventBytesByTurn: new Map(),
-    totalEventBytes: 0,
-    totalSkippedPayloadRefBytes: 0,
-    skippedTurns: new Set(),
-    skippedPayloadRefsByTurn: new Map(),
-    skippedPayloadRefBytesByTurn: new Map(),
-    skippedPayloadRefOverflowTurns: new Set(),
-    skippedPayloadRefMetadataEvicted: false,
-    updatedAt: Date.now(),
-  };
-  rolloutTraceReadStates.set(stateKey, state);
-  const handle = await fs.open(traceFile, "r");
+  rolloutTraceReadsInFlight.set(stateKey, (rolloutTraceReadsInFlight.get(stateKey) ?? 0) + 1);
   try {
-    const stat = await handle.stat();
-    if (stat.size < state.offset) {
-      state.offset = 0;
-      state.partialLine = Buffer.alloc(0);
-      state.eventsByTurn.clear();
-      state.eventBytesByTurn.clear();
-      state.totalEventBytes = 0;
-      state.totalSkippedPayloadRefBytes = 0;
-      state.skippedTurns.clear();
-      state.skippedPayloadRefsByTurn.clear();
-      state.skippedPayloadRefBytesByTurn.clear();
-      state.skippedPayloadRefOverflowTurns.clear();
-      state.skippedPayloadRefMetadataEvicted = false;
-    }
-    let position = state.offset;
-    while (position < stat.size) {
-      const length = Math.min(ROLLOUT_TRACE_READ_CHUNK_BYTES, stat.size - position);
-      const chunk = Buffer.allocUnsafe(length);
-      const { bytesRead } = await handle.read(chunk, 0, length, position);
-      if (bytesRead === 0) {
-        break;
-      }
-      position += bytesRead;
-      collectTraceEventLines(state, chunk.subarray(0, bytesRead));
-    }
-    state.offset = position;
-    state.updatedAt = Date.now();
-    enforceRolloutTraceReadStateBudget(state);
     pruneRolloutTraceReadStates();
+    let state = rolloutTraceReadStates.get(stateKey);
+    if (!state) {
+      pruneRolloutTraceReadStatesForEntry(stateKey);
+      if (rolloutTraceReadStates.size >= ROLLOUT_TRACE_READ_STATE_MAX_ENTRIES) {
+        return { events: [], backpressured: true };
+      }
+      state = {
+        offset: 0,
+        partialLine: Buffer.alloc(0),
+        eventsByTurn: new Map(),
+        eventBytesByTurn: new Map(),
+        totalEventBytes: 0,
+        totalSkippedPayloadRefBytes: 0,
+        skippedTurns: new Set(),
+        skippedPayloadRefsByTurn: new Map(),
+        skippedPayloadRefBytesByTurn: new Map(),
+        skippedPayloadRefOverflowTurns: new Set(),
+        skippedPayloadRefMetadataEvicted: false,
+        updatedAt: Date.now(),
+      };
+      rolloutTraceReadStates.set(stateKey, state);
+    }
+    let backpressured = false;
+    const handle = await fs.open(traceFile, "r");
+    try {
+      const stat = await handle.stat();
+      if (stat.size < state.offset) {
+        state.offset = 0;
+        state.partialLine = Buffer.alloc(0);
+        state.eventsByTurn.clear();
+        state.eventBytesByTurn.clear();
+        state.totalEventBytes = 0;
+        state.totalSkippedPayloadRefBytes = 0;
+        state.skippedTurns.clear();
+        state.skippedPayloadRefsByTurn.clear();
+        state.skippedPayloadRefBytesByTurn.clear();
+        state.skippedPayloadRefOverflowTurns.clear();
+        state.skippedPayloadRefMetadataEvicted = false;
+      }
+      let position = state.offset;
+      while (position < stat.size) {
+        const desiredLength = Math.min(ROLLOUT_TRACE_READ_CHUNK_BYTES, stat.size - position);
+        const reservedLength = reserveRolloutTraceReadBytes(stateKey, desiredLength);
+        if (reservedLength === 0) {
+          backpressured = true;
+          break;
+        }
+        try {
+          const chunk = Buffer.allocUnsafe(reservedLength);
+          const { bytesRead } = await handle.read(chunk, 0, reservedLength, position);
+          if (bytesRead === 0) {
+            break;
+          }
+          position += bytesRead;
+          collectTraceEventLines(state, chunk.subarray(0, bytesRead));
+        } finally {
+          rolloutTraceReservedReadBytes = Math.max(
+            0,
+            rolloutTraceReservedReadBytes - reservedLength,
+          );
+        }
+      }
+      state.offset = position;
+      state.updatedAt = Date.now();
+      enforceRolloutTraceReadStateBudget(state);
+      pruneRolloutTraceReadStates();
+    } finally {
+      await handle.close();
+    }
+    const turnKey = rolloutTraceTurnKey(threadId, turnId);
+    // A trace read can race an inference terminal event. Keep the turn buffer
+    // until the caller emits a complete pair or normal state pruning expires it.
+    return {
+      events: state.eventsByTurn.get(turnKey) ?? [],
+      backpressured,
+    };
   } finally {
-    await handle.close();
+    const remainingReads = (rolloutTraceReadsInFlight.get(stateKey) ?? 1) - 1;
+    if (remainingReads > 0) {
+      rolloutTraceReadsInFlight.set(stateKey, remainingReads);
+    } else {
+      rolloutTraceReadsInFlight.delete(stateKey);
+    }
   }
-  const turnKey = rolloutTraceTurnKey(threadId, turnId);
-  // A trace read can race an inference terminal event. Keep the turn buffer
-  // until the caller emits a complete pair or normal state pruning expires it.
-  return state.eventsByTurn.get(turnKey) ?? [];
 }
 
 function collectTraceEventLines(state: RolloutTraceReadState, chunk: Buffer): void {
@@ -1659,11 +2286,18 @@ function enforceRolloutTraceReadStateBudget(state: RolloutTraceReadState): void 
 function pruneRolloutTraceReadStates(now = Date.now()): void {
   for (const [key, state] of rolloutTraceReadStates) {
     if (
-      now - state.updatedAt > ROLLOUT_TRACE_READ_STATE_TTL_MS ||
-      rolloutTraceReadStates.size > ROLLOUT_TRACE_READ_STATE_MAX_ENTRIES
+      now - state.updatedAt > ROLLOUT_TRACE_READ_STATE_TTL_MS &&
+      !isProtectedRolloutTraceReadState(key)
     ) {
       rolloutTraceReadStates.delete(key);
     }
+  }
+  while (rolloutTraceReadStates.size > ROLLOUT_TRACE_READ_STATE_MAX_ENTRIES) {
+    const oldestInactive = oldestInactiveRolloutTraceReadState();
+    if (!oldestInactive) {
+      break;
+    }
+    rolloutTraceReadStates.delete(oldestInactive[0]);
   }
   let totalBytes = [...rolloutTraceReadStates.values()].reduce(
     (sum, state) =>
@@ -1671,30 +2305,101 @@ function pruneRolloutTraceReadStates(now = Date.now()): void {
     0,
   );
   while (totalBytes > ROLLOUT_TRACE_MAX_EVENT_BYTES_GLOBAL) {
-    const oldest = [...rolloutTraceReadStates.entries()].reduce<
-      [string, RolloutTraceReadState] | undefined
-    >(
-      (current, entry) => (!current || entry[1].updatedAt < current[1].updatedAt ? entry : current),
-      undefined,
-    );
-    if (!oldest) {
+    const oldestInactive = oldestInactiveRolloutTraceReadState();
+    if (!oldestInactive) {
       break;
     }
-    totalBytes -=
-      oldest[1].totalEventBytes +
-      oldest[1].totalSkippedPayloadRefBytes +
-      oldest[1].partialLine.length;
-    rolloutTraceReadStates.delete(oldest[0]);
+    totalBytes -= retainedRolloutTraceReadStateBytes(oldestInactive[1]);
+    rolloutTraceReadStates.delete(oldestInactive[0]);
   }
 }
 
+function isProtectedRolloutTraceReadState(stateKey: string): boolean {
+  return isActiveRolloutTraceReadState(stateKey) || rolloutTraceReadsInFlight.has(stateKey);
+}
+
+function oldestInactiveRolloutTraceReadState(
+  excludedStateKey?: string,
+): [string, RolloutTraceReadState] | undefined {
+  return [...rolloutTraceReadStates.entries()].reduce<[string, RolloutTraceReadState] | undefined>(
+    (current, entry) => {
+      if (entry[0] === excludedStateKey || isProtectedRolloutTraceReadState(entry[0])) {
+        return current;
+      }
+      return !current || entry[1].updatedAt < current[1].updatedAt ? entry : current;
+    },
+    undefined,
+  );
+}
+
+function retainedRolloutTraceReadStateBytes(state: RolloutTraceReadState): number {
+  return state.totalEventBytes + state.totalSkippedPayloadRefBytes + state.partialLine.length;
+}
+
+function totalRetainedRolloutTraceReadStateBytes(): number {
+  return [...rolloutTraceReadStates.values()].reduce(
+    (sum, state) => sum + retainedRolloutTraceReadStateBytes(state),
+    0,
+  );
+}
+
+function pruneRolloutTraceReadStatesForEntry(excludedStateKey: string): void {
+  while (rolloutTraceReadStates.size >= ROLLOUT_TRACE_READ_STATE_MAX_ENTRIES) {
+    const oldestReclaimable =
+      oldestInactiveRolloutTraceReadState(excludedStateKey) ??
+      oldestReclaimableRolloutTraceReadState(excludedStateKey);
+    if (!oldestReclaimable) {
+      return;
+    }
+    rolloutTraceReadStates.delete(oldestReclaimable[0]);
+  }
+}
+
+function reserveRolloutTraceReadBytes(stateKey: string, desiredBytes: number): number {
+  let retainedBytes = totalRetainedRolloutTraceReadStateBytes();
+  while (
+    retainedBytes + rolloutTraceReservedReadBytes + desiredBytes >
+    ROLLOUT_TRACE_MAX_EVENT_BYTES_GLOBAL
+  ) {
+    const oldestReclaimable =
+      oldestInactiveRolloutTraceReadState(stateKey) ??
+      oldestReclaimableRolloutTraceReadState(stateKey);
+    if (!oldestReclaimable) {
+      break;
+    }
+    retainedBytes -= retainedRolloutTraceReadStateBytes(oldestReclaimable[1]);
+    rolloutTraceReadStates.delete(oldestReclaimable[0]);
+  }
+  const availableBytes = Math.max(
+    0,
+    ROLLOUT_TRACE_MAX_EVENT_BYTES_GLOBAL - retainedBytes - rolloutTraceReservedReadBytes,
+  );
+  const reservedBytes = Math.min(desiredBytes, availableBytes);
+  rolloutTraceReservedReadBytes += reservedBytes;
+  return reservedBytes;
+}
+
+function oldestReclaimableRolloutTraceReadState(
+  excludedStateKey: string,
+): [string, RolloutTraceReadState] | undefined {
+  return [...rolloutTraceReadStates.entries()].reduce<[string, RolloutTraceReadState] | undefined>(
+    (current, entry) => {
+      if (entry[0] === excludedStateKey || rolloutTraceReadsInFlight.has(entry[0])) {
+        return current;
+      }
+      return !current || entry[1].updatedAt < current[1].updatedAt ? entry : current;
+    },
+    undefined,
+  );
+}
+
 function buildProviderRequestBaseFields(params: {
-  baseFields: Record<string, unknown>;
+  baseFields: RolloutTraceModelBaseFields;
   callId: string;
-  started: InferenceStarted;
-  terminal: InferenceTerminal;
-}): Record<string, unknown> {
-  const upstreamRequestIdHash = params.terminal.upstreamRequestId
+  started?: InferenceStarted;
+  terminal?: InferenceTerminal;
+}): Omit<ModelCallStartedInput, "startTimeMs" | "type"> {
+  const upstreamRequestIdHash = params.terminal?.upstreamRequestId
     ? fingerprintCodexLogValue(
         CODEX_PROVIDER_REQUEST_ID_HASH_NAMESPACE,
         params.terminal.upstreamRequestId,
@@ -1704,19 +2409,14 @@ function buildProviderRequestBaseFields(params: {
     ...params.baseFields,
     callId: params.callId,
     scope: "provider-request",
-    provider: stringValue(params.started.payload.provider_name) ?? params.baseFields.provider,
-    model: stringValue(params.started.payload.model) ?? params.baseFields.model,
+    provider: stringValue(params.started?.payload.provider_name) ?? params.baseFields.provider,
+    model: stringValue(params.started?.payload.model) ?? params.baseFields.model,
     ...(upstreamRequestIdHash ? { upstreamRequestIdHash } : {}),
   };
 }
 
-function shouldReadRequestPayload(capture: RolloutTraceContentCapture | undefined): boolean {
-  return Boolean(
-    capture?.inputMessages ||
-    capture?.systemPrompt ||
-    capture?.toolDefinitions ||
-    capture?.outputMessages,
-  );
+function rolloutTraceSourceOrder(event: RawTraceEvent): string {
+  return String(eventSeq(event)).padStart(16, "0");
 }
 
 function buildTraceModelContent(params: {
@@ -1743,6 +2443,21 @@ function buildTraceModelContent(params: {
       : {}),
   };
   return Object.keys(content).length > 0 ? content : undefined;
+}
+
+function providerRequestEvidence(
+  requestPayload: unknown,
+): Pick<ModelCallStartedInput, "previousResponseIdHash" | "requestForm"> {
+  const previousResponseId = stringValue(asObject(requestPayload)?.previous_response_id);
+  return previousResponseId
+    ? {
+        requestForm: "ws-delta",
+        previousResponseIdHash: fingerprintCodexLogValue(
+          CODEX_RESPONSE_ID_HASH_NAMESPACE,
+          previousResponseId,
+        ),
+      }
+    : { requestForm: "full" };
 }
 
 function truncatedPayloadCaptureMetadata(
@@ -1778,6 +2493,27 @@ function matchesTraceTurn(
 
 function traceDurationMs(started: RawTraceEvent, terminal: RawTraceEvent): number {
   return Math.max(0, eventWallTimeMs(terminal) - eventWallTimeMs(started));
+}
+
+function resolveTerminalOnlyStart(
+  terminal: RawTraceEvent,
+  payload: RawTracePayload,
+): {
+  startTimeMs: number;
+  durationMs: number;
+  startTimeSource: "terminal" | "terminal-duration";
+} {
+  const endTimeMs = eventWallTimeMs(terminal);
+  const durationMs = numberValue(payload.duration_ms) ?? numberValue(payload.durationMs);
+  if (durationMs === undefined) {
+    return { startTimeMs: endTimeMs, durationMs: 0, startTimeSource: "terminal" };
+  }
+  const boundedDurationMs = Math.max(0, durationMs);
+  return {
+    startTimeMs: Math.max(0, endTimeMs - boundedDurationMs),
+    durationMs: boundedDurationMs,
+    startTimeSource: "terminal-duration",
+  };
 }
 
 function eventSeq(event: RawTraceEvent): number {

@@ -158,6 +158,8 @@ export function buildThreadStartParams(
     model: modelSelection.model,
     ...(modelSelection.modelProvider ? { modelProvider: modelSelection.modelProvider } : {}),
     cwd: options.cwd,
+    // Match Codex CLI/TUI user-initiated threads so provider request metadata remains equivalent.
+    threadSource: "user",
     approvalPolicy: options.appServer.approvalPolicy,
     approvalsReviewer: resolveCodexThreadApprovalsReviewer(options.appServer, options.config),
     ...codexThreadSandboxOrPermissions(options.appServer),

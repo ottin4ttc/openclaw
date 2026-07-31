@@ -262,7 +262,8 @@ export function readPluginSdkSurfaceBudgets(env = process.env) {
       // Harvest: retired dual-field plan payload builder -1.
       // +5: trusted diagnostic listener/capture contracts, including deprecated type mirrors.
       // +1: sandbox-aware Skill prompt resolution for plugin-owned native harnesses.
-      8051,
+      // +1: before-agent-run lifecycle dispatch for plugin-owned native harnesses.
+      8052,
       env,
     ),
     publicFunctionExports: readPluginSdkSurfaceBudgetEnv(
@@ -296,7 +297,8 @@ export function readPluginSdkSurfaceBudgets(env = process.env) {
       // Harvest: retired dual-field plan payload builder -1.
       // +2: trusted diagnostic capture policy through focused and compatibility surfaces.
       // +1: sandbox-aware Skill prompt resolution for plugin-owned native harnesses.
-      4491,
+      // +1: before-agent-run lifecycle dispatch for plugin-owned native harnesses.
+      4492,
       env,
     ),
     publicDeprecatedExports: readPluginSdkSurfaceBudgetEnv(

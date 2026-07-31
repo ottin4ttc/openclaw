@@ -226,6 +226,39 @@ const OPAQUE_REPLAY_TOKEN_RE = /^[A-Za-z0-9+/_-]+={0,2}$/;
 const GOOGLE_THOUGHT_SIGNATURE_RE =
   /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 const OPENAI_REPLAY_CONTEXT_HASH_RE = /^[a-f0-9]{16}$/;
+const CODEX_APP_SERVER_MIRROR_ORIGIN = "codex-app-server";
+const CODEX_MIRROR_IDENTITY_FIELDS = new Set([
+  "idempotencyKey",
+  "mirrorIdentity",
+  "toolCallId",
+  "toolUseId",
+  "tool_use_id",
+]);
+
+function isCodexAppServerMirror(source: Record<string, unknown>): boolean {
+  const metadata = source["__openclaw"];
+  return (
+    metadata !== null &&
+    typeof metadata === "object" &&
+    !Array.isArray(metadata) &&
+    (metadata as Record<string, unknown>).mirrorOrigin === CODEX_APP_SERVER_MIRROR_ORIGIN
+  );
+}
+
+function shouldPreserveCodexMirrorIdentityField(
+  source: Record<string, unknown>,
+  key: string,
+  value: unknown,
+  preserveCodexMirrorIdentity: boolean,
+): boolean {
+  if (!preserveCodexMirrorIdentity || typeof value !== "string") {
+    return false;
+  }
+  if (CODEX_MIRROR_IDENTITY_FIELDS.has(key)) {
+    return true;
+  }
+  return key === "id" && (source.type === "toolCall" || source.type === "toolResult");
+}
 
 function isOpenAIResponsesRoute(route: TranscriptAssistantRoute | undefined): boolean {
   return typeof route?.api === "string" && OPENAI_RESPONSES_APIS.has(route.api);
@@ -583,6 +616,7 @@ function redactTranscriptStructuredValue(
   preserveImageDataUrlFields = false,
   location: TranscriptValueLocation = "nested",
   assistantRoute?: TranscriptAssistantRoute,
+  preserveCodexMirrorIdentity = false,
 ): unknown {
   if (typeof value === "string") {
     if (fieldKey) {
@@ -605,6 +639,7 @@ function redactTranscriptStructuredValue(
         preserveImageDataUrlFields,
         location === "assistant-content-array" ? "assistant-content-block" : "nested",
         assistantRoute,
+        preserveCodexMirrorIdentity,
       );
       changed ||= next !== item;
       return next;
@@ -629,6 +664,8 @@ function redactTranscriptStructuredValue(
   seen.add(value);
   const sanitizedImageRecord = sanitizeImageRecord(value);
   const source = sanitizedImageRecord ?? value;
+  const currentPreserveCodexMirrorIdentity =
+    preserveCodexMirrorIdentity || (location === "root" && isCodexAppServerMirror(source));
   const currentAssistantRoute =
     location === "root" && source.role === "assistant"
       ? resolveTranscriptAssistantRoute(source, cfg)
@@ -638,6 +675,18 @@ function redactTranscriptStructuredValue(
     next = { ...source };
   }
   for (const [key, item] of Object.entries(source)) {
+    // Codex app-server generates these values as protocol correlation IDs. Mutating
+    // them during content redaction breaks tool call/result pairing and observation dedupe.
+    if (
+      shouldPreserveCodexMirrorIdentityField(
+        source,
+        key,
+        item,
+        currentPreserveCodexMirrorIdentity,
+      )
+    ) {
+      continue;
+    }
     if (
       location === "assistant-content-block" &&
       (isOpenAIResponsesRoute(currentAssistantRoute) ||
@@ -734,6 +783,7 @@ function redactTranscriptStructuredValue(
         ? "assistant-content-array"
         : "nested",
       currentAssistantRoute,
+      currentPreserveCodexMirrorIdentity,
     );
     if (redacted === item) {
       continue;

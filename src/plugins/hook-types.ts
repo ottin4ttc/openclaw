@@ -1086,6 +1086,14 @@ export type PluginHookBeforeAgentRunEvent = {
   prompt: string;
   /** Loaded session history before the current prompt is submitted. */
   messages: unknown[];
+  /**
+   * Canonical transcript history before the current turn.
+   *
+   * Unlike `messages`, this field excludes current-turn runtime context and is
+   * intended for observability/provenance consumers. Existing policy hooks
+   * must continue to use `messages` for their runtime-defined view.
+   */
+  priorMessages?: unknown[];
   /** Active system prompt prepared for this run. */
   systemPrompt?: string;
   /** Account identity when available. */

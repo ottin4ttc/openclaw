@@ -2,6 +2,7 @@ import {
   embeddedAgentLog,
   formatErrorMessage,
   runAgentCleanupStep,
+  runAgentHarnessBeforeAgentRunHook,
   runAgentHarnessLlmInputHook,
   runAgentHarnessLlmOutputHook,
   type EmbeddedRunAttemptResult,
@@ -68,9 +69,24 @@ export async function startCodexAttemptTurn(
   } = connection;
   const { state, turnIdRef } = turnRuntime;
   const { waitForActiveNativeTurnCompletion } = notifications;
-  const { codexModelCallDiagnostics, startCodexTurn, buildLlmInputEvent } = requestRuntime;
+  const {
+    codexModelCallDiagnostics,
+    startCodexTurn,
+    buildBeforeAgentRunEvent,
+    buildLlmInputEvent,
+  } = requestRuntime;
   let turn: CodexTurnStartResponse | undefined;
+  let beforeAgentRunBlocked = false;
   try {
+    const beforeAgentRun = await runAgentHarnessBeforeAgentRunHook({
+      event: buildBeforeAgentRunEvent(),
+      ctx: hookContext,
+      hookRunner,
+    });
+    if (beforeAgentRun.action === "block") {
+      beforeAgentRunBlocked = true;
+      throw new Error(beforeAgentRun.reason);
+    }
     codexModelCallDiagnostics.emitStarted();
     runAgentHarnessLlmInputHook({ event: buildLlmInputEvent(), ctx: hookContext, hookRunner });
     turn = await startCodexTurn();
@@ -187,29 +203,31 @@ export async function startCodexAttemptTurn(
         promptError: message,
       });
       markTrajectoryEndRecorded();
-      runAgentHarnessLlmOutputHook({
-        event: {
-          runId: params.runId,
-          sessionId: params.sessionId,
-          provider: usesSupervisionConnection
-            ? (resourceState.thread.modelProvider ?? effectiveRuntimeProviderId)
-            : params.provider,
-          model: usesSupervisionConnection
-            ? (resourceState.thread.model ?? effectiveRuntimeModelId)
-            : params.modelId,
-          ...hookContextWindowFields,
-          resolvedRef: usesSupervisionConnection
-            ? `${resourceState.thread.modelProvider ?? effectiveRuntimeProviderId}/${resourceState.thread.model ?? effectiveRuntimeModelId}`
-            : (params.runtimePlan?.observability.resolvedRef ??
-              `${params.provider}/${params.modelId}`),
-          ...(!usesSupervisionConnection && params.runtimePlan?.observability.harnessId
-            ? { harnessId: params.runtimePlan.observability.harnessId }
-            : {}),
-          assistantTexts: [],
-        },
-        ctx: hookContext,
-        hookRunner,
-      });
+      if (!beforeAgentRunBlocked) {
+        runAgentHarnessLlmOutputHook({
+          event: {
+            runId: params.runId,
+            sessionId: params.sessionId,
+            provider: usesSupervisionConnection
+              ? (resourceState.thread.modelProvider ?? effectiveRuntimeProviderId)
+              : params.provider,
+            model: usesSupervisionConnection
+              ? (resourceState.thread.model ?? effectiveRuntimeModelId)
+              : params.modelId,
+            ...hookContextWindowFields,
+            resolvedRef: usesSupervisionConnection
+              ? `${resourceState.thread.modelProvider ?? effectiveRuntimeProviderId}/${resourceState.thread.model ?? effectiveRuntimeModelId}`
+              : (params.runtimePlan?.observability.resolvedRef ??
+                `${params.provider}/${params.modelId}`),
+            ...(!usesSupervisionConnection && params.runtimePlan?.observability.harnessId
+              ? { harnessId: params.runtimePlan.observability.harnessId }
+              : {}),
+            assistantTexts: [],
+          },
+          ctx: hookContext,
+          hookRunner,
+        });
+      }
       const failureKind = classifyCodexModelCallFailureKind({
         error: turnStartError,
         timedOut: state.timedOut,
@@ -219,7 +237,9 @@ export async function startCodexAttemptTurn(
         clientClosedAbort: state.clientClosedAbort,
         formatError: formatErrorMessage,
       });
-      codexModelCallDiagnostics.emitError(message, failureKind ? { failureKind } : {});
+      if (!beforeAgentRunBlocked) {
+        codexModelCallDiagnostics.emitError(message, failureKind ? { failureKind } : {});
+      }
       const messagesSnapshot = [
         ...historyState.messages,
         buildCodexUserPromptMessage({ ...runtimeParams, prompt: turnState.codexTurnPromptText }),
@@ -285,6 +305,18 @@ export async function startCodexAttemptTurn(
               replaySafe: true,
             },
           },
+        };
+      }
+      if (beforeAgentRunBlocked) {
+        return {
+          result: buildCodexTurnStartFailureResult({
+            params,
+            message,
+            promptError: turnStartError,
+            promptErrorSource: "hook:before_agent_run",
+            messagesSnapshot,
+            systemPromptReport,
+          }),
         };
       }
       throw turnStartError;

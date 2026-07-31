@@ -27,7 +27,14 @@ export async function prepareCodexAttemptTurnRequest(
 ) {
   const { prompt, state: resourceState, releaseCurrentRoute } = resources;
   const { context, turnState, buildRenderedCodexDeveloperInstructions } = prompt;
-  const { runtime, attemptTools, hookContextWindowFields, workspaceBootstrapContext } = context;
+  const {
+    runtime,
+    attemptTools,
+    historyState,
+    hookContext,
+    hookContextWindowFields,
+    workspaceBootstrapContext,
+  } = context;
   const { connection, runtimeParams, effectiveRuntimeProviderId, effectiveRuntimeModelId } =
     runtime;
   const { tools } = attemptTools;
@@ -198,10 +205,23 @@ export async function prepareCodexAttemptTurnRequest(
     imagesCount: params.images?.length ?? 0,
     tools,
   });
+  const buildBeforeAgentRunEvent = () => ({
+    // The gate contract exposes the triggering user message. Prepared history
+    // and system instructions have dedicated fields and must not be duplicated here.
+    prompt: params.prompt,
+    systemPrompt: buildRenderedCodexDeveloperInstructions(),
+    messages: structuredClone(historyState.messages),
+    priorMessages: structuredClone(historyState.messages),
+    channelId: hookContext.channelId,
+    accountId: params.agentAccountId ?? undefined,
+    senderId: params.senderId ?? undefined,
+    senderIsOwner: params.senderIsOwner ?? undefined,
+  });
   return {
     codexModelCallBaseFields,
     codexModelCallDiagnostics,
     startCodexTurn,
+    buildBeforeAgentRunEvent,
     buildLlmInputEvent,
   };
 }

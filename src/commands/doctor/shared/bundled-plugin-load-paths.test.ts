@@ -104,6 +104,76 @@ describe("bundled plugin load path repair", () => {
     expect(result.config.plugins?.load?.paths).toStrictEqual([]);
   });
 
+  it("removes a source-checkout same-package root alias", () => {
+    const packageRoot = path.resolve("repo", "openclaw");
+    const bundledPath = bundledPluginRootAt(packageRoot, "openclaw-langfuse");
+    const rootAlias = path.join(packageRoot, "openclaw-langfuse");
+    mockBundledSource("openclaw-langfuse", bundledPath);
+
+    const result = maybeRepairBundledPluginLoadPaths(
+      createPluginLoadPathConfig([rootAlias, "/custom/path"]),
+    );
+
+    expect(result.changes).toEqual([
+      `- plugins.load.paths: removed bundled openclaw-langfuse path alias ${rootAlias}`,
+    ]);
+    expect(result.config.plugins?.load?.paths).toStrictEqual(["/custom/path"]);
+  });
+
+  it("retains bundled plugin configuration while removing its retired path alias", () => {
+    const packageRoot = path.resolve("repo", "openclaw");
+    const bundledPath = bundledPluginRootAt(packageRoot, "openclaw-langfuse");
+    const rootAlias = path.join(packageRoot, "openclaw-langfuse");
+    mockBundledSource("openclaw-langfuse", bundledPath);
+    const cfg = {
+      plugins: {
+        load: { paths: [rootAlias] },
+        entries: {
+          "openclaw-langfuse": {
+            enabled: true,
+            config: {
+              baseUrl: "https://langfuse.example.test",
+              publicKey: "pk-test",
+              secretKey: "sk-test",
+            },
+          },
+        },
+      },
+    } as Parameters<typeof maybeRepairBundledPluginLoadPaths>[0];
+
+    const result = maybeRepairBundledPluginLoadPaths(cfg);
+
+    expect(result.config.plugins?.load?.paths).toStrictEqual([]);
+    expect(result.config.plugins?.entries?.["openclaw-langfuse"]).toEqual(
+      cfg.plugins?.entries?.["openclaw-langfuse"],
+    );
+  });
+
+  it("removes a packaged same-package root alias", () => {
+    const packageRoot = path.resolve("app", "node_modules", "openclaw");
+    const bundledPath = bundledDistPluginRootAt(packageRoot, "openclaw-langfuse");
+    const rootAlias = path.join(packageRoot, "openclaw-langfuse");
+    mockBundledSource("openclaw-langfuse", bundledPath);
+
+    const result = maybeRepairBundledPluginLoadPaths(createPluginLoadPathConfig([rootAlias]));
+
+    expect(result.config.plugins?.load?.paths).toStrictEqual([]);
+  });
+
+  it("preserves an external same-ID plugin outside the active package root", () => {
+    const packageRoot = path.resolve("app", "node_modules", "openclaw");
+    const bundledPath = bundledDistPluginRootAt(packageRoot, "openclaw-langfuse");
+    const externalOverride = path.resolve("srv", "plugins", "openclaw-langfuse");
+    mockBundledSource("openclaw-langfuse", bundledPath);
+
+    const result = maybeRepairBundledPluginLoadPaths(
+      createPluginLoadPathConfig([externalOverride]),
+    );
+
+    expect(result.changes).toEqual([]);
+    expect(result.config.plugins?.load?.paths).toStrictEqual([externalOverride]);
+  });
+
   it("removes stale bundled paths from old versioned OpenClaw package roots", () => {
     const currentPackageRoot = path.resolve("node_modules", "openclaw");
     const stalePackageRoot = path.resolve(

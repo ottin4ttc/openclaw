@@ -30,6 +30,7 @@ export const CODEX_NATIVE_HOOK_RELAY_EVENTS: readonly NativeHookRelayEvent[] = [
 
 const CODEX_NATIVE_HOOK_RELAY_EVENTS_WITH_APP_SERVER_APPROVALS =
   CODEX_NATIVE_HOOK_RELAY_EVENTS.filter((event) => event !== "permission_request");
+export const CODEX_NATIVE_TOOL_LIFECYCLE_OWNER = "codex-native-tool-lifecycle";
 const CODEX_NATIVE_HOOK_RELAY_MIN_TTL_MS = 30 * 60_000;
 /** Extra relay lifetime after the expected turn budget, preventing late hook drops. */
 export const CODEX_NATIVE_HOOK_RELAY_TTL_GRACE_MS = 5 * 60_000;
@@ -104,6 +105,7 @@ export function emitCodexNativePreToolUseFailureDiagnostic(params: {
     ...(params.sessionKey ? { sessionKey: params.sessionKey } : {}),
     runId: params.runId,
     toolName: params.failure.toolName,
+    toolOwner: CODEX_NATIVE_TOOL_LIFECYCLE_OWNER,
     toolCallId: params.failure.toolCallId,
     durationMs: params.failure.durationMs,
     errorCategory: "before_tool_call",

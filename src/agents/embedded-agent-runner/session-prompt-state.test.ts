@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { AgentMessage } from "../runtime/index.js";
 import {
   clearEmbeddedSessionPromptStates,
   getEmbeddedSessionPromptState,
@@ -14,7 +15,12 @@ describe("embedded session prompt state", () => {
     const original = getEmbeddedSessionPromptState("active-session");
     original.toolResults.frozen.add("tool-result");
     markSessionUserTurnsSent(original, [
-      { role: "user", content: "first turn", idempotencyKey: "turn-1" },
+      {
+        role: "user",
+        content: "first turn",
+        timestamp: 1,
+        idempotencyKey: "turn-1",
+      } as AgentMessage,
     ]);
 
     for (let index = 0; index < 128; index += 1) {
@@ -45,10 +51,20 @@ describe("embedded session prompt state", () => {
   it("drops sent user turns that are no longer in the provider transcript", () => {
     const state = getEmbeddedSessionPromptState("active-session");
     markSessionUserTurnsSent(state, [
-      { role: "user", content: "first turn", idempotencyKey: "turn-1" },
+      {
+        role: "user",
+        content: "first turn",
+        timestamp: 1,
+        idempotencyKey: "turn-1",
+      } as AgentMessage,
     ]);
     markSessionUserTurnsSent(state, [
-      { role: "user", content: "second turn", idempotencyKey: "turn-2" },
+      {
+        role: "user",
+        content: "second turn",
+        timestamp: 2,
+        idempotencyKey: "turn-2",
+      } as AgentMessage,
     ]);
 
     expect(state.sentUserTurnIds).toEqual(new Set(["turn-2"]));

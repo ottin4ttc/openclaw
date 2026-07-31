@@ -2195,7 +2195,9 @@ describe("deliverOutboundPayloads", () => {
 
   it("emits bounded delivery diagnostics for successful outbound sends", async () => {
     const events: DiagnosticEventPayload[] = [];
-    const unsubscribe = onInternalDiagnosticEvent((event) => events.push(event));
+    const unsubscribe = onInternalDiagnosticEvent((event) => {
+      events.push(event);
+    });
     const sendMatrix = vi.fn().mockResolvedValue({ messageId: "m1", roomId: "!room:example" });
 
     try {
@@ -2232,7 +2234,9 @@ describe("deliverOutboundPayloads", () => {
 
   it("emits bounded delivery diagnostics for outbound send failures", async () => {
     const events: DiagnosticEventPayload[] = [];
-    const unsubscribe = onInternalDiagnosticEvent((event) => events.push(event));
+    const unsubscribe = onInternalDiagnosticEvent((event) => {
+      events.push(event);
+    });
     const sendMatrix = vi
       .fn()
       .mockRejectedValue(new TypeError("secret delivery body could not send"));

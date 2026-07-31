@@ -52,6 +52,7 @@ const EXPECTED_BUNDLED_STARTUP_PLUGIN_IDS = [
   "logbook",
   "memory-wiki",
   "ollama",
+  "openclaw-langfuse",
   "opencode",
   "openshell",
   "phone-control",

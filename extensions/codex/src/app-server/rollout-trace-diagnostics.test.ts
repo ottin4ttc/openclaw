@@ -11,17 +11,24 @@ import {
 import { onTrustedInternalDiagnosticEvent } from "openclaw/plugin-sdk/plugin-test-runtime";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  activeRolloutTraceTurnRegistrationCountForTest,
   drainCodexRolloutTraceProviderRequestDiagnostics,
   emitCodexRolloutTraceProviderRequestDiagnostics,
+  finalizeCodexRolloutTraceProviderRequestDiagnostics,
   prepareCodexRolloutTraceRoot,
   pruneCodexRolloutTraceBundles,
   registerCodexRolloutTraceClient,
+  startCodexRolloutTraceMonitor,
   waitForCodexAttemptDiagnosticEventsDrained,
 } from "./rollout-trace-diagnostics.js";
 
 type ModelCallEvent = Extract<
   DiagnosticEventPayload,
   { type: "model.call.started" | "model.call.completed" | "model.call.error" }
+>;
+type ToolExecutionEvent = Extract<
+  DiagnosticEventPayload,
+  { type: "tool.execution.started" | "tool.execution.completed" | "tool.execution.error" }
 >;
 
 afterEach(() => {
@@ -72,7 +79,11 @@ describe("emitCodexRolloutTraceProviderRequestDiagnostics", () => {
     );
     await fs.writeFile(
       path.join(payloadsDir, "3.json"),
-      `${JSON.stringify({ model: "aliyun/qwen3.7-plus", input: "second" })}\n`,
+      `${JSON.stringify({
+        model: "aliyun/qwen3.7-plus",
+        previous_response_id: "resp-1",
+        input: "second",
+      })}\n`,
     );
     await fs.writeFile(
       path.join(payloadsDir, "4.json"),
@@ -97,6 +108,7 @@ describe("emitCodexRolloutTraceProviderRequestDiagnostics", () => {
         }),
         traceEvent(2, 1075, "inference_completed", {
           inference_call_id: "call-1",
+          response_id: "resp-1",
           upstream_request_id: "upstream-secret",
           response_payload: payloadRef("2"),
         }),
@@ -178,6 +190,15 @@ describe("emitCodexRolloutTraceProviderRequestDiagnostics", () => {
     expect(modelCallEvents.every((event) => event.provider === "codex")).toBe(true);
     expect(modelCallEvents.every((event) => event.model === "aliyun/qwen3.7-plus")).toBe(true);
     expect(modelCallEvents.map((event) => event.startTimeMs)).toEqual([1000, 1000, 1100, 1100]);
+    expect(modelCallEvents[0]).toMatchObject({ requestForm: "full" });
+    expect(modelCallEvents[0]).not.toHaveProperty("previousResponseIdHash");
+    expect(modelCallEvents[1]).not.toHaveProperty("requestForm");
+    expect(modelCallEvents[1]?.responseIdHash).toMatch(/^sha256:[a-f0-9]{16}$/);
+    expect(modelCallEvents[2]).toMatchObject({
+      requestForm: "ws-delta",
+      previousResponseIdHash: modelCallEvents[1]?.responseIdHash,
+    });
+    expect(modelCallEvents[0]).not.toHaveProperty("requestTransport");
     expect(modelCallEvents[1]).toMatchObject({
       endTimeMs: 1075,
       durationMs: 75,
@@ -200,6 +221,9 @@ describe("emitCodexRolloutTraceProviderRequestDiagnostics", () => {
     expect(privateDataByCall.get("model.call.completed:call-1")?.modelContent).toMatchObject({
       outputMessages: [{ type: "message", content: [{ type: "output_text", text: "done" }] }],
     });
+    expect(privateDataByCall.get("model.call.completed:call-1")?.modelContent).not.toHaveProperty(
+      "inputMessages",
+    );
     expect(modelCallEvents[3]).toMatchObject({
       endTimeMs: 1140,
       durationMs: 40,
@@ -225,7 +249,81 @@ describe("emitCodexRolloutTraceProviderRequestDiagnostics", () => {
     await fs.rm(traceRoot, { recursive: true, force: true });
   });
 
-  it("retains bounded payload evidence and provider usage for oversized payloads", async () => {
+  it("omits unavailable per-request usage instead of estimating from the turn", async () => {
+    const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-codex-no-usage-"));
+    const bundleDir = path.join(traceRoot, "trace-one");
+    const payloadsDir = path.join(bundleDir, "payloads");
+    await fs.mkdir(payloadsDir, { recursive: true });
+    await fs.writeFile(path.join(bundleDir, "manifest.json"), "{}\n");
+    await fs.writeFile(
+      path.join(payloadsDir, "1.json"),
+      `${JSON.stringify({
+        model: "aliyun/qwen3.7-plus",
+        input: [{ role: "user", content: "hello" }],
+      })}\n`,
+    );
+    await fs.writeFile(
+      path.join(payloadsDir, "2.json"),
+      `${JSON.stringify({
+        response_id: "resp-no-usage",
+        output_items: [{ type: "message", content: "done" }],
+      })}\n`,
+    );
+    await fs.writeFile(
+      path.join(bundleDir, "trace.jsonl"),
+      [
+        traceEvent(1, 1000, "inference_started", {
+          inference_call_id: "call-no-usage",
+          request_payload: payloadRef("1"),
+        }),
+        traceEvent(2, 1050, "inference_completed", {
+          inference_call_id: "call-no-usage",
+          response_payload: payloadRef("2"),
+        }),
+      ].join(""),
+    );
+    const events: DiagnosticEventPayload[] = [];
+    onInternalDiagnosticEvent((event) => {
+      events.push(event);
+    });
+
+    await expect(
+      emitCodexRolloutTraceProviderRequestDiagnostics({
+        traceRoot,
+        threadId: "thread-1",
+        turnId: "turn-1",
+        baseFields: {
+          runId: "run-1",
+          callId: "turn-call",
+          scope: "turn-aggregate",
+          sessionId: "session-1",
+          provider: "codex",
+          model: "aliyun/qwen3.7-plus",
+        },
+      }),
+    ).resolves.toBe(2);
+    await waitForDiagnosticEventsDrained();
+
+    const modelCallEvents = events.filter(isModelCallEvent);
+    expect(modelCallEvents).toHaveLength(2);
+    expect(modelCallEvents[0]).toMatchObject({
+      type: "model.call.started",
+      callId: "call-no-usage",
+      requestForm: "full",
+    });
+    expect(modelCallEvents[0]).not.toHaveProperty("requestTransport");
+    expect(modelCallEvents[1]).toMatchObject({
+      type: "model.call.completed",
+      callId: "call-no-usage",
+      usageSource: "unknown",
+    });
+    expect(modelCallEvents[1]).not.toHaveProperty("usage");
+    expect(modelCallEvents[1]).not.toHaveProperty("requestForm");
+
+    await fs.rm(traceRoot, { recursive: true, force: true });
+  });
+
+  it("keeps oversized request evidence on start and provider usage on terminal", async () => {
     const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-codex-huge-payload-"));
     const bundleDir = path.join(traceRoot, "trace-one");
     const payloadsDir = path.join(bundleDir, "payloads");
@@ -276,13 +374,16 @@ describe("emitCodexRolloutTraceProviderRequestDiagnostics", () => {
       ].join(""),
     );
     const events: DiagnosticEventPayload[] = [];
+    let startedPrivateData: DiagnosticEventPrivateData | undefined;
     let completedPrivateData: DiagnosticEventPrivateData | undefined;
     onInternalDiagnosticEvent((event) => {
       events.push(event);
     });
     onTrustedInternalDiagnosticEvent(
       (event, _metadata, privateData) => {
-        if (event.type === "model.call.completed") {
+        if (event.type === "model.call.started") {
+          startedPrivateData = privateData;
+        } else if (event.type === "model.call.completed") {
           completedPrivateData = privateData;
         }
       },
@@ -305,15 +406,18 @@ describe("emitCodexRolloutTraceProviderRequestDiagnostics", () => {
     ).resolves.toBe(2);
     await waitForDiagnosticEventsDrained();
 
-    expect(events.filter(isModelCallEvent).at(-1)).toMatchObject({
+    expect(events.findLast(isModelCallEvent)).toMatchObject({
       type: "model.call.completed",
       usageSource: "provider",
       usage: { input: 75, output: 7, cacheRead: 25, total: 107 },
     });
-    expect(completedPrivateData?.modelContent).toMatchObject({
+    expect(startedPrivateData?.modelContent).toMatchObject({
       inputMessages: { truncated: true, originalBytes: expect.any(Number) },
+    });
+    expect(completedPrivateData?.modelContent).toMatchObject({
       outputMessages: { truncated: true, originalBytes: expect.any(Number) },
     });
+    expect(completedPrivateData?.modelContent).not.toHaveProperty("inputMessages");
     const serializedPrivateData = JSON.stringify(completedPrivateData);
     expect(serializedPrivateData).not.toContain(padding);
     expect(serializedPrivateData).not.toContain("private-system-instruction");
@@ -352,6 +456,13 @@ describe("emitCodexRolloutTraceProviderRequestDiagnostics", () => {
     );
     const baseFields = { runId: "run-1", provider: "codex", model: "aliyun/qwen3.7-plus" };
 
+    const events: ModelCallEvent[] = [];
+    onInternalDiagnosticEvent((event) => {
+      if (isModelCallEvent(event)) {
+        events.push(event);
+      }
+    });
+
     await expect(
       emitCodexRolloutTraceProviderRequestDiagnostics({
         traceRoot,
@@ -359,7 +470,11 @@ describe("emitCodexRolloutTraceProviderRequestDiagnostics", () => {
         turnId: "turn-1",
         baseFields,
       }),
-    ).resolves.toBe(0);
+    ).resolves.toBe(1);
+    await waitForDiagnosticEventsDrained();
+    expect(events.map((event) => `${event.type}:${event.callId}`)).toEqual([
+      "model.call.started:call-late",
+    ]);
     await fs.appendFile(
       traceFile,
       traceEvent(2, 1040, "inference_completed", {
@@ -375,7 +490,185 @@ describe("emitCodexRolloutTraceProviderRequestDiagnostics", () => {
         turnId: "turn-1",
         baseFields,
       }),
+    ).resolves.toBe(1);
+    await waitForDiagnosticEventsDrained();
+    expect(events.map((event) => `${event.type}:${event.callId}`)).toEqual([
+      "model.call.started:call-late",
+      "model.call.completed:call-late",
+    ]);
+
+    await fs.rm(traceRoot, { recursive: true, force: true });
+  });
+
+  it("emits a synthetic model start immediately before a terminal-only inference", async () => {
+    const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-codex-synthetic-model-"));
+    const bundleDir = path.join(traceRoot, "trace-terminal-only");
+    const payloadsDir = path.join(bundleDir, "payloads");
+    await fs.mkdir(payloadsDir, { recursive: true });
+    await fs.writeFile(path.join(bundleDir, "manifest.json"), "{}\n");
+    await fs.writeFile(
+      path.join(payloadsDir, "1.json"),
+      `${JSON.stringify({
+        token_usage: { input_tokens: 3, output_tokens: 2, total_tokens: 5 },
+        output_items: [],
+      })}\n`,
+    );
+    await fs.writeFile(
+      path.join(bundleDir, "trace.jsonl"),
+      [
+        traceEvent(7, 1040, "inference_completed", {
+          inference_call_id: "terminal-only",
+          response_payload: payloadRef("1"),
+          duration_ms: 40,
+        }),
+        traceEvent(8, 1050, "codex_turn_ended", { status: "completed" }),
+      ].join(""),
+    );
+    const events: ModelCallEvent[] = [];
+    onInternalDiagnosticEvent((event) => {
+      if (isModelCallEvent(event)) {
+        events.push(event);
+      }
+    });
+
+    await expect(
+      emitCodexRolloutTraceProviderRequestDiagnostics({
+        traceRoot,
+        threadId: "thread-1",
+        turnId: "turn-1",
+        baseFields: { runId: "run-1", provider: "codex", model: "baidu/glm-5.2" },
+      }),
     ).resolves.toBe(2);
+    await waitForDiagnosticEventsDrained();
+
+    expect(events.map((event) => event.type)).toEqual([
+      "model.call.started",
+      "model.call.completed",
+    ]);
+    expect(events).toMatchObject([
+      {
+        callId: "terminal-only",
+        startTimeMs: 1000,
+        syntheticStart: true,
+        startTimeSource: "terminal-duration",
+        providerRequestIndex: 1,
+        rolloutSourceOrder: "0000000000000007",
+      },
+      {
+        callId: "terminal-only",
+        startTimeMs: 1000,
+        endTimeMs: 1040,
+        durationMs: 40,
+        providerRequestIndex: 1,
+        rolloutSourceOrder: "0000000000000007",
+      },
+    ]);
+    await expect(
+      emitCodexRolloutTraceProviderRequestDiagnostics({
+        traceRoot,
+        threadId: "thread-1",
+        turnId: "turn-1",
+        baseFields: { runId: "run-1", provider: "codex", model: "baidu/glm-5.2" },
+      }),
+    ).resolves.toBe(0);
+
+    await fs.rm(traceRoot, { recursive: true, force: true });
+  });
+
+  it("keeps an empty turn open until final drain so late lifecycle records can replay", async () => {
+    const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-codex-empty-turn-"));
+    const bundleDir = path.join(traceRoot, "trace-empty-turn");
+    await fs.mkdir(bundleDir, { recursive: true });
+    await fs.writeFile(path.join(bundleDir, "manifest.json"), "{}\n");
+    const traceFile = path.join(bundleDir, "trace.jsonl");
+    await fs.writeFile(traceFile, traceEvent(1, 1000, "codex_turn_ended", { status: "completed" }));
+    const events: ModelCallEvent[] = [];
+    onInternalDiagnosticEvent((event) => {
+      if (isModelCallEvent(event)) {
+        events.push(event);
+      }
+    });
+    const params = {
+      traceRoot,
+      threadId: "thread-1",
+      turnId: "turn-1",
+      baseFields: { runId: "run-1", provider: "codex", model: "baidu/glm-5.2" },
+    };
+
+    await expect(emitCodexRolloutTraceProviderRequestDiagnostics(params)).resolves.toBe(0);
+    await fs.appendFile(
+      traceFile,
+      traceEvent(2, 1010, "inference_completed", {
+        inference_call_id: "late-terminal-only",
+        duration_ms: 10,
+      }),
+    );
+
+    await expect(
+      finalizeCodexRolloutTraceProviderRequestDiagnostics(params),
+    ).resolves.toMatchObject({
+      emitted: 2,
+      complete: true,
+    });
+    await waitForDiagnosticEventsDrained();
+    expect(events.map((event) => `${event.type}:${event.callId}`)).toEqual([
+      "model.call.started:late-terminal-only",
+      "model.call.completed:late-terminal-only",
+    ]);
+
+    await fs.rm(traceRoot, { recursive: true, force: true });
+  });
+
+  it("keeps a nonempty turn open during polling so later lifecycle records can replay", async () => {
+    const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-codex-open-turn-"));
+    const bundleDir = path.join(traceRoot, "trace-open-turn");
+    await fs.mkdir(bundleDir, { recursive: true });
+    await fs.writeFile(path.join(bundleDir, "manifest.json"), "{}\n");
+    const traceFile = path.join(bundleDir, "trace.jsonl");
+    await fs.writeFile(
+      traceFile,
+      [
+        traceEvent(1, 1000, "inference_started", { inference_call_id: "first-call" }),
+        traceEvent(2, 1020, "inference_completed", { inference_call_id: "first-call" }),
+        traceEvent(3, 1030, "codex_turn_ended", { status: "completed" }),
+      ].join(""),
+    );
+    const events: ModelCallEvent[] = [];
+    onInternalDiagnosticEvent((event) => {
+      if (isModelCallEvent(event)) {
+        events.push(event);
+      }
+    });
+    const params = {
+      traceRoot,
+      threadId: "thread-1",
+      turnId: "turn-1",
+      baseFields: { runId: "run-1", provider: "codex", model: "baidu/glm-5.2" },
+    };
+
+    await expect(emitCodexRolloutTraceProviderRequestDiagnostics(params)).resolves.toBe(2);
+    await fs.appendFile(
+      traceFile,
+      traceEvent(4, 1060, "inference_completed", {
+        inference_call_id: "late-terminal-only",
+        duration_ms: 10,
+      }),
+    );
+    await expect(emitCodexRolloutTraceProviderRequestDiagnostics(params)).resolves.toBe(2);
+    await expect(
+      finalizeCodexRolloutTraceProviderRequestDiagnostics(params),
+    ).resolves.toMatchObject({
+      emitted: 0,
+      complete: true,
+    });
+    await waitForDiagnosticEventsDrained();
+
+    expect(events.map((event) => `${event.type}:${event.callId}`)).toEqual([
+      "model.call.started:first-call",
+      "model.call.completed:first-call",
+      "model.call.started:late-terminal-only",
+      "model.call.completed:late-terminal-only",
+    ]);
 
     await fs.rm(traceRoot, { recursive: true, force: true });
   });
@@ -423,7 +716,7 @@ describe("emitCodexRolloutTraceProviderRequestDiagnostics", () => {
       baseFields: { runId: "run-1", provider: "codex", model: "aliyun/qwen3.7-plus" },
     };
 
-    await expect(emitCodexRolloutTraceProviderRequestDiagnostics(params)).resolves.toBe(0);
+    await expect(emitCodexRolloutTraceProviderRequestDiagnostics(params)).resolves.toBe(1);
     await fs.appendFile(
       traceFile,
       [
@@ -435,7 +728,7 @@ describe("emitCodexRolloutTraceProviderRequestDiagnostics", () => {
       ].join(""),
     );
 
-    await expect(emitCodexRolloutTraceProviderRequestDiagnostics(params)).resolves.toBe(2);
+    await expect(emitCodexRolloutTraceProviderRequestDiagnostics(params)).resolves.toBe(1);
     await waitForDiagnosticEventsDrained();
 
     expect(events.map((event) => `${event.type}:${event.callId}`)).toEqual([
@@ -586,7 +879,9 @@ describe("emitCodexRolloutTraceProviderRequestDiagnostics", () => {
         traceEventForTurn(3, 1050, "codex_turn_ended", {}, "thread-1", "turn-no-background"),
       ].join(""),
     );
-    await new Promise((resolve) => setTimeout(resolve, 250));
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 250);
+    });
     await waitForDiagnosticEventsDrained();
 
     expect(events).toEqual([]);
@@ -638,7 +933,9 @@ describe("emitCodexRolloutTraceProviderRequestDiagnostics", () => {
         traceEventForTurn(3, 1050, "codex_turn_ended", {}, "thread-1", "turn-cancel-background"),
       ].join(""),
     );
-    await new Promise((resolve) => setTimeout(resolve, 250));
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 250);
+    });
     await waitForDiagnosticEventsDrained();
 
     expect(events).toEqual([]);
@@ -749,7 +1046,7 @@ describe("emitCodexRolloutTraceProviderRequestDiagnostics", () => {
           toolOutputs: true,
         },
       }),
-    ).resolves.toBe(3);
+    ).resolves.toBe(4);
 
     for (const name of ["1.json", "2.json", "3.json", "4.json"]) {
       await expect(fs.access(path.join(payloadsDir, name))).rejects.toThrow();
@@ -759,7 +1056,184 @@ describe("emitCodexRolloutTraceProviderRequestDiagnostics", () => {
     await fs.rm(traceRoot, { recursive: true, force: true });
   });
 
-  it("defers later tool diagnostics until an earlier inference terminal arrives", async () => {
+  it("reports emitted rollout tool lifecycle coverage from the final drain", async () => {
+    const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-codex-tool-coverage-"));
+    const bundleDir = path.join(traceRoot, "trace-one");
+    await fs.mkdir(bundleDir, { recursive: true });
+    await fs.writeFile(path.join(bundleDir, "manifest.json"), "{}\n");
+    await fs.writeFile(
+      path.join(bundleDir, "trace.jsonl"),
+      [
+        traceEvent(1, 1000, "tool_call_started", { tool_call_id: "tool-covered" }),
+        traceEvent(2, 1020, "tool_call_ended", {
+          tool_call_id: "tool-covered",
+          status: "completed",
+        }),
+        traceEvent(3, 1030, "codex_turn_ended", { status: "completed" }),
+      ].join(""),
+    );
+
+    await expect(
+      finalizeCodexRolloutTraceProviderRequestDiagnostics({
+        traceRoot,
+        threadId: "thread-1",
+        turnId: "turn-1",
+        baseFields: { runId: "run-1", provider: "codex", model: "baidu/glm-5.2" },
+      }),
+    ).resolves.toMatchObject({
+      complete: true,
+      emittedToolLifecycleKeys: ["started:tool-covered", "terminal:tool-covered"],
+    });
+
+    await fs.rm(traceRoot, { recursive: true, force: true });
+  });
+
+  it("retains tool payloads until a late terminal makes the turn complete", async () => {
+    const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-codex-late-tool-"));
+    const bundleDir = path.join(traceRoot, "trace-one");
+    const payloadsDir = path.join(bundleDir, "payloads");
+    await fs.mkdir(payloadsDir, { recursive: true });
+    await fs.writeFile(path.join(bundleDir, "manifest.json"), "{}\n");
+    await fs.writeFile(
+      path.join(payloadsDir, "1.json"),
+      JSON.stringify({
+        tool_name: "lookup",
+        payload: { type: "function", arguments: JSON.stringify({ query: "late" }) },
+      }),
+    );
+    await fs.writeFile(
+      path.join(payloadsDir, "2.json"),
+      JSON.stringify({ type: "direct_response", response_item: { output: "found" } }),
+    );
+    const traceFile = path.join(bundleDir, "trace.jsonl");
+    await fs.writeFile(
+      traceFile,
+      [
+        traceEvent(1, 1000, "tool_call_started", {
+          tool_call_id: "tool-late",
+          invocation_payload: payloadRef("1"),
+        }),
+        traceEvent(2, 1010, "codex_turn_ended", { status: "completed" }),
+      ].join(""),
+    );
+    const events: ToolExecutionEvent[] = [];
+    onInternalDiagnosticEvent((event) => {
+      if (event.type.startsWith("tool.execution.")) {
+        events.push(event as ToolExecutionEvent);
+      }
+    });
+    const params = {
+      traceRoot,
+      threadId: "thread-1",
+      turnId: "turn-1",
+      baseFields: { runId: "run-1", provider: "codex", model: "baidu/deepseek-v4-pro" },
+    };
+
+    await expect(emitCodexRolloutTraceProviderRequestDiagnostics(params)).resolves.toBe(1);
+    await expect(fs.access(path.join(payloadsDir, "1.json"))).resolves.toBeUndefined();
+
+    await fs.appendFile(
+      traceFile,
+      traceEvent(3, 1020, "tool_call_ended", {
+        tool_call_id: "tool-late",
+        result_payload: payloadRef("2"),
+        status: "completed",
+      }),
+    );
+    await expect(emitCodexRolloutTraceProviderRequestDiagnostics(params)).resolves.toBe(1);
+    await waitForDiagnosticEventsDrained();
+
+    expect(events.map((event) => `${event.type}:${event.toolName}`)).toEqual([
+      "tool.execution.started:lookup",
+      "tool.execution.completed:lookup",
+    ]);
+    for (const name of ["1.json", "2.json"]) {
+      await expect(fs.access(path.join(payloadsDir, name))).rejects.toThrow();
+    }
+
+    await fs.rm(traceRoot, { recursive: true, force: true });
+  });
+
+  it("closes a started-only tool as an error after the final drain settles", async () => {
+    const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-codex-missing-tool-"));
+    const bundleDir = path.join(traceRoot, "trace-one");
+    const payloadsDir = path.join(bundleDir, "payloads");
+    await fs.mkdir(payloadsDir, { recursive: true });
+    await fs.writeFile(path.join(bundleDir, "manifest.json"), "{}\n");
+    await fs.writeFile(
+      path.join(payloadsDir, "1.json"),
+      JSON.stringify({
+        tool_name: "openmai_internal_api_call",
+        payload: {
+          type: "function",
+          arguments: JSON.stringify({ method: "POST", path: "/api/search" }),
+        },
+      }),
+    );
+    await fs.writeFile(
+      path.join(bundleDir, "trace.jsonl"),
+      [
+        traceEvent(1, 1000, "tool_call_started", {
+          tool_call_id: "tool-missing-terminal",
+          invocation_payload: payloadRef("1"),
+        }),
+        traceEvent(2, 1100, "codex_turn_ended", { status: "completed" }),
+      ].join(""),
+    );
+    const toolEvents: Array<{
+      event: ToolExecutionEvent;
+      privateData: DiagnosticEventPrivateData | undefined;
+    }> = [];
+    onTrustedInternalDiagnosticEvent(
+      (event, _metadata, privateData) => {
+        if (event.type.startsWith("tool.execution.")) {
+          toolEvents.push({ event: event as ToolExecutionEvent, privateData });
+        }
+      },
+      { captureModelContent: { toolInputs: true, toolOutputs: true } },
+    );
+
+    await expect(
+      finalizeCodexRolloutTraceProviderRequestDiagnostics({
+        traceRoot,
+        threadId: "thread-1",
+        turnId: "turn-1",
+        baseFields: { runId: "run-1", provider: "codex", model: "clawos/gpt-5.6-sol" },
+        capture: { toolInputs: true, toolOutputs: true },
+      }),
+    ).resolves.toMatchObject({
+      emitted: 2,
+      complete: true,
+      emittedToolLifecycleKeys: ["started:tool-missing-terminal", "terminal:tool-missing-terminal"],
+    });
+    await waitForDiagnosticEventsDrained();
+
+    expect(toolEvents.map(({ event }) => event.type)).toEqual([
+      "tool.execution.started",
+      "tool.execution.error",
+    ]);
+    expect(toolEvents[1]?.event).toMatchObject({
+      toolName: "openmai_internal_api_call",
+      toolCallId: "tool-missing-terminal",
+      startTimeMs: 1000,
+      endTimeMs: 1100,
+      durationMs: 100,
+      errorCategory: "codex_native_tool_missing_terminal",
+      errorCode: "tool_terminal_missing",
+      terminalReason: "failed",
+    });
+    expect(toolEvents[1]?.privateData).toEqual({
+      toolContent: {
+        toolInput: { method: "POST", path: "/api/search" },
+        toolOutput: { status: "error", errorCode: "tool_terminal_missing" },
+      },
+    });
+    await expect(fs.access(path.join(payloadsDir, "1.json"))).rejects.toThrow();
+
+    await fs.rm(traceRoot, { recursive: true, force: true });
+  });
+
+  it("streams later tool diagnostics before an earlier inference terminal arrives", async () => {
     const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-codex-order-trace-"));
     const bundleDir = path.join(traceRoot, "trace-one");
     const payloadsDir = path.join(bundleDir, "payloads");
@@ -808,7 +1282,13 @@ describe("emitCodexRolloutTraceProviderRequestDiagnostics", () => {
       baseFields: { runId: "run-1", provider: "codex", model: "baidu/deepseek-v4-pro" },
     };
 
-    await expect(emitCodexRolloutTraceProviderRequestDiagnostics(params)).resolves.toBe(0);
+    await expect(emitCodexRolloutTraceProviderRequestDiagnostics(params)).resolves.toBe(3);
+    await waitForDiagnosticEventsDrained();
+    expect(eventTypes).toEqual([
+      "model.call.started",
+      "tool.execution.started",
+      "tool.execution.completed",
+    ]);
     await fs.appendFile(
       traceFile,
       [
@@ -816,11 +1296,12 @@ describe("emitCodexRolloutTraceProviderRequestDiagnostics", () => {
         traceEvent(5, 1040, "codex_turn_ended", { status: "completed" }),
       ].join(""),
     );
-    await expect(emitCodexRolloutTraceProviderRequestDiagnostics(params)).resolves.toBe(3);
+    await expect(emitCodexRolloutTraceProviderRequestDiagnostics(params)).resolves.toBe(1);
     await waitForDiagnosticEventsDrained();
 
     expect(eventTypes).toEqual([
       "model.call.started",
+      "tool.execution.started",
       "tool.execution.completed",
       "model.call.completed",
     ]);
@@ -1042,8 +1523,25 @@ describe("emitCodexRolloutTraceProviderRequestDiagnostics", () => {
     });
     await waitForDiagnosticEventsDrained();
 
-    expect(toolEvents).toHaveLength(2);
+    expect(toolEvents).toHaveLength(4);
     expect(toolEvents[0]?.event).toMatchObject({
+      type: "tool.execution.started",
+      runId: "run-1",
+      sessionKey: "agent:openmai-u1:openresponses:s1",
+      sessionId: "session-1",
+      toolName: "skills.list",
+      toolSource: "core",
+      toolOwner: "codex-rollout-trace",
+      toolCallId: "tool-call-1",
+      startTimeMs: 2000,
+      sourceTimestampMs: 2000,
+    });
+    expect(toolEvents[0]?.privateData).toEqual({
+      toolContent: {
+        toolInput: { authority: { kind: "orchestrator" } },
+      },
+    });
+    expect(toolEvents[1]?.event).toMatchObject({
       type: "tool.execution.completed",
       runId: "run-1",
       sessionKey: "agent:openmai-u1:openresponses:s1",
@@ -1056,13 +1554,20 @@ describe("emitCodexRolloutTraceProviderRequestDiagnostics", () => {
       endTimeMs: 2075,
       durationMs: 75,
     });
-    expect(toolEvents[0]?.privateData).toEqual({
+    expect(toolEvents[1]?.privateData).toEqual({
       toolContent: {
         toolInput: { authority: { kind: "orchestrator" } },
         toolOutput: { skills: ["example-search"], warnings: [] },
       },
     });
-    expect(toolEvents[1]?.privateData).toEqual({
+    expect(toolEvents[2]?.event).toMatchObject({
+      type: "tool.execution.started",
+      toolName: "skills.search",
+      toolCallId: "tool-call-2",
+      startTimeMs: 2100,
+      sourceTimestampMs: 2100,
+    });
+    expect(toolEvents[3]?.privateData).toEqual({
       toolContent: {
         toolInput: { query: "talent" },
         toolOutput: {
@@ -1083,7 +1588,79 @@ describe("emitCodexRolloutTraceProviderRequestDiagnostics", () => {
       capture: { toolInputs: true, toolOutputs: true },
     });
     await waitForDiagnosticEventsDrained();
-    expect(toolEvents).toHaveLength(2);
+    expect(toolEvents).toHaveLength(4);
+
+    await fs.rm(traceRoot, { recursive: true, force: true });
+  });
+
+  it("emits a synthetic tool start and claims rollout start coverage", async () => {
+    const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-codex-synthetic-tool-"));
+    const bundleDir = path.join(traceRoot, "trace-tool-terminal-only");
+    const payloadsDir = path.join(bundleDir, "payloads");
+    await fs.mkdir(payloadsDir, { recursive: true });
+    await fs.writeFile(path.join(bundleDir, "manifest.json"), "{}\n");
+    await fs.writeFile(
+      path.join(payloadsDir, "1.json"),
+      JSON.stringify({
+        type: "direct_response",
+        response_item: { output: JSON.stringify({ ok: true }) },
+      }),
+    );
+    await fs.writeFile(
+      path.join(bundleDir, "trace.jsonl"),
+      [
+        traceEvent(9, 3075, "tool_call_ended", {
+          tool_call_id: "terminal-tool",
+          status: "completed",
+          result_payload: payloadRef("1"),
+          durationMs: 75,
+        }),
+        traceEvent(10, 3080, "codex_turn_ended", { status: "completed" }),
+      ].join(""),
+    );
+    const events: ToolExecutionEvent[] = [];
+    onTrustedInternalDiagnosticEvent((event) => {
+      if (isToolExecutionEvent(event)) {
+        events.push(event);
+      }
+    });
+
+    await expect(
+      finalizeCodexRolloutTraceProviderRequestDiagnostics({
+        traceRoot,
+        threadId: "thread-1",
+        turnId: "turn-1",
+        baseFields: { runId: "run-1", sessionId: "session-1" },
+        capture: { toolOutputs: true },
+      }),
+    ).resolves.toMatchObject({
+      emitted: 2,
+      complete: true,
+      emittedToolLifecycleKeys: ["started:terminal-tool", "terminal:terminal-tool"],
+    });
+    await waitForDiagnosticEventsDrained();
+
+    expect(events).toMatchObject([
+      {
+        type: "tool.execution.started",
+        toolName: "codex.native_tool",
+        toolCallId: "terminal-tool",
+        startTimeMs: 3000,
+        sourceTimestampMs: 3000,
+        syntheticStart: true,
+        startTimeSource: "terminal-duration",
+        rolloutSourceOrder: "0000000000000009",
+      },
+      {
+        type: "tool.execution.completed",
+        toolName: "codex.native_tool",
+        toolCallId: "terminal-tool",
+        startTimeMs: 3000,
+        endTimeMs: 3075,
+        durationMs: 75,
+        rolloutSourceOrder: "0000000000000009",
+      },
+    ]);
 
     await fs.rm(traceRoot, { recursive: true, force: true });
   });
@@ -1149,17 +1726,23 @@ describe("emitCodexRolloutTraceProviderRequestDiagnostics", () => {
         baseFields: { runId: "run-1" },
         capture: { toolInputs: true, toolOutputs: true },
       }),
-    ).resolves.toBe(1);
+    ).resolves.toBe(2);
     await waitForDiagnosticEventsDrained();
 
-    expect(toolEvents).toHaveLength(1);
+    expect(toolEvents).toHaveLength(2);
     expect(toolEvents[0]?.event).toMatchObject({
+      type: "tool.execution.started",
+      toolName: "skills.large",
+      toolCallId: "tool-call-huge",
+      paramsSummary: { kind: "truncated", originalBytes: expect.any(Number) },
+    });
+    expect(toolEvents[1]?.event).toMatchObject({
       type: "tool.execution.completed",
       toolName: "skills.large",
       toolCallId: "tool-call-huge",
       paramsSummary: { kind: "truncated", originalBytes: expect.any(Number) },
     });
-    expect(toolEvents[0]?.privateData).toEqual({
+    expect(toolEvents[1]?.privateData).toEqual({
       toolContent: {
         toolInput: { truncated: true, originalBytes: expect.any(Number) },
         toolOutput: { truncated: true, originalBytes: expect.any(Number) },
@@ -1262,11 +1845,12 @@ describe("emitCodexRolloutTraceProviderRequestDiagnostics", () => {
           toolOutputs: true,
         },
       }),
-    ).resolves.toBe(3);
+    ).resolves.toBe(4);
     await waitForDiagnosticEventsDrained();
 
     expect(orderedEvents).toEqual([
       { type: "model.call.started", provider: "Baidu", model: "glm-5.2" },
+      { type: "tool.execution.started" },
       { type: "tool.execution.completed" },
       { type: "model.call.completed", provider: "Baidu", model: "glm-5.2" },
     ]);
@@ -1374,40 +1958,30 @@ describe("emitCodexRolloutTraceProviderRequestDiagnostics", () => {
     await fs.rm(traceRoot, { recursive: true, force: true });
   });
 
-  it("seals a completed turn when unrelated trace bundle reads fail", async () => {
+  it("keeps a completed polled turn open for lifecycle records appended before final drain", async () => {
     const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-codex-bundles-trace-"));
-    const matchingDir = path.join(traceRoot, "trace-matching");
-    const unrelatedDir = path.join(traceRoot, "trace-unrelated");
-    await fs.mkdir(path.join(matchingDir, "payloads"), { recursive: true });
-    await fs.mkdir(unrelatedDir, { recursive: true });
-    await fs.writeFile(path.join(matchingDir, "manifest.json"), "{}\n");
-    await fs.writeFile(path.join(unrelatedDir, "manifest.json"), "{}\n");
+    const bundleDir = path.join(traceRoot, "trace-matching");
+    await fs.mkdir(bundleDir, { recursive: true });
+    await fs.writeFile(path.join(bundleDir, "manifest.json"), "{}\n");
+    const traceFile = path.join(bundleDir, "trace.jsonl");
     await fs.writeFile(
-      path.join(matchingDir, "payloads", "1.json"),
-      `${JSON.stringify({ model: "glm-5.2", input: "request" })}\n`,
-    );
-    await fs.writeFile(
-      path.join(matchingDir, "payloads", "2.json"),
-      `${JSON.stringify({
-        token_usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
-        output_items: [],
-      })}\n`,
-    );
-    const matchingTrace = path.join(matchingDir, "trace.jsonl");
-    await fs.writeFile(
-      matchingTrace,
+      traceFile,
       [
         traceEvent(1, 1000, "inference_started", {
-          inference_call_id: "call-complete",
-          request_payload: payloadRef("1"),
+          inference_call_id: "call-before-final",
         }),
         traceEvent(2, 1010, "inference_completed", {
-          inference_call_id: "call-complete",
-          response_payload: payloadRef("2"),
+          inference_call_id: "call-before-final",
         }),
         traceEvent(3, 1020, "codex_turn_ended", { status: "completed" }),
       ].join(""),
     );
+    const events: ModelCallEvent[] = [];
+    onInternalDiagnosticEvent((event) => {
+      if (isModelCallEvent(event)) {
+        events.push(event);
+      }
+    });
     const params = {
       traceRoot,
       threadId: "thread-1",
@@ -1417,18 +1991,40 @@ describe("emitCodexRolloutTraceProviderRequestDiagnostics", () => {
 
     await expect(emitCodexRolloutTraceProviderRequestDiagnostics(params)).resolves.toBe(2);
     await fs.appendFile(
-      matchingTrace,
+      traceFile,
       [
-        traceEvent(4, 1030, "inference_started", { inference_call_id: "post-turn-call" }),
-        traceEvent(5, 1040, "inference_completed", { inference_call_id: "post-turn-call" }),
+        traceEvent(4, 1030, "inference_started", {
+          inference_call_id: "call-appended-before-final",
+        }),
+        traceEvent(5, 1040, "inference_completed", {
+          inference_call_id: "call-appended-before-final",
+        }),
       ].join(""),
     );
-    await expect(emitCodexRolloutTraceProviderRequestDiagnostics(params)).resolves.toBe(0);
+    await expect(
+      finalizeCodexRolloutTraceProviderRequestDiagnostics(params),
+    ).resolves.toMatchObject({
+      emitted: 2,
+      complete: true,
+    });
+    await waitForDiagnosticEventsDrained();
+    expect(events.map((event) => `${event.type}:${event.callId}`)).toEqual([
+      "model.call.started:call-before-final",
+      "model.call.completed:call-before-final",
+      "model.call.started:call-appended-before-final",
+      "model.call.completed:call-appended-before-final",
+    ]);
+    await expect(
+      finalizeCodexRolloutTraceProviderRequestDiagnostics(params),
+    ).resolves.toMatchObject({
+      emitted: 0,
+      complete: true,
+    });
 
     await fs.rm(traceRoot, { recursive: true, force: true });
   });
 
-  it("cleans every payload ref and settles after an oversized pending turn ends", async () => {
+  it("cleans every payload ref when an oversized skipped turn reaches its terminal boundary", async () => {
     const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-codex-large-trace-"));
     const bundleDir = path.join(traceRoot, "trace-large");
     const payloadsDir = path.join(bundleDir, "payloads");
@@ -1458,6 +2054,7 @@ describe("emitCodexRolloutTraceProviderRequestDiagnostics", () => {
     };
 
     await expect(emitCodexRolloutTraceProviderRequestDiagnostics(params)).resolves.toBe(0);
+    await expect(fs.access(path.join(payloadsDir, "1.json"))).resolves.toBeUndefined();
     await fs.appendFile(
       traceFile,
       [
@@ -1518,7 +2115,7 @@ describe("emitCodexRolloutTraceProviderRequestDiagnostics", () => {
     await fs.rm(traceRoot, { recursive: true, force: true });
   });
 
-  it("cleans payload refs for a pending turn evicted by the state byte budget", async () => {
+  it("cleans byte-budget-evicted payload refs known at the terminal turn boundary", async () => {
     const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-codex-budget-scrub-"));
     const bundleDir = path.join(traceRoot, "trace-budget-scrub");
     const payloadsDir = path.join(bundleDir, "payloads");
@@ -1558,19 +2155,24 @@ describe("emitCodexRolloutTraceProviderRequestDiagnostics", () => {
     };
 
     await expect(emitCodexRolloutTraceProviderRequestDiagnostics(params)).resolves.toBe(0);
+    await expect(fs.access(path.join(payloadsDir, "1.json"))).resolves.toBeUndefined();
     await fs.appendFile(
       traceFile,
-      [
-        traceEvent(12, 2000, "inference_completed", {
-          inference_call_id: "evicted-call",
-          response_payload: payloadRef("2"),
-        }),
-        traceEvent(13, 2010, "codex_turn_ended", { status: "completed" }),
-      ].join(""),
+      traceEvent(12, 2000, "codex_turn_ended", { status: "completed" }),
     );
     await expect(emitCodexRolloutTraceProviderRequestDiagnostics(params)).resolves.toBe(0);
 
     await expect(fs.access(path.join(payloadsDir, "1.json"))).rejects.toThrow();
+    await expect(fs.access(path.join(payloadsDir, "2.json"))).resolves.toBeUndefined();
+
+    await fs.appendFile(
+      traceFile,
+      traceEvent(13, 2010, "inference_completed", {
+        inference_call_id: "evicted-call",
+        response_payload: payloadRef("2"),
+      }),
+    );
+    await expect(emitCodexRolloutTraceProviderRequestDiagnostics(params)).resolves.toBe(0);
     await expect(fs.access(path.join(payloadsDir, "2.json"))).rejects.toThrow();
     await fs.rm(traceRoot, { recursive: true, force: true });
   });
@@ -1632,6 +2234,651 @@ describe("emitCodexRolloutTraceProviderRequestDiagnostics", () => {
   });
 });
 
+describe("startCodexRolloutTraceMonitor", () => {
+  it("keeps duplicate active-turn registrations protected until every owner releases", () => {
+    const params = {
+      traceRoot: path.join(os.tmpdir(), "openclaw-codex-registration-count"),
+      threadId: "thread-1",
+      turnId: "turn-1",
+      baseFields: { runId: "run-1", provider: "codex", model: "model" },
+      intervalMs: 60_000,
+    };
+    const first = startCodexRolloutTraceMonitor(params);
+    const second = startCodexRolloutTraceMonitor(params);
+
+    expect(activeRolloutTraceTurnRegistrationCountForTest(params)).toBe(2);
+    first.stop();
+    expect(activeRolloutTraceTurnRegistrationCountForTest(params)).toBe(1);
+    second.stop();
+    expect(activeRolloutTraceTurnRegistrationCountForTest(params)).toBe(0);
+  });
+
+  it("serializes trace reads across different turns sharing one bundle", async () => {
+    const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-codex-shared-bundle-"));
+    const bundleDir = path.join(traceRoot, "trace-shared");
+    await fs.mkdir(bundleDir, { recursive: true });
+    await fs.writeFile(path.join(bundleDir, "manifest.json"), "{}\n");
+    await fs.writeFile(
+      path.join(bundleDir, "trace.jsonl"),
+      [
+        traceEventForTurn(
+          1,
+          1_000,
+          "inference_started",
+          { inference_call_id: "call-1" },
+          "thread-1",
+          "turn-1",
+        ),
+        traceEventForTurn(
+          2,
+          1_001,
+          "inference_started",
+          { inference_call_id: "call-2" },
+          "thread-2",
+          "turn-2",
+        ),
+      ].join(""),
+    );
+
+    let releaseFirstOpen: (() => void) | undefined;
+    const firstOpenGate = new Promise<void>((resolve) => {
+      releaseFirstOpen = resolve;
+    });
+    let markFirstOpenStarted: (() => void) | undefined;
+    const firstOpenStarted = new Promise<void>((resolve) => {
+      markFirstOpenStarted = resolve;
+    });
+    let activeTraceOpens = 0;
+    let maxActiveTraceOpens = 0;
+    const originalOpen = fs.open.bind(fs);
+    const openSpy = vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+      const handle = await originalOpen(...args);
+      if (!String(args[0]).endsWith("trace.jsonl")) {
+        return handle;
+      }
+      activeTraceOpens += 1;
+      maxActiveTraceOpens = Math.max(maxActiveTraceOpens, activeTraceOpens);
+      const originalClose = handle.close.bind(handle);
+      handle.close = (async () => {
+        activeTraceOpens -= 1;
+        return originalClose();
+      }) as typeof handle.close;
+      if (activeTraceOpens === 1) {
+        markFirstOpenStarted?.();
+        await firstOpenGate;
+      }
+      return handle;
+    });
+    const first = emitCodexRolloutTraceProviderRequestDiagnostics({
+      traceRoot,
+      threadId: "thread-1",
+      turnId: "turn-1",
+      baseFields: { runId: "run-1", provider: "codex", model: "model" },
+    });
+    await firstOpenStarted;
+    const second = emitCodexRolloutTraceProviderRequestDiagnostics({
+      traceRoot,
+      threadId: "thread-2",
+      turnId: "turn-2",
+      baseFields: { runId: "run-2", provider: "codex", model: "model" },
+    });
+    await new Promise<void>((resolve) => {
+      setImmediate(resolve);
+    });
+
+    releaseFirstOpen?.();
+    await expect(Promise.all([first, second])).resolves.toEqual([1, 1]);
+    openSpy.mockRestore();
+    expect(maxActiveTraceOpens).toBe(1);
+  });
+
+  it("streams appended events, serializes final drain, and stops idempotently", async () => {
+    const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-codex-monitor-"));
+    const bundleDir = path.join(traceRoot, "trace-monitor");
+    await fs.mkdir(bundleDir, { recursive: true });
+    await fs.writeFile(path.join(bundleDir, "manifest.json"), "{}\n");
+    const traceFile = path.join(bundleDir, "trace.jsonl");
+    const events: ModelCallEvent[] = [];
+    onInternalDiagnosticEvent((event) => {
+      if (isModelCallEvent(event)) {
+        events.push(event);
+      }
+    });
+    const monitor = startCodexRolloutTraceMonitor({
+      traceRoot,
+      threadId: "thread-1",
+      turnId: "turn-monitor",
+      baseFields: { runId: "run-1", provider: "codex", model: "baidu/glm-5.2" },
+      intervalMs: 10,
+    });
+
+    await fs.writeFile(
+      traceFile,
+      traceEventForTurn(
+        1,
+        1000,
+        "inference_started",
+        { inference_call_id: "streamed-call" },
+        "thread-1",
+        "turn-monitor",
+      ),
+    );
+    await vi.waitFor(async () => {
+      await waitForDiagnosticEventsDrained();
+      expect(events.map((event) => `${event.type}:${event.callId}`)).toEqual([
+        "model.call.started:streamed-call",
+      ]);
+    });
+    await fs.appendFile(
+      traceFile,
+      [
+        traceEventForTurn(
+          2,
+          1040,
+          "inference_completed",
+          { inference_call_id: "streamed-call" },
+          "thread-1",
+          "turn-monitor",
+        ),
+        traceEventForTurn(
+          3,
+          1050,
+          "codex_turn_ended",
+          { status: "completed" },
+          "thread-1",
+          "turn-monitor",
+        ),
+      ].join(""),
+    );
+    await expect(Promise.all([monitor.finalDrain(), monitor.finalDrain()])).resolves.toEqual([
+      expect.objectContaining({ complete: true }),
+      expect.objectContaining({ complete: true }),
+    ]);
+    await waitForDiagnosticEventsDrained();
+
+    expect(events.map((event) => `${event.type}:${event.callId}`)).toEqual([
+      "model.call.started:streamed-call",
+      "model.call.completed:streamed-call",
+    ]);
+    await fs.appendFile(
+      traceFile,
+      traceEventForTurn(
+        3,
+        1080,
+        "inference_started",
+        { inference_call_id: "after-stop" },
+        "thread-1",
+        "turn-monitor",
+      ),
+    );
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 50);
+    });
+    await waitForDiagnosticEventsDrained();
+    expect(events.map((event) => event.callId)).toEqual(["streamed-call", "streamed-call"]);
+    monitor.stop();
+    monitor.stop();
+
+    await fs.rm(traceRoot, { recursive: true, force: true });
+  });
+
+  it("fails softly when monitor reads throw", async () => {
+    const logs: Array<Record<string, unknown> | undefined> = [];
+    const monitor = startCodexRolloutTraceMonitor({
+      traceRoot: path.join(os.tmpdir(), "openclaw-codex-missing-monitor-root"),
+      threadId: "thread-1",
+      turnId: "turn-1",
+      baseFields: { runId: "run-1", provider: "codex", model: "baidu/glm-5.2" },
+      intervalMs: 10,
+      log: {
+        debug(_message, data) {
+          logs.push(data);
+        },
+      },
+    });
+
+    await expect(monitor.finalDrain()).resolves.toEqual({
+      emitted: 0,
+      complete: false,
+      reason: "read_error",
+    });
+    monitor.stop();
+    expect(logs.length).toBeGreaterThanOrEqual(0);
+  });
+
+  it("retains incremental offsets for 100 concurrently active monitors", async () => {
+    const roots = await Promise.all(
+      Array.from({ length: 100 }, async (_, index) => {
+        const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-codex-stress-"));
+        const bundleDir = path.join(traceRoot, `trace-${index}`);
+        await fs.mkdir(bundleDir, { recursive: true });
+        await fs.writeFile(path.join(bundleDir, "manifest.json"), "{}\n");
+        const traceFile = path.join(bundleDir, "trace.jsonl");
+        const started = traceEventForTurn(
+          1,
+          1000,
+          "inference_started",
+          { inference_call_id: `stress-call-${index}` },
+          `stress-thread-${index}`,
+          `stress-turn-${index}`,
+        );
+        await fs.writeFile(traceFile, started);
+        return { traceRoot, traceFile, startedBytes: Buffer.byteLength(started), index };
+      }),
+    );
+    const readPositions = new Map<string, number[]>();
+    const originalOpen = fs.open.bind(fs);
+    const openSpy = vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+      const handle = await originalOpen(...args);
+      const file = String(args[0]);
+      if (file.endsWith("trace.jsonl")) {
+        const originalRead = handle.read.bind(handle);
+        handle.read = (async (...readArgs: Parameters<typeof handle.read>) => {
+          const position = readArgs[3];
+          if (typeof position === "number") {
+            const positions = readPositions.get(file) ?? [];
+            positions.push(position);
+            readPositions.set(file, positions);
+          }
+          return originalRead(...readArgs);
+        }) as typeof handle.read;
+      }
+      return handle;
+    });
+    const monitors = roots.map(({ traceRoot, index }) =>
+      startCodexRolloutTraceMonitor({
+        traceRoot,
+        threadId: `stress-thread-${index}`,
+        turnId: `stress-turn-${index}`,
+        baseFields: { runId: `stress-run-${index}`, provider: "codex", model: "stress" },
+        intervalMs: 60_000,
+      }),
+    );
+
+    try {
+      await Promise.all(
+        roots.map(({ traceRoot, index }) =>
+          emitCodexRolloutTraceProviderRequestDiagnostics({
+            traceRoot,
+            threadId: `stress-thread-${index}`,
+            turnId: `stress-turn-${index}`,
+            baseFields: { runId: `stress-run-${index}`, provider: "codex", model: "stress" },
+          }),
+        ),
+      );
+      await Promise.all(
+        roots.map(({ traceFile, index }) =>
+          fs.appendFile(
+            traceFile,
+            [
+              traceEventForTurn(
+                2,
+                1040,
+                "inference_completed",
+                { inference_call_id: `stress-call-${index}` },
+                `stress-thread-${index}`,
+                `stress-turn-${index}`,
+              ),
+              traceEventForTurn(
+                3,
+                1050,
+                "codex_turn_ended",
+                { status: "completed" },
+                `stress-thread-${index}`,
+                `stress-turn-${index}`,
+              ),
+            ].join(""),
+          ),
+        ),
+      );
+      const drains = await Promise.all(monitors.map((monitor) => monitor.finalDrain()));
+
+      expect(drains.every((drain) => drain.complete)).toBe(true);
+      for (const { traceFile, startedBytes } of roots) {
+        const positions = readPositions.get(traceFile) ?? [];
+        expect(positions.filter((position) => position === 0)).toHaveLength(1);
+        expect(positions).toContain(startedBytes);
+      }
+    } finally {
+      for (const monitor of monitors) {
+        monitor.stop();
+      }
+      openSpy.mockRestore();
+      await Promise.all(
+        roots.map(({ traceRoot }) => fs.rm(traceRoot, { recursive: true, force: true })),
+      );
+    }
+  });
+
+  it("bounds historical bundle states under an active root without stalling append progress", async () => {
+    const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-codex-history-cap-"));
+    const activeBundleDir = path.join(traceRoot, "000-active");
+    await fs.mkdir(activeBundleDir, { recursive: true });
+    await fs.writeFile(path.join(activeBundleDir, "manifest.json"), "{}\n");
+    const activeTraceFile = path.join(activeBundleDir, "trace.jsonl");
+    const activeStart = traceEventForTurn(
+      1,
+      1000,
+      "inference_started",
+      { inference_call_id: "active-call" },
+      "active-thread",
+      "active-turn",
+    );
+    await fs.writeFile(activeTraceFile, activeStart);
+    const historicalTraceFiles = await Promise.all(
+      Array.from({ length: 129 }, async (_, index) => {
+        const bundleDir = path.join(traceRoot, `100-history-${String(index).padStart(3, "0")}`);
+        await fs.mkdir(bundleDir, { recursive: true });
+        await fs.writeFile(path.join(bundleDir, "manifest.json"), "{}\n");
+        const traceFile = path.join(bundleDir, "trace.jsonl");
+        await fs.writeFile(
+          traceFile,
+          traceEventForTurn(
+            1,
+            900,
+            "codex_turn_ended",
+            { status: "completed" },
+            `history-thread-${index}`,
+            `history-turn-${index}`,
+          ),
+        );
+        return traceFile;
+      }),
+    );
+    const readPositions = new Map<string, number[]>();
+    const originalOpen = fs.open.bind(fs);
+    const openSpy = vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+      const handle = await originalOpen(...args);
+      const file = String(args[0]);
+      if (file.endsWith("trace.jsonl")) {
+        const originalRead = handle.read.bind(handle);
+        handle.read = (async (...readArgs: Parameters<typeof handle.read>) => {
+          const position = readArgs[3];
+          if (typeof position === "number") {
+            const positions = readPositions.get(file) ?? [];
+            positions.push(position);
+            readPositions.set(file, positions);
+          }
+          return originalRead(...readArgs);
+        }) as typeof handle.read;
+      }
+      return handle;
+    });
+    const monitor = startCodexRolloutTraceMonitor({
+      traceRoot,
+      threadId: "active-thread",
+      turnId: "active-turn",
+      baseFields: { runId: "active-run", provider: "codex", model: "stress" },
+      intervalMs: 60_000,
+    });
+
+    try {
+      await expect(
+        emitCodexRolloutTraceProviderRequestDiagnostics({
+          traceRoot,
+          threadId: "active-thread",
+          turnId: "active-turn",
+          baseFields: { runId: "active-run", provider: "codex", model: "stress" },
+        }),
+      ).resolves.toBe(1);
+      await fs.appendFile(
+        activeTraceFile,
+        [
+          traceEventForTurn(
+            2,
+            1040,
+            "inference_completed",
+            { inference_call_id: "active-call" },
+            "active-thread",
+            "active-turn",
+          ),
+          traceEventForTurn(
+            3,
+            1050,
+            "codex_turn_ended",
+            { status: "completed" },
+            "active-thread",
+            "active-turn",
+          ),
+        ].join(""),
+      );
+
+      await expect(monitor.finalDrain()).resolves.toMatchObject({ complete: true });
+      expect(readPositions.get(activeTraceFile)?.filter((position) => position === 0)).toHaveLength(
+        1,
+      );
+      expect(readPositions.get(activeTraceFile)).toContain(Buffer.byteLength(activeStart));
+      expect(
+        historicalTraceFiles.some(
+          (traceFile) =>
+            (readPositions.get(traceFile)?.filter((position) => position === 0).length ?? 0) > 1,
+        ),
+      ).toBe(true);
+    } finally {
+      monitor.stop();
+      openSpy.mockRestore();
+      await fs.rm(traceRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("reclaims active state caches without losing buffered events when they fill the global budget", async () => {
+    const roots: string[] = [];
+    const monitors: Array<ReturnType<typeof startCodexRolloutTraceMonitor>> = [];
+    const largeValue = "x".repeat(1020 * 1024);
+    const createBundle = async (prefix: string) => {
+      const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
+      roots.push(traceRoot);
+      const bundleDir = path.join(traceRoot, "trace-budget");
+      await fs.mkdir(bundleDir, { recursive: true });
+      await fs.writeFile(path.join(bundleDir, "manifest.json"), "{}\n");
+      return {
+        traceRoot,
+        bundleDir,
+        traceFile: path.join(bundleDir, "trace.jsonl"),
+      };
+    };
+    const readPositions = new Map<string, number[]>();
+    const originalOpen = fs.open.bind(fs);
+    const openSpy = vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+      const handle = await originalOpen(...args);
+      const file = String(args[0]);
+      if (file.endsWith("trace.jsonl")) {
+        const originalRead = handle.read.bind(handle);
+        handle.read = (async (...readArgs: Parameters<typeof handle.read>) => {
+          const position = readArgs[3];
+          if (typeof position === "number") {
+            const positions = readPositions.get(file) ?? [];
+            positions.push(position);
+            readPositions.set(file, positions);
+          }
+          return originalRead(...readArgs);
+        }) as typeof handle.read;
+      }
+      return handle;
+    });
+
+    try {
+      const inactive = await createBundle("openclaw-codex-budget-inactive-");
+      await fs.writeFile(
+        inactive.traceFile,
+        traceEventForTurn(
+          1,
+          900,
+          "inference_started",
+          { inference_call_id: "inactive-call" },
+          "inactive-thread",
+          "inactive-turn",
+        ),
+      );
+      await expect(
+        emitCodexRolloutTraceProviderRequestDiagnostics({
+          traceRoot: inactive.traceRoot,
+          threadId: "buffer-only-thread",
+          turnId: "buffer-only-turn",
+          baseFields: { runId: "inactive-buffer", provider: "codex", model: "stress" },
+        }),
+      ).resolves.toBe(0);
+
+      const target = await createBundle("openclaw-codex-budget-active-");
+      const targetPayloadsDir = path.join(target.bundleDir, "payloads");
+      await fs.mkdir(targetPayloadsDir, { recursive: true });
+      await fs.writeFile(
+        path.join(targetPayloadsDir, "1.json"),
+        JSON.stringify({
+          tool_name: "lookup",
+          payload: { type: "function", arguments: JSON.stringify({ query: "kept" }) },
+        }),
+      );
+      await fs.writeFile(
+        path.join(targetPayloadsDir, "2.json"),
+        JSON.stringify({ type: "direct_response", response_item: { output: "found" } }),
+      );
+      const targetStart = traceEventForTurn(
+        1,
+        1000,
+        "tool_call_started",
+        {
+          tool_call_id: "target-tool",
+          invocation_payload: payloadRef("1"),
+          largeValue,
+        },
+        "target-thread",
+        "target-turn",
+      );
+      await fs.writeFile(target.traceFile, targetStart);
+      const targetMonitor = startCodexRolloutTraceMonitor({
+        traceRoot: target.traceRoot,
+        threadId: "target-thread",
+        turnId: "target-turn",
+        baseFields: { runId: "target-run", provider: "codex", model: "stress" },
+        capture: { toolInputs: true, toolOutputs: true },
+        intervalMs: 60_000,
+      });
+      monitors.push(targetMonitor);
+      await expect(
+        emitCodexRolloutTraceProviderRequestDiagnostics({
+          traceRoot: target.traceRoot,
+          threadId: "buffer-only-thread",
+          turnId: "buffer-only-turn",
+          baseFields: { runId: "target-buffer", provider: "codex", model: "stress" },
+        }),
+      ).resolves.toBe(0);
+
+      for (let index = 0; index < 34; index += 1) {
+        const filler = await createBundle("openclaw-codex-budget-filler-");
+        await fs.writeFile(
+          filler.traceFile,
+          traceEventForTurn(
+            1,
+            1100 + index,
+            "inference_started",
+            { inference_call_id: `filler-call-${index}`, largeValue },
+            `filler-thread-${index}`,
+            `filler-turn-${index}`,
+          ),
+        );
+        const monitor = startCodexRolloutTraceMonitor({
+          traceRoot: filler.traceRoot,
+          threadId: `filler-thread-${index}`,
+          turnId: `filler-turn-${index}`,
+          baseFields: { runId: `filler-run-${index}`, provider: "codex", model: "stress" },
+          intervalMs: 60_000,
+        });
+        monitors.push(monitor);
+        await emitCodexRolloutTraceProviderRequestDiagnostics({
+          traceRoot: filler.traceRoot,
+          threadId: "buffer-only-thread",
+          turnId: "buffer-only-turn",
+          baseFields: { runId: `filler-buffer-${index}`, provider: "codex", model: "stress" },
+        });
+      }
+
+      await fs.appendFile(
+        target.traceFile,
+        [
+          traceEventForTurn(
+            2,
+            1200,
+            "tool_call_ended",
+            {
+              tool_call_id: "target-tool",
+              result_payload: payloadRef("2"),
+              status: "completed",
+            },
+            "target-thread",
+            "target-turn",
+          ),
+          traceEventForTurn(
+            3,
+            1210,
+            "codex_turn_ended",
+            { status: "completed" },
+            "target-thread",
+            "target-turn",
+          ),
+        ].join(""),
+      );
+      const toolEvents: ToolExecutionEvent[] = [];
+      onInternalDiagnosticEvent((event) => {
+        if (isToolExecutionEvent(event)) {
+          toolEvents.push(event);
+        }
+      });
+
+      await expect(targetMonitor.finalDrain()).resolves.toMatchObject({ complete: true });
+      await waitForDiagnosticEventsDrained();
+      const targetEvents = toolEvents.filter((event) => event.toolCallId === "target-tool");
+      expect(targetEvents.map((event) => `${event.type}:${event.toolName}`)).toEqual([
+        "tool.execution.started:lookup",
+        "tool.execution.completed:lookup",
+      ]);
+      expect(targetEvents[0]).not.toHaveProperty("syntheticStart");
+      expect(readPositions.get(target.traceFile)?.filter((position) => position === 0).length).toBe(
+        2,
+      );
+
+      await fs.appendFile(
+        inactive.traceFile,
+        [
+          traceEventForTurn(
+            2,
+            1300,
+            "inference_completed",
+            { inference_call_id: "inactive-call" },
+            "inactive-thread",
+            "inactive-turn",
+          ),
+          traceEventForTurn(
+            3,
+            1310,
+            "codex_turn_ended",
+            { status: "completed" },
+            "inactive-thread",
+            "inactive-turn",
+          ),
+        ].join(""),
+      );
+      await expect(
+        finalizeCodexRolloutTraceProviderRequestDiagnostics({
+          traceRoot: inactive.traceRoot,
+          threadId: "inactive-thread",
+          turnId: "inactive-turn",
+          baseFields: { runId: "inactive-run", provider: "codex", model: "stress" },
+        }),
+      ).resolves.toMatchObject({ complete: true });
+      expect(
+        readPositions.get(inactive.traceFile)?.filter((position) => position === 0),
+      ).toHaveLength(2);
+    } finally {
+      for (const monitor of monitors) {
+        monitor.stop();
+      }
+      openSpy.mockRestore();
+      await Promise.all(roots.map((root) => fs.rm(root, { recursive: true, force: true })));
+    }
+  });
+});
+
 describe("pruneCodexRolloutTraceBundles", () => {
   it("periodically removes completed bundles without requiring another attempt", async () => {
     let scheduledPrune: (() => Promise<void>) | undefined;
@@ -1662,11 +2909,16 @@ describe("pruneCodexRolloutTraceBundles", () => {
 
       await firstPrune?.();
 
-      await expect(fs.access(path.join(traceRoot, "attempt-completed"))).rejects.toThrow();
+      await vi.waitFor(async () => {
+        await expect(fs.access(path.join(traceRoot, "attempt-completed"))).rejects.toThrow();
+      });
     } finally {
       await fs.rm(traceRoot, { recursive: true, force: true });
       const cleanupPrune = scheduledPrune;
       await cleanupPrune?.();
+      await new Promise<void>((resolve) => {
+        setImmediate(resolve);
+      });
       setTimeoutSpy.mockRestore();
     }
   });
@@ -1698,11 +2950,16 @@ describe("pruneCodexRolloutTraceBundles", () => {
 
       await scheduledPrune?.();
 
-      await expect(fs.access(bundleDir)).rejects.toThrow();
+      await vi.waitFor(async () => {
+        await expect(fs.access(bundleDir)).rejects.toThrow();
+      });
     } finally {
       await fs.rm(traceRoot, { recursive: true, force: true });
       const cleanupPrune = scheduledPrune;
       await cleanupPrune?.();
+      await new Promise<void>((resolve) => {
+        setImmediate(resolve);
+      });
       setTimeoutSpy.mockRestore();
     }
   });
@@ -1904,11 +3161,20 @@ describe("pruneCodexRolloutTraceBundles", () => {
 describe("waitForCodexAttemptDiagnosticEventsDrained", () => {
   it("bounds attempt finalization when the global diagnostic queue does not drain", async () => {
     await expect(
-      waitForCodexAttemptDiagnosticEventsDrained(() => new Promise(() => undefined), 10),
+      waitForCodexAttemptDiagnosticEventsDrained(() => new Promise(() => {}), 10),
     ).resolves.toBe(false);
     await expect(
       waitForCodexAttemptDiagnosticEventsDrained(() => Promise.resolve(), 10),
     ).resolves.toBe(true);
+  });
+
+  it("fails soft when the scoped diagnostic drain rejects", async () => {
+    await expect(
+      waitForCodexAttemptDiagnosticEventsDrained(async (timeoutMs) => {
+        expect(timeoutMs).toBe(10);
+        throw new Error("delivery cap exhausted");
+      }, 10),
+    ).resolves.toBe(false);
   });
 });
 
@@ -1917,6 +3183,14 @@ function isModelCallEvent(event: DiagnosticEventPayload): event is ModelCallEven
     event.type === "model.call.started" ||
     event.type === "model.call.completed" ||
     event.type === "model.call.error"
+  );
+}
+
+function isToolExecutionEvent(event: DiagnosticEventPayload): event is ToolExecutionEvent {
+  return (
+    event.type === "tool.execution.started" ||
+    event.type === "tool.execution.completed" ||
+    event.type === "tool.execution.error"
   );
 }
 

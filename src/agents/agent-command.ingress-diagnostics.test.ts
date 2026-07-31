@@ -154,6 +154,7 @@ function makeOpts(overrides?: Record<string, unknown>) {
     message: "hello",
     sessionKey: "agent:main:main",
     agentId: "main",
+    runId: "run-ingress-1",
     allowModelOverride: false,
     messageChannel: "api",
     ...overrides,
@@ -221,6 +222,7 @@ describe("emitIngressModelUsageDiagnostic", () => {
       sessionId: "sess-abc",
       channel: "api",
       agentId: "main",
+      runId: "run-ingress-1",
       provider: "openai",
       model: "gpt-5.5",
       usage: {

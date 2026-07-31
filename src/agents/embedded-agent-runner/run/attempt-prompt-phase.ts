@@ -168,6 +168,7 @@ export async function runEmbeddedAttemptPromptPhase(input: {
     const {
       aggregatePressureEngaged,
       hookMessagesForCurrentPrompt,
+      priorMessagesForHook,
       promptForModel,
       systemPromptForHook,
     } = promptContext;
@@ -189,6 +190,7 @@ export async function runEmbeddedAttemptPromptPhase(input: {
       activeSession,
       hookContext: hookCtx,
       hookMessages: hookMessagesForCurrentPrompt,
+      priorMessages: priorMessagesForHook,
       hookRunner: input.assembly.hookRunner,
       modelPrompt: promptForModel,
       sessionManager,

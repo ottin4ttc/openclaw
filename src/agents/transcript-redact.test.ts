@@ -1384,6 +1384,99 @@ describe("redactTranscriptMessage", () => {
     expect(summaryResult.summary).not.toContain("sk-abcdef1234567890xyz");
   });
 
+  it("preserves trusted Codex mirror tool identities while redacting payload content", () => {
+    const toolCallId = "exec-31bc63b8-378f-4b0b-92fc-2d03482cff0d";
+    const assistant = {
+      role: "assistant",
+      content: [
+        {
+          type: "toolCall",
+          id: toolCallId,
+          name: "bash",
+          arguments: { command: "printf sk-abcdef1234567890xyz" },
+        },
+      ],
+      idempotencyKey: `codex-app-server:thread-1:turn-1:tool:${toolCallId}:call`,
+      __openclaw: {
+        mirrorOrigin: "codex-app-server",
+        mirrorIdentity: `turn-1:tool:${toolCallId}:call`,
+      },
+    } as unknown as AgentMessage;
+    const toolResult = {
+      role: "toolResult",
+      toolCallId,
+      toolName: "bash",
+      content: [
+        {
+          type: "toolResult",
+          id: toolCallId,
+          toolCallId,
+          toolUseId: toolCallId,
+          tool_use_id: toolCallId,
+          content: "sk-abcdef1234567890xyz",
+        },
+      ],
+      idempotencyKey: `codex-app-server:thread-1:turn-1:tool:${toolCallId}:result`,
+      __openclaw: {
+        mirrorOrigin: "codex-app-server",
+        mirrorIdentity: `turn-1:tool:${toolCallId}:result`,
+      },
+    } as unknown as AgentMessage;
+
+    const redactedAssistant = redactTranscriptMessage(assistant, cfg("tools")) as unknown as {
+      content: Array<{ id: string; arguments: { command: string } }>;
+      idempotencyKey: string;
+      __openclaw: { mirrorIdentity: string };
+    };
+    const redactedResult = redactTranscriptMessage(toolResult, cfg("tools")) as unknown as {
+      toolCallId: string;
+      content: Array<{
+        id: string;
+        toolCallId: string;
+        toolUseId: string;
+        tool_use_id: string;
+        content: string;
+      }>;
+      idempotencyKey: string;
+      __openclaw: { mirrorIdentity: string };
+    };
+
+    expect(redactedAssistant.content[0]?.id).toBe(toolCallId);
+    expect(redactedAssistant.idempotencyKey).toContain(toolCallId);
+    expect(redactedAssistant.__openclaw.mirrorIdentity).toContain(toolCallId);
+    expect(redactedAssistant.content[0]?.arguments.command).not.toContain(
+      "sk-abcdef1234567890xyz",
+    );
+    expect(redactedResult.toolCallId).toBe(toolCallId);
+    expect(redactedResult.content[0]).toMatchObject({
+      id: toolCallId,
+      toolCallId,
+      toolUseId: toolCallId,
+      tool_use_id: toolCallId,
+    });
+    expect(redactedResult.idempotencyKey).toContain(toolCallId);
+    expect(redactedResult.__openclaw.mirrorIdentity).toContain(toolCallId);
+    expect(redactedResult.content[0]?.content).not.toContain("sk-abcdef1234567890xyz");
+  });
+
+  it("continues redacting token-shaped IDs outside trusted Codex mirrors", () => {
+    const toolCallId = "exec-31bc63b8-378f-4b0b-92fc-2d03482cff0d";
+    const message = {
+      role: "toolResult",
+      toolCallId,
+      toolName: "bash",
+      content: [{ type: "toolResult", id: toolCallId, content: "safe" }],
+    } as unknown as AgentMessage;
+
+    const result = redactTranscriptMessage(message, cfg("tools")) as unknown as {
+      toolCallId: string;
+      content: Array<{ id: string }>;
+    };
+
+    expect(result.toolCallId).not.toBe(toolCallId);
+    expect(result.content[0]?.id).not.toBe(toolCallId);
+  });
+
   it("redacts using custom pattern without dropping default patterns", () => {
     const msg = textMessage("email peter@dc.io and key sk-abcdef1234567890xyz ok");
     const result = redactTranscriptMessage(msg, cfg("tools", [EMAIL_PATTERN]));

@@ -1,4 +1,13 @@
 import type { ContextEngineSessionTarget } from "../../../context-engine/types.js";
+import {
+  beginInternalDiagnosticDeliveryIdentity,
+  captureInternalDiagnosticDeliveryCursor,
+  completeInternalDiagnosticDeliveryIdentity,
+  failInternalDiagnosticDeliveryIdentity,
+  waitForInternalDiagnosticDeliveryCursor,
+} from "../../../infra/diagnostic-delivery.js";
+// Install the process-local delivery implementation before exposing its host-only capability.
+import "../../../infra/diagnostic-events.js";
 import { createAgentHarnessTaskRuntimeScope } from "../../../tasks/agent-harness-task-runtime-scope.js";
 import type { ToolOutcomeObserver } from "../../agent-tools.before-tool-call.js";
 import type { AuthProfileStore } from "../../auth-profiles.js";
@@ -14,6 +23,7 @@ import {
   EMBEDDED_RUN_LANE_TIMEOUT_GRACE_MS,
 } from "./lane-runtime.js";
 import type { RunEmbeddedAgentParams } from "./params.js";
+import { CODEX_HARNESS_ID } from "./runtime-resolution.js";
 import { resolveSkillWorkshopAttemptParams } from "./skill-workshop-attempt-params.js";
 import type { EmbeddedRunAttemptParams, EmbeddedRunAttemptTrajectoryRecorder } from "./types.js";
 
@@ -160,216 +170,265 @@ export async function dispatchEmbeddedRunAttempt(input: {
   };
 
   let cancellationRequested = false;
-  const rawAttempt = await runEmbeddedAttemptWithBackend({
-    sessionId: runtime.sessionId,
-    sessionKey: runtime.sessionKey,
-    promptCacheKey: params.promptCacheKey,
-    sandboxSessionKey: params.sandboxSessionKey,
-    trigger: params.trigger,
-    memoryFlushWritePath: params.memoryFlushWritePath,
-    messageChannel: params.messageChannel,
-    messageProvider: params.messageProvider,
-    clientCaps: params.clientCaps,
-    chatType: params.chatType,
-    agentAccountId: params.agentAccountId,
-    messageTo: params.messageTo,
-    messageThreadId: params.messageThreadId,
-    messageActionTurnCapability: params.messageActionTurnCapability,
-    groupId: params.groupId,
-    groupChannel: params.groupChannel,
-    groupSpace: params.groupSpace,
-    memberRoleIds: params.memberRoleIds,
-    spawnedBy: params.spawnedBy,
-    isCanonicalWorkspace: runtime.isCanonicalWorkspace,
-    senderId: params.senderId,
-    senderName: params.senderName,
-    senderUsername: params.senderUsername,
-    senderE164: params.senderE164,
-    senderIsOwner: params.senderIsOwner,
-    approvalReviewerDeviceId: params.approvalReviewerDeviceId,
-    currentChannelId: params.currentChannelId,
-    chatId: params.chatId,
-    channelContext: params.channelContext,
-    currentMessagingTarget: params.currentMessagingTarget,
-    currentThreadTs: params.currentThreadTs,
-    currentMessageId: params.currentMessageId,
-    currentInboundAudio: params.currentInboundAudio,
-    replyToMode: params.replyToMode,
-    hasRepliedRef: params.hasRepliedRef,
-    sessionFile: runtime.sessionFile,
-    sessionTarget: runtime.sessionTarget,
-    trajectorySessionFile: runtime.trajectorySessionFile,
-    trajectoryRecorder: runtime.trajectoryRecorder,
-    workspaceDir: runtime.workspaceDir,
-    cwd: params.cwd,
-    agentDir: runtime.agentDir,
-    config: params.config,
-    allowGatewaySubagentBinding: params.allowGatewaySubagentBinding,
-    ...(runtime.contextEngine
-      ? {
-          contextEngine: runtime.contextEngine,
-          contextTokenBudget: runtime.contextTokenBudget,
-          contextWindowInfo: runtime.contextWindowInfo,
-        }
-      : {}),
-    skillsSnapshot: params.skillsSnapshot,
-    prompt: runtime.prompt,
-    transcriptPrompt: params.transcriptPrompt,
-    userTurnTranscriptRecorder: params.userTurnTranscriptRecorder,
-    skipPreparedUserTurnMessage: runtime.skipPreparedUserTurnMessage,
-    currentInboundEventKind: params.currentInboundEventKind,
-    currentInboundContext: params.currentInboundContext,
-    images: params.images,
-    imageOrder: params.imageOrder,
-    clientTools: params.clientTools,
-    disableTools: params.disableTools,
-    provider: runtime.provider,
-    modelId: runtime.modelId,
-    requestedModelId: runtime.requestedModelId,
-    fallbackActive: runtime.fallbackActive,
-    fallbackReason: runtime.fallbackReason,
-    delegationCapability: resolveDelegationCapability({
-      fallbackActive: runtime.fallbackActive,
-      inputProvenance: params.inputProvenance,
-    }),
-    isFinalFallbackAttempt: params.isFinalFallbackAttempt,
-    agentHarnessId: runtime.agentHarnessId,
-    agentHarnessRuntimeOverride: runtime.agentHarnessId,
-    modelSelectionLocked: params.modelSelectionLocked,
-    ...(runtime.captureRuntimeArtifact ? { captureRuntimeArtifact: true } : {}),
-    ...(runtime.expectedRuntimeArtifact
-      ? { expectedRuntimeArtifact: runtime.expectedRuntimeArtifact }
-      : {}),
-    ...(params.sessionKey
-      ? {
-          agentHarnessTaskRuntimeScope: createAgentHarnessTaskRuntimeScope({
-            requesterSessionKey: params.sessionKey,
-          }),
-        }
-      : {}),
-    runtimePlan: runtime.runtimePlan,
-    observeToolTerminal,
-    model: applyAuthHeaderOverride(
-      applyLocalNoAuthHeaderOverride(runtime.model, runtime.apiKeyInfo),
-      runtime.runtimeAuthActive ? null : runtime.apiKeyInfo,
-      params.config,
-    ),
-    resolvedApiKey: runtime.resolvedApiKey,
-    authProfileId: runtime.authProfileId,
-    authProfileIdSource: runtime.authProfileIdSource,
-    initialReplayState: runtime.initialReplayState,
-    authStorage: runtime.authStorage,
-    authProfileStore: runtime.authProfileStore,
-    toolAuthProfileStore: runtime.toolAuthProfileStore,
-    modelRegistry: runtime.modelRegistry,
-    agentId: runtime.agentId,
-    beforeAgentStartResult: runtime.beforeAgentStartResult,
-    thinkLevel: runtime.thinkLevel,
-    onToolOutcome: control.onToolOutcome,
-    allocateToolOutcomeOrdinal: control.allocateToolOutcomeOrdinal,
-    onToolStreamBoundary: control.onToolStreamBoundary,
-    onRunProgress: control.onRunProgress,
-    fastMode: runtime.fastMode,
-    fastModeAuto: params.fastMode === "auto",
-    ...(params.fastMode === "auto"
-      ? {
-          fastModeStartedAtMs: runtime.fastModeStartedAtMs,
-          fastModeAutoOnSeconds: runtime.fastModeAutoOnSeconds,
-          fastModeAutoProgressState: runtime.fastModeAutoProgressState,
-        }
-      : {}),
-    verboseLevel: params.verboseLevel,
-    reasoningLevel: params.reasoningLevel,
-    toolResultFormat: runtime.toolResultFormat,
-    toolProgressDetail: params.toolProgressDetail,
-    execOverrides: params.execOverrides,
-    bashElevated: params.bashElevated,
-    timeoutMs: params.timeoutMs,
-    runTimeoutOverrideMs: params.runTimeoutOverrideMs,
+  const diagnosticDeliveryIdentity = {
     runId: params.runId,
-    lifecycleGeneration: control.lifecycleGeneration,
-    abortSignal: attemptAbortController.signal,
-    onAttemptTimeoutArmed: control.pluginHarnessOwnsTransport
-      ? undefined
-      : startLaneProgressHeartbeat,
-    onAttemptTimeout: control.pluginHarnessOwnsTransport ? undefined : armAttemptTimeoutRelease,
-    onAttemptAbort: () => {
-      cancellationRequested = true;
-      if (!params.abortSignal?.aborted) {
-        params.replyOperation?.abortByUser();
-      }
-      if (!control.pluginHarnessOwnsTransport) {
-        stopLaneProgressHeartbeat();
-        control.laneTaskAbortController.abort();
-      }
-    },
-    replyOperation: params.replyOperation,
-    shouldEmitToolResult: params.shouldEmitToolResult,
-    shouldEmitToolOutput: params.shouldEmitToolOutput,
-    onPartialReply: params.onPartialReply,
-    onAssistantMessageStart: params.onAssistantMessageStart,
-    onBlockReply: params.onBlockReply,
-    onBlockReplyFlush: params.onBlockReplyFlush,
-    blockReplyBreak: params.blockReplyBreak,
-    blockReplyChunking: params.blockReplyChunking,
-    onReasoningStream: params.onReasoningStream,
-    streamReasoningInNonStreamModes: params.streamReasoningInNonStreamModes,
-    onReasoningEnd: params.onReasoningEnd,
-    onToolResult: control.onToolResult,
-    onAgentToolResult: params.onAgentToolResult,
-    onAgentEvent: control.onAgentEvent,
-    deferTerminalLifecycle: params.deferTerminalLifecycle ?? params.deferTerminalLifecycleEnd,
-    deferTerminalLifecycleEnd: params.deferTerminalLifecycle ?? params.deferTerminalLifecycleEnd,
-    onExecutionPhase: params.onExecutionPhase,
-    extraSystemPrompt: params.extraSystemPrompt,
-    sourceReplyDeliveryMode: params.sourceReplyDeliveryMode,
-    taskSuggestionDeliveryMode: params.taskSuggestionDeliveryMode,
-    inputProvenance: params.inputProvenance,
-    streamParams: params.streamParams,
-    modelRun: params.modelRun,
-    disableTrajectory: params.disableTrajectory,
-    ...resolveSkillWorkshopAttemptParams(params),
-    promptMode: params.promptMode,
-    ownerNumbers: params.ownerNumbers,
-    enforceFinalTag: params.enforceFinalTag,
-    silentExpected: params.silentExpected,
-    suppressLiveStreamOutput: params.suppressLiveStreamOutput,
-    bootstrapContextMode: params.bootstrapContextMode,
-    bootstrapContextRunKind: params.bootstrapContextRunKind,
-    jobId: params.jobId,
-    toolsAllow: params.toolsAllow,
-    ...(params.systemAgentTool ? { systemAgentTool: params.systemAgentTool } : {}),
-    cleanupBundleMcpOnRunEnd: params.cleanupBundleMcpOnRunEnd,
-    disableMessageTool: params.disableMessageTool,
-    forceRestartSafeTools: params.forceRestartSafeTools,
-    forceMessageTool: params.forceMessageTool,
-    enableHeartbeatTool: params.enableHeartbeatTool,
-    forceHeartbeatTool: params.forceHeartbeatTool,
-    requireExplicitMessageTarget: params.requireExplicitMessageTarget,
-    internalEvents: params.internalEvents,
-    bootstrapPromptWarningSignaturesSeen: input.bootstrapPromptWarningSignaturesSeen,
-    bootstrapPromptWarningSignature:
-      input.bootstrapPromptWarningSignaturesSeen[
-        input.bootstrapPromptWarningSignaturesSeen.length - 1
-      ],
-    suppressNextUserMessagePersistence: input.suppressNextUserMessagePersistence,
-    beforeAgentFinalizeRevisionAttempts: input.beforeAgentFinalizeRevisionAttempts,
-    maxBeforeAgentFinalizeRevisions: input.maxBeforeAgentFinalizeRevisions,
-    suppressTranscriptOnlyAssistantPersistence: params.suppressTranscriptOnlyAssistantPersistence,
-    suppressAssistantErrorPersistence: params.suppressAssistantErrorPersistence,
-    onUserMessagePersisted: control.onUserMessagePersisted,
-    onUserMessagePersistenceInvalidated: control.onUserMessagePersistenceInvalidated,
-    onAssistantErrorMessagePersisted: params.onAssistantErrorMessagePersisted,
-  })
-    .catch((err: unknown): never => {
+    ...(runtime.sessionKey ? { sessionKey: runtime.sessionKey } : {}),
+    ...(runtime.sessionId ? { sessionId: runtime.sessionId } : {}),
+  } as const;
+  const issuedDiagnosticDeliveryCursors = new WeakSet<object>();
+  const ownsInternalDiagnosticDelivery = runtime.agentHarnessId === CODEX_HARNESS_ID;
+  let diagnosticDeliveryFailed = false;
+  const markInternalDiagnosticDeliveryFailed = () => {
+    diagnosticDeliveryFailed = true;
+    failInternalDiagnosticDeliveryIdentity(diagnosticDeliveryIdentity);
+  };
+  if (ownsInternalDiagnosticDelivery) {
+    beginInternalDiagnosticDeliveryIdentity(diagnosticDeliveryIdentity);
+  }
+  const internalDiagnosticDelivery: EmbeddedRunAttemptParams["internalDiagnosticDelivery"] =
+    ownsInternalDiagnosticDelivery
+      ? {
+          capture: () => {
+            const cursor = captureInternalDiagnosticDeliveryCursor(diagnosticDeliveryIdentity);
+            issuedDiagnosticDeliveryCursors.add(cursor);
+            return cursor;
+          },
+          fail: markInternalDiagnosticDeliveryFailed,
+          waitFor: (cursor, options) => {
+            if (!issuedDiagnosticDeliveryCursors.has(cursor)) {
+              throw new Error("invalid diagnostic delivery cursor for this Codex attempt");
+            }
+            return waitForInternalDiagnosticDeliveryCursor(cursor, options);
+          },
+        }
+      : undefined;
+  const runAttempt = () =>
+    runEmbeddedAttemptWithBackend({
+      sessionId: runtime.sessionId,
+      sessionKey: runtime.sessionKey,
+      promptCacheKey: params.promptCacheKey,
+      sandboxSessionKey: params.sandboxSessionKey,
+      trigger: params.trigger,
+      memoryFlushWritePath: params.memoryFlushWritePath,
+      messageChannel: params.messageChannel,
+      messageProvider: params.messageProvider,
+      clientCaps: params.clientCaps,
+      chatType: params.chatType,
+      agentAccountId: params.agentAccountId,
+      messageTo: params.messageTo,
+      messageThreadId: params.messageThreadId,
+      messageActionTurnCapability: params.messageActionTurnCapability,
+      groupId: params.groupId,
+      groupChannel: params.groupChannel,
+      groupSpace: params.groupSpace,
+      memberRoleIds: params.memberRoleIds,
+      spawnedBy: params.spawnedBy,
+      isCanonicalWorkspace: runtime.isCanonicalWorkspace,
+      senderId: params.senderId,
+      senderName: params.senderName,
+      senderUsername: params.senderUsername,
+      senderE164: params.senderE164,
+      senderIsOwner: params.senderIsOwner,
+      approvalReviewerDeviceId: params.approvalReviewerDeviceId,
+      currentChannelId: params.currentChannelId,
+      chatId: params.chatId,
+      channelContext: params.channelContext,
+      currentMessagingTarget: params.currentMessagingTarget,
+      currentThreadTs: params.currentThreadTs,
+      currentMessageId: params.currentMessageId,
+      currentInboundAudio: params.currentInboundAudio,
+      replyToMode: params.replyToMode,
+      hasRepliedRef: params.hasRepliedRef,
+      sessionFile: runtime.sessionFile,
+      sessionTarget: runtime.sessionTarget,
+      trajectorySessionFile: runtime.trajectorySessionFile,
+      trajectoryRecorder: runtime.trajectoryRecorder,
+      ...(internalDiagnosticDelivery ? { internalDiagnosticDelivery } : {}),
+      workspaceDir: runtime.workspaceDir,
+      cwd: params.cwd,
+      agentDir: runtime.agentDir,
+      config: params.config,
+      allowGatewaySubagentBinding: params.allowGatewaySubagentBinding,
+      ...(runtime.contextEngine
+        ? {
+            contextEngine: runtime.contextEngine,
+            contextTokenBudget: runtime.contextTokenBudget,
+            contextWindowInfo: runtime.contextWindowInfo,
+          }
+        : {}),
+      skillsSnapshot: params.skillsSnapshot,
+      prompt: runtime.prompt,
+      transcriptPrompt: params.transcriptPrompt,
+      userTurnTranscriptRecorder: params.userTurnTranscriptRecorder,
+      skipPreparedUserTurnMessage: runtime.skipPreparedUserTurnMessage,
+      currentInboundEventKind: params.currentInboundEventKind,
+      currentInboundContext: params.currentInboundContext,
+      images: params.images,
+      imageOrder: params.imageOrder,
+      clientTools: params.clientTools,
+      disableTools: params.disableTools,
+      provider: runtime.provider,
+      modelId: runtime.modelId,
+      requestedModelId: runtime.requestedModelId,
+      fallbackActive: runtime.fallbackActive,
+      fallbackReason: runtime.fallbackReason,
+      delegationCapability: resolveDelegationCapability({
+        fallbackActive: runtime.fallbackActive,
+        inputProvenance: params.inputProvenance,
+      }),
+      isFinalFallbackAttempt: params.isFinalFallbackAttempt,
+      agentHarnessId: runtime.agentHarnessId,
+      agentHarnessRuntimeOverride: runtime.agentHarnessId,
+      modelSelectionLocked: params.modelSelectionLocked,
+      ...(runtime.captureRuntimeArtifact ? { captureRuntimeArtifact: true } : {}),
+      ...(runtime.expectedRuntimeArtifact
+        ? { expectedRuntimeArtifact: runtime.expectedRuntimeArtifact }
+        : {}),
+      ...(params.sessionKey
+        ? {
+            agentHarnessTaskRuntimeScope: createAgentHarnessTaskRuntimeScope({
+              requesterSessionKey: params.sessionKey,
+            }),
+          }
+        : {}),
+      runtimePlan: runtime.runtimePlan,
+      observeToolTerminal,
+      model: applyAuthHeaderOverride(
+        applyLocalNoAuthHeaderOverride(runtime.model, runtime.apiKeyInfo),
+        runtime.runtimeAuthActive ? null : runtime.apiKeyInfo,
+        params.config,
+      ),
+      resolvedApiKey: runtime.resolvedApiKey,
+      authProfileId: runtime.authProfileId,
+      authProfileIdSource: runtime.authProfileIdSource,
+      initialReplayState: runtime.initialReplayState,
+      authStorage: runtime.authStorage,
+      authProfileStore: runtime.authProfileStore,
+      toolAuthProfileStore: runtime.toolAuthProfileStore,
+      modelRegistry: runtime.modelRegistry,
+      agentId: runtime.agentId,
+      beforeAgentStartResult: runtime.beforeAgentStartResult,
+      thinkLevel: runtime.thinkLevel,
+      onToolOutcome: control.onToolOutcome,
+      allocateToolOutcomeOrdinal: control.allocateToolOutcomeOrdinal,
+      onToolStreamBoundary: control.onToolStreamBoundary,
+      onRunProgress: control.onRunProgress,
+      fastMode: runtime.fastMode,
+      fastModeAuto: params.fastMode === "auto",
+      ...(params.fastMode === "auto"
+        ? {
+            fastModeStartedAtMs: runtime.fastModeStartedAtMs,
+            fastModeAutoOnSeconds: runtime.fastModeAutoOnSeconds,
+            fastModeAutoProgressState: runtime.fastModeAutoProgressState,
+          }
+        : {}),
+      verboseLevel: params.verboseLevel,
+      reasoningLevel: params.reasoningLevel,
+      toolResultFormat: runtime.toolResultFormat,
+      toolProgressDetail: params.toolProgressDetail,
+      execOverrides: params.execOverrides,
+      bashElevated: params.bashElevated,
+      timeoutMs: params.timeoutMs,
+      runTimeoutOverrideMs: params.runTimeoutOverrideMs,
+      runId: params.runId,
+      lifecycleGeneration: control.lifecycleGeneration,
+      abortSignal: attemptAbortController.signal,
+      onAttemptTimeoutArmed: control.pluginHarnessOwnsTransport
+        ? undefined
+        : startLaneProgressHeartbeat,
+      onAttemptTimeout: control.pluginHarnessOwnsTransport ? undefined : armAttemptTimeoutRelease,
+      onAttemptAbort: () => {
+        cancellationRequested = true;
+        if (!params.abortSignal?.aborted) {
+          params.replyOperation?.abortByUser();
+        }
+        if (!control.pluginHarnessOwnsTransport) {
+          stopLaneProgressHeartbeat();
+          control.laneTaskAbortController.abort();
+        }
+      },
+      replyOperation: params.replyOperation,
+      shouldEmitToolResult: params.shouldEmitToolResult,
+      shouldEmitToolOutput: params.shouldEmitToolOutput,
+      onPartialReply: params.onPartialReply,
+      onAssistantMessageStart: params.onAssistantMessageStart,
+      onBlockReply: params.onBlockReply,
+      onBlockReplyFlush: params.onBlockReplyFlush,
+      blockReplyBreak: params.blockReplyBreak,
+      blockReplyChunking: params.blockReplyChunking,
+      onReasoningStream: params.onReasoningStream,
+      streamReasoningInNonStreamModes: params.streamReasoningInNonStreamModes,
+      onReasoningEnd: params.onReasoningEnd,
+      onToolResult: control.onToolResult,
+      onAgentToolResult: params.onAgentToolResult,
+      onAgentEvent: control.onAgentEvent,
+      deferTerminalLifecycle: params.deferTerminalLifecycle ?? params.deferTerminalLifecycleEnd,
+      deferTerminalLifecycleEnd: params.deferTerminalLifecycle ?? params.deferTerminalLifecycleEnd,
+      onExecutionPhase: params.onExecutionPhase,
+      extraSystemPrompt: params.extraSystemPrompt,
+      sourceReplyDeliveryMode: params.sourceReplyDeliveryMode,
+      taskSuggestionDeliveryMode: params.taskSuggestionDeliveryMode,
+      inputProvenance: params.inputProvenance,
+      streamParams: params.streamParams,
+      modelRun: params.modelRun,
+      disableTrajectory: params.disableTrajectory,
+      ...resolveSkillWorkshopAttemptParams(params),
+      promptMode: params.promptMode,
+      ownerNumbers: params.ownerNumbers,
+      enforceFinalTag: params.enforceFinalTag,
+      silentExpected: params.silentExpected,
+      suppressLiveStreamOutput: params.suppressLiveStreamOutput,
+      bootstrapContextMode: params.bootstrapContextMode,
+      bootstrapContextRunKind: params.bootstrapContextRunKind,
+      jobId: params.jobId,
+      toolsAllow: params.toolsAllow,
+      ...(params.systemAgentTool ? { systemAgentTool: params.systemAgentTool } : {}),
+      cleanupBundleMcpOnRunEnd: params.cleanupBundleMcpOnRunEnd,
+      disableMessageTool: params.disableMessageTool,
+      forceRestartSafeTools: params.forceRestartSafeTools,
+      forceMessageTool: params.forceMessageTool,
+      enableHeartbeatTool: params.enableHeartbeatTool,
+      forceHeartbeatTool: params.forceHeartbeatTool,
+      requireExplicitMessageTarget: params.requireExplicitMessageTarget,
+      internalEvents: params.internalEvents,
+      bootstrapPromptWarningSignaturesSeen: input.bootstrapPromptWarningSignaturesSeen,
+      bootstrapPromptWarningSignature:
+        input.bootstrapPromptWarningSignaturesSeen[
+          input.bootstrapPromptWarningSignaturesSeen.length - 1
+        ],
+      suppressNextUserMessagePersistence: input.suppressNextUserMessagePersistence,
+      beforeAgentFinalizeRevisionAttempts: input.beforeAgentFinalizeRevisionAttempts,
+      maxBeforeAgentFinalizeRevisions: input.maxBeforeAgentFinalizeRevisions,
+      suppressTranscriptOnlyAssistantPersistence: params.suppressTranscriptOnlyAssistantPersistence,
+      suppressAssistantErrorPersistence: params.suppressAssistantErrorPersistence,
+      onUserMessagePersisted: control.onUserMessagePersisted,
+      onUserMessagePersistenceInvalidated: control.onUserMessagePersistenceInvalidated,
+      onAssistantErrorMessagePersisted: params.onAssistantErrorMessagePersisted,
+    }).catch((err: unknown): never => {
       throw control.getPostCompactionAbortError() ?? err;
-    })
-    .finally(() => {
-      clearAttemptTimeoutRelease();
-      stopLaneProgressHeartbeat();
-      parentAbortSignal?.removeEventListener?.("abort", relayParentAbort);
-      control.clearPostCompactionAbortController(attemptAbortController);
     });
+  let rawAttempt: Awaited<ReturnType<typeof runEmbeddedAttemptWithBackend>>;
+  try {
+    rawAttempt = await runAttempt();
+  } catch (error) {
+    if (ownsInternalDiagnosticDelivery) {
+      markInternalDiagnosticDeliveryFailed();
+    }
+    throw error;
+  } finally {
+    if (ownsInternalDiagnosticDelivery) {
+      completeInternalDiagnosticDeliveryIdentity(diagnosticDeliveryIdentity);
+      if (diagnosticDeliveryFailed) {
+        // Completion releases this attempt's active owner. Reassert producer
+        // failure so a later agent_end drain cannot seal an incomplete trace.
+        failInternalDiagnosticDeliveryIdentity(diagnosticDeliveryIdentity);
+      }
+    }
+    clearAttemptTimeoutRelease();
+    stopLaneProgressHeartbeat();
+    parentAbortSignal?.removeEventListener?.("abort", relayParentAbort);
+    control.clearPostCompactionAbortController(attemptAbortController);
+  }
 
   const postCompactionAbortError = control.getPostCompactionAbortError();
   if (postCompactionAbortError) {

@@ -35,9 +35,11 @@ import {
   tempDir,
   threadStartResult,
   turnStartResult,
+  userMessage,
 } from "./run-attempt-test-harness.js";
 import {
   readCodexAppServerBinding,
+  seedCodexTestBinding,
   testCodexAppServerBindingStore,
 } from "./session-binding.test-helpers.js";
 
@@ -49,11 +51,157 @@ function flushDiagnosticEvents() {
   return waitForDiagnosticEventsDrained();
 }
 
+function rolloutTraceEventForTurn(
+  seq: number,
+  wallTimeMs: number,
+  type: string,
+  payload: Record<string, unknown>,
+): string {
+  return `${JSON.stringify({
+    schema_version: 1,
+    seq,
+    wall_time_unix_ms: wallTimeMs,
+    rollout_id: "rollout-1",
+    thread_id: "thread-1",
+    codex_turn_id: "turn-1",
+    payload: {
+      type,
+      ...payload,
+      thread_id: "thread-1",
+      codex_turn_id: "turn-1",
+    },
+  })}\n`;
+}
+
 setupRunAttemptTestHooks();
 
 describe("runCodexAppServerAttempt hooks and model diagnostics", () => {
+  it("runs before_agent_run with canonical context before model and turn start", async () => {
+    const order: string[] = [];
+    const beforeAgentRun = vi.fn(async () => {
+      order.push("before_agent_run:start");
+      await new Promise<void>((resolve) => {
+        setImmediate(resolve);
+      });
+      order.push("before_agent_run:end");
+      return { outcome: "pass" as const };
+    });
+    const llmInput = vi.fn(() => {
+      order.push("llm_input");
+    });
+    initializeGlobalHookRunner(
+      createMockPluginRegistry([
+        { hookName: "before_agent_run", handler: beforeAgentRun },
+        { hookName: "llm_input", handler: llmInput },
+      ]),
+    );
+    onInternalDiagnosticEvent((event) => {
+      if (event.type === "model.call.started" && event.scope === "turn-aggregate") {
+        order.push("model.call.started");
+      }
+    });
+    const sessionFile = path.join(tempDir, "before-agent-run-order.jsonl");
+    const workspaceDir = path.join(tempDir, "before-agent-run-order-workspace");
+    const priorMessages = [
+      userMessage("prior question", 1_783_000_000_000),
+      assistantMessage("prior answer", 1_783_000_001_000),
+    ];
+    const sessionManager = SessionManager.open(sessionFile);
+    for (const message of priorMessages) {
+      sessionManager.appendMessage(message);
+    }
+    seedCodexTestBinding(sessionFile, {
+      threadId: "thread-existing",
+      cwd: workspaceDir,
+      model: "gpt-5.4-codex",
+      modelProvider: "openai",
+      historyCoveredThrough: new Date(1_783_000_002_000).toISOString(),
+    });
+    const harness = createAppServerHarness(async (method, params) => {
+      if (method === "thread/start") {
+        return threadStartResult();
+      }
+      if (method === "thread/resume") {
+        return threadStartResult(
+          (params as { threadId?: string } | undefined)?.threadId ?? "thread-existing",
+        );
+      }
+      if (method === "turn/start") {
+        order.push("turn/start");
+        return turnStartResult();
+      }
+      return {};
+    });
+
+    const run = runCodexAppServerAttempt(createParams(sessionFile, workspaceDir));
+    await harness.waitForMethod("turn/start");
+    await harness.completeTurn({ threadId: "thread-existing", turnId: "turn-1" });
+    await run;
+    await flushDiagnosticEvents();
+
+    const [beforeRunEvent] = mockCall(beforeAgentRun, "before_agent_run") as [
+      {
+        messages?: unknown[];
+        priorMessages?: unknown[];
+        prompt?: string;
+        systemPrompt?: string;
+      },
+    ];
+    expect(beforeRunEvent.prompt).toBe("hello");
+    expect(beforeRunEvent.systemPrompt).toContain(
+      "You are a personal agent running inside OpenClaw.",
+    );
+    expect(beforeRunEvent.messages).toEqual(priorMessages);
+    expect(beforeRunEvent.priorMessages).toEqual(priorMessages);
+    expect(order.slice(0, 2)).toEqual(["before_agent_run:start", "before_agent_run:end"]);
+    for (const downstream of ["model.call.started", "llm_input", "turn/start"]) {
+      expect(order.indexOf(downstream)).toBeGreaterThan(1);
+    }
+    expect(order.indexOf("llm_input")).toBeLessThan(order.indexOf("turn/start"));
+  });
+
+  it("stops before model diagnostics and turn/start when before_agent_run blocks", async () => {
+    const beforeAgentRun = vi.fn(async () => ({
+      outcome: "block" as const,
+      reason: "policy denied",
+      message: "blocked by policy",
+    }));
+    const llmInput = vi.fn();
+    initializeGlobalHookRunner(
+      createMockPluginRegistry([
+        { hookName: "before_agent_run", handler: beforeAgentRun },
+        { hookName: "llm_input", handler: llmInput },
+      ]),
+    );
+    const modelStarted = vi.fn();
+    onInternalDiagnosticEvent((event) => {
+      if (event.type === "model.call.started") {
+        modelStarted(event);
+      }
+    });
+    const sessionFile = path.join(tempDir, "before-agent-run-block.jsonl");
+    const workspaceDir = path.join(tempDir, "before-agent-run-block-workspace");
+    const harness = createStartedThreadHarness();
+
+    await expect(
+      runCodexAppServerAttempt(createParams(sessionFile, workspaceDir)),
+    ).resolves.toMatchObject({
+      promptError: expect.objectContaining({
+        message: expect.stringContaining("blocked by policy"),
+      }),
+      promptErrorSource: "hook:before_agent_run",
+    });
+    await flushDiagnosticEvents();
+
+    expect(beforeAgentRun).toHaveBeenCalledTimes(1);
+    expect(llmInput).not.toHaveBeenCalled();
+    expect(modelStarted).not.toHaveBeenCalled();
+    expect(harness.requests.some((request) => request.method === "turn/start")).toBe(false);
+  });
+
   it("does not enable Codex rollout traces without a content consumer", async () => {
     let rolloutTraceRoot: string | undefined;
+    const failDiagnosticDelivery = vi.fn();
     const harness = createStartedThreadHarness(undefined, {
       onStart: (_authProfileId, _agentDir, _clientOptions, startOptions) => {
         rolloutTraceRoot = startOptions.env?.[CODEX_ROLLOUT_TRACE_ROOT_ENV_VAR];
@@ -63,6 +211,19 @@ describe("runCodexAppServerAttempt hooks and model diagnostics", () => {
       path.join(tempDir, "no-rollout-trace.jsonl"),
       path.join(tempDir, "no-rollout-trace-workspace"),
     );
+    (
+      params as typeof params & {
+        internalDiagnosticDelivery: {
+          capture: () => unknown;
+          fail: () => void;
+          waitFor: () => Promise<{ ok: true; deliveredEvents: number }>;
+        };
+      }
+    ).internalDiagnosticDelivery = {
+      capture: () => ({}),
+      fail: failDiagnosticDelivery,
+      waitFor: async () => ({ ok: true, deliveredEvents: 0 }),
+    };
 
     const run = runCodexAppServerAttempt(params);
     await harness.waitForMethod("turn/start");
@@ -70,6 +231,7 @@ describe("runCodexAppServerAttempt hooks and model diagnostics", () => {
     await run;
 
     expect(rolloutTraceRoot).toBeUndefined();
+    expect(failDiagnosticDelivery).not.toHaveBeenCalled();
   });
 
   it("enables Codex rollout traces for an authorized content consumer", async () => {
@@ -100,6 +262,165 @@ describe("runCodexAppServerAttempt hooks and model diagnostics", () => {
     await expect(fs.stat(rolloutTraceRoot!)).resolves.toMatchObject({
       isDirectory: expect.any(Function),
     });
+  });
+
+  it("drains rollout diagnostics through the run cursor before agent_end", async () => {
+    let rolloutTraceRoot: string | undefined;
+    const ordered: string[] = [];
+    const stopTrustedListener = onTrustedInternalDiagnosticEvent(() => {}, {
+      captureModelContent: { inputMessages: true },
+    });
+    const agentEnd = vi.fn(() => {
+      ordered.push("agent_end");
+    });
+    initializeGlobalHookRunner(
+      createMockPluginRegistry([{ hookName: "agent_end", handler: agentEnd }]),
+    );
+    onInternalDiagnosticEvent(async (event) => {
+      if (!("runId" in event) || event.runId !== "run-1" || !event.type.startsWith("model.call.")) {
+        return;
+      }
+      ordered.push(`${event.type}:${event.scope}`);
+      await new Promise<void>((resolve) => {
+        setImmediate(resolve);
+      });
+      ordered.push(`${event.type}:${event.scope}:listener-drained`);
+    });
+    const harness = createStartedThreadHarness(undefined, {
+      onStart: (_authProfileId, _agentDir, _clientOptions, startOptions) => {
+        rolloutTraceRoot = startOptions.env?.[CODEX_ROLLOUT_TRACE_ROOT_ENV_VAR];
+      },
+    });
+    const params = createParams(
+      path.join(tempDir, "rollout-before-agent-end.jsonl"),
+      path.join(tempDir, "rollout-before-agent-end-workspace"),
+    );
+    (
+      params as typeof params & {
+        internalDiagnosticDelivery: {
+          capture: () => unknown;
+          fail: () => void;
+          waitFor: () => Promise<{ ok: true; deliveredEvents: number }>;
+        };
+      }
+    ).internalDiagnosticDelivery = {
+      capture: () => ({}),
+      fail: vi.fn(),
+      waitFor: async () => {
+        await waitForDiagnosticEventsDrained();
+        return { ok: true, deliveredEvents: 2 };
+      },
+    };
+
+    const run = runCodexAppServerAttempt(params);
+    await harness.waitForMethod("turn/start");
+    expect(rolloutTraceRoot).toBeDefined();
+    const bundleDir = path.join(rolloutTraceRoot!, "attempt-one", "trace-one");
+    await fs.mkdir(bundleDir, { recursive: true });
+    await fs.writeFile(path.join(bundleDir, "manifest.json"), "{}\n");
+    await fs.writeFile(
+      path.join(bundleDir, "trace.jsonl"),
+      [
+        rolloutTraceEventForTurn(1, 1000, "inference_started", {
+          inference_call_id: "rollout-live-call",
+          model: "gpt-5.4-codex",
+          provider_name: "codex",
+        }),
+        rolloutTraceEventForTurn(2, 1040, "inference_completed", {
+          inference_call_id: "rollout-live-call",
+        }),
+        rolloutTraceEventForTurn(3, 1050, "codex_turn_ended", { status: "completed" }),
+      ].join(""),
+    );
+    await harness.completeTurn({ threadId: "thread-1", turnId: "turn-1" });
+    await run;
+    stopTrustedListener();
+
+    expect(agentEnd).toHaveBeenCalled();
+    expect(ordered).toEqual([
+      "model.call.started:turn-aggregate",
+      "model.call.started:turn-aggregate:listener-drained",
+      "model.call.started:provider-request",
+      "model.call.started:provider-request:listener-drained",
+      "model.call.completed:provider-request",
+      "model.call.completed:provider-request:listener-drained",
+      "model.call.completed:turn-aggregate",
+      "model.call.completed:turn-aggregate:listener-drained",
+      "agent_end",
+    ]);
+  });
+
+  it("marks an incomplete rollout producer before draining diagnostics and agent_end", async () => {
+    let rolloutTraceRoot: string | undefined;
+    const ordered: string[] = [];
+    const stopTrustedListener = onTrustedInternalDiagnosticEvent(() => {}, {
+      captureModelContent: { inputMessages: true },
+    });
+    const agentEnd = vi.fn(() => {
+      ordered.push("agent_end");
+    });
+    initializeGlobalHookRunner(
+      createMockPluginRegistry([{ hookName: "agent_end", handler: agentEnd }]),
+    );
+    const harness = createStartedThreadHarness(undefined, {
+      onStart: (_authProfileId, _agentDir, _clientOptions, startOptions) => {
+        rolloutTraceRoot = startOptions.env?.[CODEX_ROLLOUT_TRACE_ROOT_ENV_VAR];
+      },
+    });
+    const params = createParams(
+      path.join(tempDir, "incomplete-rollout-before-agent-end.jsonl"),
+      path.join(tempDir, "incomplete-rollout-before-agent-end-workspace"),
+    );
+    params.agentDir = path.join(tempDir, "incomplete-rollout-agent");
+    (
+      params as typeof params & {
+        internalDiagnosticDelivery: {
+          capture: () => unknown;
+          fail: () => void;
+          waitFor: () => Promise<{
+            ok: false;
+            deliveredEvents: number;
+            reason: "producer_incomplete";
+          }>;
+        };
+      }
+    ).internalDiagnosticDelivery = {
+      capture: () => {
+        ordered.push("capture");
+        return {};
+      },
+      fail: () => {
+        ordered.push("producer_incomplete");
+      },
+      waitFor: async () => {
+        ordered.push("wait");
+        return { ok: false, deliveredEvents: 1, reason: "producer_incomplete" };
+      },
+    };
+
+    try {
+      const run = runCodexAppServerAttempt(params);
+      await harness.waitForMethod("turn/start");
+      expect(rolloutTraceRoot).toBeDefined();
+      const bundleDir = path.join(rolloutTraceRoot!, "attempt-incomplete", "trace-incomplete");
+      await fs.mkdir(bundleDir, { recursive: true });
+      await fs.writeFile(path.join(bundleDir, "manifest.json"), "{}\n");
+      await fs.writeFile(
+        path.join(bundleDir, "trace.jsonl"),
+        rolloutTraceEventForTurn(1, 1000, "inference_started", {
+          inference_call_id: "rollout-incomplete-call",
+          model: "gpt-5.4-codex",
+          provider_name: "codex",
+        }),
+      );
+      await harness.completeTurn({ threadId: "thread-1", turnId: "turn-1" });
+      await run;
+    } finally {
+      stopTrustedListener();
+    }
+
+    expect(agentEnd).toHaveBeenCalled();
+    expect(ordered).toEqual(["producer_incomplete", "capture", "wait", "agent_end"]);
   });
 
   it.each([

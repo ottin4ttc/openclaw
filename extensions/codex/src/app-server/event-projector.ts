@@ -80,6 +80,7 @@ type CodexAppServerEventProjectorOptions = {
   trajectoryRecorder?: CodexTrajectoryRecorder | null;
   onContextCompacted?: () => void;
   upstreamUserText?: string;
+  suppressNativeToolLifecycleDiagnostics?: boolean;
 };
 
 export class CodexAppServerEventProjector {
@@ -116,6 +117,7 @@ export class CodexAppServerEventProjector {
       turnId,
       {
         runAbortSignal: options.runAbortSignal,
+        suppressNativeToolLifecycleDiagnostics: options.suppressNativeToolLifecycleDiagnostics,
       },
     );
     this.generatedMediaProjection = new CodexGeneratedMediaProjection(params.config);
@@ -432,6 +434,12 @@ export class CodexAppServerEventProjector {
       didSendDeterministicApprovalPrompt:
         this.eventProjection.guardianReviewCount > 0 ? false : undefined,
     };
+  }
+
+  resolveSuppressedNativeToolLifecycleDiagnostics(
+    rolloutLifecycleKeys?: ReadonlySet<string>,
+  ): void {
+    this.nativeToolLifecycleProjector.resolveSuppressedDiagnostics(rolloutLifecycleKeys);
   }
 
   recordDynamicToolCall(params: { callId: string; tool: string; arguments?: JsonValue }): void {

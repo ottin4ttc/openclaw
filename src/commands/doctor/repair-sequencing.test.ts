@@ -15,6 +15,7 @@ const mocks = vi.hoisted(() => ({
   maybeRepairGroupAllowFromFallback: vi.fn(),
   maybeRepairManagedNpmOpenClawPeerLinks: vi.fn(),
   maybeRepairLegacyOAuthSidecarProfiles: vi.fn(),
+  maybeRepairBundledPluginLoadPaths: vi.fn(),
   maybeMigrateAuthProfileJsonStoresToSqlite: vi.fn(),
   maybeRepairOpenAICodexAuthConfig: vi.fn(),
   maybeRepairOpenAICodexAuthProfileStores: vi.fn(),
@@ -132,10 +133,7 @@ vi.mock("./shared/active-tool-schema-warnings.js", () => ({
 }));
 
 vi.mock("./shared/bundled-plugin-load-paths.js", () => ({
-  maybeRepairBundledPluginLoadPaths: (cfg: OpenClawConfig) => ({
-    config: cfg,
-    changes: [],
-  }),
+  maybeRepairBundledPluginLoadPaths: mocks.maybeRepairBundledPluginLoadPaths,
 }));
 
 vi.mock("./shared/open-policy-allowfrom.js", () => ({
@@ -246,6 +244,10 @@ describe("doctor repair sequencing", () => {
       changes: [],
       warnings: [],
     });
+    mocks.maybeRepairBundledPluginLoadPaths.mockImplementation((cfg: OpenClawConfig) => ({
+      config: cfg,
+      changes: [],
+    }));
     mocks.maybeMigrateAuthProfileJsonStoresToSqlite.mockResolvedValue({
       detected: [],
       changes: [],
@@ -284,6 +286,36 @@ describe("doctor repair sequencing", () => {
       config: cfg,
       changes: [],
     }));
+  });
+
+  it("repairs bundled load-path aliases before plugin config contracts load", async () => {
+    const events: string[] = [];
+    mocks.maybeRepairBundledPluginLoadPaths.mockImplementationOnce((cfg: OpenClawConfig) => {
+      events.push("bundled-load-paths");
+      return {
+        config: cfg,
+        changes: [],
+      };
+    });
+    mocks.maybeRepairStalePluginConfig.mockImplementationOnce((cfg: OpenClawConfig) => {
+      events.push("plugin-config");
+      return {
+        config: cfg,
+        changes: [],
+      };
+    });
+
+    await runDoctorRepairSequence({
+      state: {
+        cfg: {},
+        candidate: {},
+        pendingChanges: false,
+        fixHints: [],
+      },
+      doctorFixCommand: "openclaw doctor --fix",
+    });
+
+    expect(events).toEqual(["bundled-load-paths", "plugin-config"]);
   });
 
   it("applies ordered repairs and sanitizes empty-allowlist warnings", async () => {

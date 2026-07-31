@@ -55,6 +55,7 @@ function createInput(hooks: PluginHookRegistration[] = []) {
       activeSession,
       hookContext,
       hookMessages: state.messages,
+      priorMessages: [],
       hookRunner: createHookRunner(createRegistry(hooks)),
       modelPrompt: "model prompt",
       sessionManager,

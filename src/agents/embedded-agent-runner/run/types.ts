@@ -8,6 +8,10 @@ import type {
   SessionSystemPromptReport,
 } from "../../../config/sessions/types.js";
 import type { ContextEngine, ContextEnginePromptCacheInfo } from "../../../context-engine/types.js";
+import type {
+  InternalDiagnosticDeliveryCursor,
+  InternalDiagnosticDeliveryCursorDrainResult,
+} from "../../../infra/diagnostic-delivery.js";
 import type { DiagnosticTraceContext } from "../../../infra/diagnostic-trace-context.js";
 import type { AssistantMessage, Model } from "../../../llm/types.js";
 import type { PluginHookBeforeAgentStartResult } from "../../../plugins/hook-before-agent-start.types.js";
@@ -90,6 +94,16 @@ export type EmbeddedRunAttemptTrajectoryRecorder = {
   flush: () => Promise<void>;
 };
 
+/** Host-only ordering barrier supplied to a native harness for its accepted diagnostics. */
+export type EmbeddedRunAttemptDiagnosticDelivery = {
+  capture: () => InternalDiagnosticDeliveryCursor;
+  fail: () => void;
+  waitFor: (
+    cursor: InternalDiagnosticDeliveryCursor,
+    options?: { timeoutMs?: number },
+  ) => Promise<InternalDiagnosticDeliveryCursorDrainResult>;
+};
+
 export type EmbeddedRunAttemptParams = EmbeddedRunAttemptBase & {
   /** Active file-backed artifact target resolved by the run/session target seam. */
   sessionFile: string;
@@ -134,6 +148,8 @@ export type EmbeddedRunAttemptParams = EmbeddedRunAttemptBase & {
   trajectorySessionFile?: string;
   /** Storage-aware trajectory recorder owned by the OpenClaw host. */
   trajectoryRecorder?: EmbeddedRunAttemptTrajectoryRecorder | null;
+  /** Host-only barrier; omitted from the public harness contract. */
+  internalDiagnosticDelivery?: EmbeddedRunAttemptDiagnosticDelivery;
   /** Live observer called after wrapped tool outcomes are recorded. */
   onToolOutcome?: ToolOutcomeObserver;
   /** Signals that the attempt's own run-timeout watchdog is active. */

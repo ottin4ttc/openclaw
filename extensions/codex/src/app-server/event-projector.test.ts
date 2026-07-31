@@ -3005,6 +3005,7 @@ describe("CodexAppServerEventProjector", () => {
       toolDiagnosticEvents.map((event) => ({
         type: event.type,
         toolName: event.toolName,
+        toolOwner: event.toolOwner,
         toolCallId: event.toolCallId,
         durationMs: "durationMs" in event ? event.durationMs : undefined,
         sourceTimestampMs: event.sourceTimestampMs,
@@ -3013,6 +3014,7 @@ describe("CodexAppServerEventProjector", () => {
       {
         type: "tool.execution.started",
         toolName: "bash",
+        toolOwner: "codex-native-tool-lifecycle",
         toolCallId: "cmd-1",
         durationMs: undefined,
         sourceTimestampMs: 1_750_000_000_000,
@@ -3020,6 +3022,7 @@ describe("CodexAppServerEventProjector", () => {
       {
         type: "tool.execution.completed",
         toolName: "bash",
+        toolOwner: "codex-native-tool-lifecycle",
         toolCallId: "cmd-1",
         durationMs: 42,
         sourceTimestampMs: 1_750_000_000_042,
@@ -3054,6 +3057,74 @@ describe("CodexAppServerEventProjector", () => {
     expect(toolResultContentItem.toolName).toBe("bash");
     expect(toolResultContentItem.toolCallId).toBe("cmd-1");
     expect(toolResultContentItem.content).toBe("ok");
+  });
+
+  it("replays buffered native tool phases missing from rollout tracing", async () => {
+    const projector = await createProjector(await createParams(), {
+      suppressNativeToolLifecycleDiagnostics: true,
+    });
+    const diagnosticEvents: DiagnosticEventPayload[] = [];
+    const unsubscribe = onInternalDiagnosticEvent((event) => diagnosticEvents.push(event));
+
+    try {
+      await projector.handleNotification(
+        forCurrentTurn("item/started", {
+          startedAtMs: 1_750_000_000_000,
+          item: {
+            type: "commandExecution",
+            id: "cmd-fallback",
+            command: "printf fallback",
+            cwd: "/workspace",
+            processId: null,
+            source: "agent",
+            status: "inProgress",
+            commandActions: [],
+            aggregatedOutput: null,
+            exitCode: null,
+            durationMs: null,
+          },
+        }),
+      );
+      await projector.handleNotification(
+        forCurrentTurn("item/completed", {
+          completedAtMs: 1_750_000_000_042,
+          item: {
+            type: "commandExecution",
+            id: "cmd-fallback",
+            command: "printf fallback",
+            cwd: "/workspace",
+            processId: null,
+            source: "agent",
+            status: "completed",
+            commandActions: [],
+            aggregatedOutput: "fallback",
+            exitCode: 0,
+            durationMs: 42,
+          },
+        }),
+      );
+      projector.buildResult(buildEmptyToolTelemetry());
+      await flushDiagnosticEvents();
+      expect(diagnosticEvents.filter((event) => event.type.startsWith("tool.execution."))).toEqual(
+        [],
+      );
+
+      projector.resolveSuppressedNativeToolLifecycleDiagnostics(new Set(["started:cmd-fallback"]));
+      await flushDiagnosticEvents();
+    } finally {
+      unsubscribe();
+    }
+
+    expect(
+      diagnosticEvents
+        .filter((event) => event.type.startsWith("tool.execution."))
+        .map((event) => ({ type: event.type, toolOwner: event.toolOwner })),
+    ).toEqual([
+      {
+        type: "tool.execution.completed",
+        toolOwner: "codex-native-tool-lifecycle",
+      },
+    ]);
   });
 
   it("preserves structured file-change diffs in mirrored transcript calls", async () => {
@@ -4701,6 +4772,79 @@ describe("CodexAppServerEventProjector", () => {
     },
   );
 
+  it.each([
+    {
+      name: "skips phases already covered by rollout",
+      rolloutLifecycleKeys: new Set([
+        "started:cmd-approval-rollout",
+        "terminal:cmd-approval-rollout",
+      ]),
+      expectedTypes: [],
+    },
+    {
+      name: "replays only the terminal phase missing from rollout",
+      rolloutLifecycleKeys: new Set(["started:cmd-approval-rollout"]),
+      expectedTypes: ["tool.execution.error"],
+    },
+  ])("$name for declined native approvals", async ({ rolloutLifecycleKeys, expectedTypes }) => {
+    const projector = await createProjector(await createParams(), {
+      suppressNativeToolLifecycleDiagnostics: true,
+    });
+    const diagnosticEvents: DiagnosticEventPayload[] = [];
+    const unsubscribe = onInternalDiagnosticEvent((event) => diagnosticEvents.push(event));
+
+    try {
+      await projector.handleNotification(
+        forCurrentTurn("item/started", {
+          item: {
+            type: "commandExecution",
+            id: "cmd-approval-rollout",
+            command: "pnpm test extensions/codex",
+            cwd: "/workspace",
+            processId: null,
+            source: "agent",
+            status: "inProgress",
+            commandActions: [],
+            aggregatedOutput: null,
+            exitCode: null,
+            durationMs: null,
+          },
+        }),
+      );
+      projector.recordNativeToolApprovalFailure("cmd-approval-rollout", "failed");
+      await projector.handleNotification(
+        forCurrentTurn("item/completed", {
+          item: {
+            type: "commandExecution",
+            id: "cmd-approval-rollout",
+            command: "pnpm test extensions/codex",
+            cwd: "/workspace",
+            processId: null,
+            source: "agent",
+            status: "declined",
+            commandActions: [],
+            aggregatedOutput: null,
+            exitCode: null,
+            durationMs: 1,
+          },
+        }),
+      );
+      await flushDiagnosticEvents();
+      expect(diagnosticEvents).toEqual([]);
+
+      projector.resolveSuppressedNativeToolLifecycleDiagnostics(rolloutLifecycleKeys);
+      await flushDiagnosticEvents();
+    } finally {
+      unsubscribe();
+    }
+
+    expect(
+      diagnosticEvents
+        .filter((event) => event.type.startsWith("tool.execution."))
+        .map((event) => event.type),
+    ).toEqual(expectedTypes);
+  });
+
   it("coalesces a native pre-tool failure with the matching item terminal", async () => {
     const projector = await createProjector();
     const diagnosticEvents: DiagnosticEventPayload[] = [];
@@ -4773,6 +4917,55 @@ describe("CodexAppServerEventProjector", () => {
     ]);
   });
 
+  it("reconciles a matching native pre-tool failure against rollout phases", async () => {
+    const projector = await createProjector(await createParams(), {
+      suppressNativeToolLifecycleDiagnostics: true,
+    });
+    const diagnosticEvents: DiagnosticEventPayload[] = [];
+    const unsubscribe = onInternalDiagnosticEvent((event) => diagnosticEvents.push(event));
+    const item = {
+      type: "commandExecution" as const,
+      id: "cmd-pre-tool-rollout",
+      command: "pnpm test extensions/codex",
+      cwd: "/workspace",
+      processId: null,
+      source: "agent" as const,
+      commandActions: [],
+      aggregatedOutput: null,
+      exitCode: null,
+    };
+
+    try {
+      projector.recordNativeToolPreToolUseFailure({
+        toolName: "exec",
+        toolCallId: item.id,
+        disposition: "timed_out",
+        durationMs: 5,
+      });
+      await projector.handleNotification(
+        forCurrentTurn("item/started", {
+          item: { ...item, status: "inProgress", durationMs: null },
+        }),
+      );
+      await projector.handleNotification(
+        forCurrentTurn("item/completed", {
+          item: { ...item, status: "declined", durationMs: 7 },
+        }),
+      );
+      await flushDiagnosticEvents();
+      expect(diagnosticEvents).toEqual([]);
+
+      projector.resolveSuppressedNativeToolLifecycleDiagnostics(
+        new Set([`started:${item.id}`, `terminal:${item.id}`]),
+      );
+      await flushDiagnosticEvents();
+    } finally {
+      unsubscribe();
+    }
+
+    expect(diagnosticEvents).toEqual([]);
+  });
+
   it("finalizes a native pre-tool failure when no item arrives", async () => {
     const runAbortController = new AbortController();
     const projector = await createProjector(undefined, {
@@ -4824,6 +5017,64 @@ describe("CodexAppServerEventProjector", () => {
         durationMs: 6,
         errorCategory: "before_tool_call",
         terminalReason: "cancelled",
+      }),
+    ]);
+  });
+
+  it("reconciles late item-less native failures against rollout coverage", async () => {
+    const projector = await createProjector(undefined, {
+      suppressNativeToolLifecycleDiagnostics: true,
+    });
+    const diagnosticEvents: DiagnosticEventPayload[] = [];
+    const unsubscribe = onInternalDiagnosticEvent((event) => diagnosticEvents.push(event));
+
+    try {
+      projector.buildResult(buildEmptyToolTelemetry());
+      projector.recordNativeToolPreToolUseFailure({
+        toolName: "exec",
+        toolCallId: "native-late-before-reconcile",
+        disposition: "failed",
+        durationMs: 5,
+      });
+      await flushDiagnosticEvents();
+      expect(diagnosticEvents).toEqual([]);
+
+      projector.resolveSuppressedNativeToolLifecycleDiagnostics(
+        new Set([
+          "terminal:native-late-before-reconcile",
+          "terminal:native-late-after-reconcile-covered",
+        ]),
+      );
+      projector.resolveSuppressedNativeToolLifecycleDiagnostics(new Set());
+      projector.recordNativeToolPreToolUseFailure({
+        toolName: "exec",
+        toolCallId: "native-late-after-reconcile-covered",
+        disposition: "failed",
+        durationMs: 6,
+      });
+      projector.recordNativeToolPreToolUseFailure({
+        toolName: "exec",
+        toolCallId: "native-late-after-reconcile-missing",
+        disposition: "failed",
+        durationMs: 7,
+      });
+      await flushDiagnosticEvents();
+    } finally {
+      unsubscribe();
+    }
+
+    expect(
+      diagnosticEvents.filter(
+        (event) =>
+          event.type.startsWith("tool.execution.") &&
+          "toolCallId" in event &&
+          event.toolCallId.startsWith("native-late-"),
+      ),
+    ).toEqual([
+      expect.objectContaining({
+        type: "tool.execution.error",
+        toolCallId: "native-late-after-reconcile-missing",
+        durationMs: 7,
       }),
     ]);
   });

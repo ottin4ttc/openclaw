@@ -61,7 +61,10 @@ export type {
   AgentHarnessUserInputPromptOptions,
   AgentHarnessUserInputQuestion,
 } from "../agents/harness/user-input-bridge.js";
-export type EmbeddedRunAttemptParams = Omit<CoreEmbeddedRunAttemptParams, "trajectoryRecorder">;
+export type EmbeddedRunAttemptParams = Omit<
+  CoreEmbeddedRunAttemptParams,
+  "trajectoryRecorder" | "internalDiagnosticDelivery"
+>;
 export type { EmbeddedRunAttemptResult };
 export type {
   ContextEngine as HarnessContextEngine,
@@ -390,6 +393,7 @@ export {
 export {
   awaitAgentHarnessAgentEndHook,
   getAgentHarnessHookRunner,
+  runAgentHarnessBeforeAgentRunHook,
   runAgentHarnessBeforeAgentFinalizeHook,
   runAgentHarnessAgentEndHook,
   runAgentHarnessLlmInputHook,

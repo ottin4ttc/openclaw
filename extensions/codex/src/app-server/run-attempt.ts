@@ -3,6 +3,7 @@ import type {
   EmbeddedRunAttemptParams,
   EmbeddedRunAttemptResult,
 } from "openclaw/plugin-sdk/agent-harness-runtime";
+import { startCodexRolloutTraceMonitor } from "./rollout-trace-diagnostics.js";
 import { activateCodexAttemptTurn } from "./run-attempt-active-turn.js";
 import { cleanupCodexAttempt } from "./run-attempt-cleanup.js";
 import { prepareCodexAttemptConnection } from "./run-attempt-connection.js";
@@ -65,6 +66,15 @@ export async function runCodexAppServerAttempt(
     notifications,
     turnStart.turn,
   );
+  if (connection.rolloutTraceRoot) {
+    resources.state.rolloutTraceMonitor = startCodexRolloutTraceMonitor({
+      traceRoot: connection.rolloutTraceRoot,
+      threadId: resources.state.thread.threadId,
+      turnId: activeTurn.activeTurnId,
+      baseFields: turnRequest.codexModelCallBaseFields,
+      capture: connection.codexModelContentCapture,
+    });
+  }
 
   try {
     return await finalizeCodexAttempt(

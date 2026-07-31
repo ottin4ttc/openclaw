@@ -17,6 +17,7 @@ import {
 } from "./native-hook-relay.js";
 import { codexNativeSubagentMonitorRuntime } from "./native-subagent-monitor.js";
 import type { CodexSandboxPolicy, CodexTurnEnvironmentParams } from "./protocol.js";
+import type { CodexRolloutTraceMonitor } from "./rollout-trace-diagnostics.js";
 import type { CodexAttemptPrompt } from "./run-attempt-prompt.js";
 import { releaseCodexSandboxExecServerEnvironment } from "./sandbox-exec-server.js";
 import type { CodexAppServerThreadBinding } from "./session-binding.js";
@@ -67,6 +68,7 @@ export function prepareCodexAttemptResources(prompt: CodexAttemptPrompt) {
     detachRouteAbort: (() => undefined) as () => void,
     trajectoryEndRecorded: false,
     nativeHookRelay: undefined as NativeHookRelayRegistrationHandle | undefined,
+    nativeFailureProjectionDrainAttempted: false,
     nativeSubagentMonitor: undefined as
       | ReturnType<typeof codexNativeSubagentMonitorRuntime.register>
       | undefined,
@@ -83,6 +85,7 @@ export function prepareCodexAttemptResources(prompt: CodexAttemptPrompt) {
     restartContextEngineCodexThread: undefined as
       | (() => Promise<CodexAppServerThreadLifecycleBinding>)
       | undefined,
+    rolloutTraceMonitor: undefined as CodexRolloutTraceMonitor | undefined,
   };
   const pendingNativePreToolUseFailures: CodexNativePreToolUseFailure[] = [];
   const projectorRef: { current?: CodexAppServerEventProjector } = {};

@@ -696,31 +696,4 @@ describe("web search provider auto-detection", () => {
       >[0]),
     ).toBe("gemini");
   });
-
-  it("resolves searxng when explicitly configured", () => {
-    expect(
-      resolveSearchProvider({ provider: "searxng" } as unknown as Parameters<
-        typeof resolveSearchProvider
-      >[0]),
-    ).toBe("searxng");
-  });
-});
-
-describe("searxng provider config validation", () => {
-  it("accepts searxng provider with baseUrl", () => {
-    const res = validateConfigObjectWithPlugins(
-      buildWebSearchProviderConfig({
-        provider: "searxng",
-        providerConfig: { baseUrl: "http://localhost:8080" },
-      }),
-    );
-    expect(res.ok).toBe(true);
-  });
-
-  it("accepts searxng provider with no extra config", () => {
-    const res = validateConfigObjectWithPlugins(
-      buildWebSearchProviderConfig({ provider: "searxng" }),
-    );
-    expect(res.ok).toBe(true);
-  });
 });

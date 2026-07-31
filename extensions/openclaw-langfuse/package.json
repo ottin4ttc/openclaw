@@ -1,0 +1,23 @@
+{
+  "name": "@openclaw/openclaw-langfuse",
+  "version": "2026.7.2",
+  "private": true,
+  "description": "Langfuse tracing and prompt management for OpenClaw",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/openclaw/openclaw"
+  },
+  "license": "MIT",
+  "type": "module",
+  "dependencies": {
+    "langfuse": "3.38.6"
+  },
+  "devDependencies": {
+    "@openclaw/plugin-sdk": "workspace:*"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}

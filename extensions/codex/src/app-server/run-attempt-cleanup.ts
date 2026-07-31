@@ -8,6 +8,7 @@ import {
   unsubscribeCodexThreadBestEffort,
 } from "./attempt-client-cleanup.js";
 import { scheduleCodexNativeHookRelayUnregister } from "./native-hook-relay.js";
+import { waitForCodexAttemptDiagnosticEventsDrained } from "./rollout-trace-diagnostics.js";
 import type { CodexAttemptActiveTurn } from "./run-attempt-active-turn.js";
 import type { CodexAttemptLifecycleController } from "./run-attempt-lifecycle-controller.js";
 import type { CodexAttemptResources } from "./run-attempt-resources.js";
@@ -24,13 +25,17 @@ export async function cleanupCodexAttempt(
   const {
     prompt,
     state: resourceState,
+    projectorRef,
     trajectoryRecorder,
     releaseCurrentRoute,
     releaseSharedClientLeaseAndRetireOneShotClient,
     releaseSandboxExecEnvironment,
   } = resources;
   const { connection } = prompt.context.runtime;
-  const { params, options, runAbortController } = connection;
+  const { params, options, rolloutTraceRoot, runAbortController } = connection;
+  const diagnosticDelivery = (
+    params as typeof params & { internalDiagnosticDelivery?: { fail: () => void } }
+  ).internalDiagnosticDelivery;
   const { state, steeringQueueRef, userInputBridgeRef, turnWatches } = turnRuntime;
   const {
     maybeEmitFastModeAutoResetBestEffort,
@@ -39,6 +44,10 @@ export async function cleanupCodexAttempt(
   } = lifecycle;
   const { codexModelCallDiagnostics } = requestRuntime;
   const { activeTurnId, abortListener, handle, freezeRunTerminalOutcome } = activeTurn;
+  const rolloutTraceMonitor = resourceState.rolloutTraceMonitor;
+  if (rolloutTraceMonitor && !state.completed && !runAbortController.signal.aborted) {
+    handle.abort();
+  }
   if (params.isFinalFallbackAttempt !== false) {
     await maybeEmitFastModeAutoResetBestEffort();
   }
@@ -83,17 +92,63 @@ export async function cleanupCodexAttempt(
   }
   userInputBridgeRef.current?.cancelPending();
   turnWatches.clearAllTimers();
+  await resourceState.turnRoute?.drain();
   releaseCurrentRoute();
   await releaseSharedClientLeaseAndRetireOneShotClient();
-  if (resourceState.nativeHookRelay) {
+  let rolloutTraceDrain:
+    | Awaited<ReturnType<NonNullable<typeof rolloutTraceMonitor>["finalDrain"]>>
+    | undefined;
+  if (rolloutTraceMonitor) {
+    try {
+      rolloutTraceDrain = await rolloutTraceMonitor.finalDrain();
+    } catch (error) {
+      embeddedAgentLog.debug("codex rollout trace cleanup drain failed", {
+        error: error instanceof Error ? error.message : String(error),
+        runId: params.runId,
+      });
+    } finally {
+      rolloutTraceMonitor.stop();
+      resourceState.rolloutTraceMonitor = undefined;
+    }
+    if (!rolloutTraceDrain?.complete) {
+      diagnosticDelivery?.fail();
+      embeddedAgentLog.warn("codex rollout trace cleanup drain incomplete", {
+        reason: rolloutTraceDrain?.reason ?? "incomplete_rollout",
+        runId: params.runId,
+      });
+    }
+  }
+  const nativeHookRelay = resourceState.nativeHookRelay;
+  const nativeHookRelayToSettle = resourceState.nativeFailureProjectionDrainAttempted
+    ? undefined
+    : nativeHookRelay;
+  resourceState.nativeFailureProjectionDrainAttempted = true;
+  const nativeFailureProjectionsSettled = nativeHookRelayToSettle
+    ? await waitForCodexAttemptDiagnosticEventsDrained(() =>
+        nativeHookRelayToSettle.settlePreToolUseFailureProjections(),
+      )
+    : true;
+  if (!nativeFailureProjectionsSettled) {
+    diagnosticDelivery?.fail();
+    embeddedAgentLog.warn("codex native hook failure projection drain timed out during cleanup", {
+      threadId: resourceState.thread.threadId,
+      turnId: activeTurnId,
+    });
+  }
+  if (rolloutTraceRoot) {
+    projectorRef.current?.resolveSuppressedNativeToolLifecycleDiagnostics(
+      new Set(rolloutTraceDrain?.emittedToolLifecycleKeys ?? []),
+    );
+  }
+  if (nativeHookRelay) {
     if (state.shouldDelayNativeHookRelayUnregister) {
       // Native hook subprocesses can finish shortly after turn completion.
       scheduleCodexNativeHookRelayUnregister({
-        relay: resourceState.nativeHookRelay,
+        relay: nativeHookRelay,
         hookTimeoutSec: options.nativeHookRelay?.hookTimeoutSec,
       });
     } else {
-      resourceState.nativeHookRelay.unregister();
+      nativeHookRelay.unregister();
     }
   }
   await releaseSandboxExecEnvironment();

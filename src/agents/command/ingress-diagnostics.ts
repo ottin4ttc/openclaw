@@ -75,6 +75,7 @@ export function emitIngressModelUsageDiagnostic(
 
   emitTrustedDiagnosticEvent({
     type: "model.usage",
+    runId: opts.runId,
     sessionKey: opts.sessionKey,
     sessionId: agentMeta.sessionId,
     channel: ingressDiagnosticChannel(opts),

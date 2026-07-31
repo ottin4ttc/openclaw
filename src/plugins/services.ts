@@ -3,6 +3,10 @@ import { STATE_DIR } from "../config/paths.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { GatewayPluginEventBroadcastFn } from "../gateway/server-broadcast-types.js";
 import {
+  captureInternalDiagnosticDeliveryCursor,
+  waitForInternalDiagnosticDeliveryCursor,
+} from "../infra/diagnostic-delivery.js";
+import {
   emitTrustedDiagnosticEventWithPrivateData,
   onTrustedInternalDiagnosticEvent,
 } from "../infra/diagnostic-events.js";
@@ -44,6 +48,14 @@ function createServiceContext(params: {
     allowsConversationAccess ||
     (isDiagnosticsExporter &&
       (params.service?.origin === "bundled" || params.service?.trustedOfficialInstall === true));
+  const internalDiagnostics = grantsInternalDiagnostics
+    ? {
+        emit: emitTrustedDiagnosticEventWithPrivateData,
+        onEvent: onTrustedInternalDiagnosticEvent,
+        captureDeliveryCursor: captureInternalDiagnosticDeliveryCursor,
+        waitForDeliveryCursor: waitForInternalDiagnosticDeliveryCursor,
+      }
+    : undefined;
 
   return {
     config: params.config,
@@ -59,14 +71,7 @@ function createServiceContext(params: {
           ),
         }
       : {}),
-    ...(grantsInternalDiagnostics
-      ? {
-          internalDiagnostics: {
-            emit: emitTrustedDiagnosticEventWithPrivateData,
-            onEvent: onTrustedInternalDiagnosticEvent,
-          },
-        }
-      : {}),
+    ...(internalDiagnostics ? { internalDiagnostics } : {}),
   };
 }
 

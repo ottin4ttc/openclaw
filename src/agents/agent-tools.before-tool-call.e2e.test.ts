@@ -200,7 +200,9 @@ describe("before_tool_call loop detection behavior", () => {
   ) {
     const emitted: DiagnosticEventPayload[] = [];
     const skillUsagePrivateData: DiagnosticEventPrivateData[] = [];
-    const stopShared = onInternalDiagnosticEvent((event) => emitted.push(event));
+    const stopShared = onInternalDiagnosticEvent((event) => {
+      emitted.push(event);
+    });
     const stopTrusted = onTrustedInternalDiagnosticEvent((event, _metadata, privateData) => {
       if (event.type === "skill.used") {
         skillUsagePrivateData.push(privateData);

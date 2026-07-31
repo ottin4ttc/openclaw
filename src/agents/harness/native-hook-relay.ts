@@ -124,6 +124,7 @@ export type NativeHookRelayRegistrationHandle = NativeHookRelayRegistration & {
     options?: NativeHookRelayCommandForEventOptions,
   ) => string;
   renew: (ttlMs?: number) => void;
+  settlePreToolUseFailureProjections: () => Promise<void>;
   unregister: () => void;
 };
 
@@ -509,6 +510,17 @@ export function registerNativeHookRelay(
       }
       current.expiresAtMs = renewedExpiresAtMs;
       handle.expiresAtMs = renewedExpiresAtMs;
+    },
+    settlePreToolUseFailureProjections: async () => {
+      while (true) {
+        const pending = [...registration.preToolUseFailureProjections.values()]
+          .filter((record) => !record.settled)
+          .map((record) => record.promise);
+        if (pending.length === 0) {
+          return;
+        }
+        await Promise.allSettled(pending);
+      }
     },
     unregister: () => unregisterNativeHookRelay(relayId, registration),
   };

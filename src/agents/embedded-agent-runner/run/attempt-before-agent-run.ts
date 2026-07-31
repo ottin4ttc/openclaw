@@ -34,6 +34,7 @@ export async function runEmbeddedAttemptBeforeAgentRun(input: {
   activeSession: BeforeAgentRunSession;
   hookContext: HookContext;
   hookMessages: AgentMessage[];
+  priorMessages: AgentMessage[];
   hookRunner: BeforeAgentRunHookRunner | null;
   modelPrompt: string;
   sessionManager: AttemptSessionManager;
@@ -92,6 +93,7 @@ export async function runEmbeddedAttemptBeforeAgentRun(input: {
         prompt: input.modelPrompt,
         systemPrompt: input.systemPrompt,
         messages: cloneHookMessages(input.hookMessages),
+        priorMessages: cloneHookMessages(input.priorMessages),
         channelId: input.hookContext.channelId,
         accountId: input.attempt.agentAccountId ?? undefined,
         senderId: input.attempt.senderId ?? undefined,

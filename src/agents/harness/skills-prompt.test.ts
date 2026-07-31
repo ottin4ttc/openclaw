@@ -44,6 +44,7 @@ function attemptWithSkillsSnapshot(): EmbeddedRunAttemptParams {
     authProfileStore: { version: 1, profiles: {} },
     modelRegistry: {} as never,
     thinkLevel: "off",
+    timeoutMs: 30_000,
     skillsSnapshot: snapshot,
   };
 }

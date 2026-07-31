@@ -2,6 +2,13 @@
 import { randomUUID } from "node:crypto";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { TalkBrain, TalkEventType, TalkMode, TalkTransport } from "../talk/talk-events.js";
+import {
+  installInternalDiagnosticDeliveryApi,
+  type InternalDiagnosticDeliveryCursor,
+  type InternalDiagnosticDeliveryCursorDrainResult,
+  type InternalDiagnosticDeliveryCursorIdentity,
+  type InternalDiagnosticDeliveryCursorOptions,
+} from "./diagnostic-delivery.js";
 import type { DiagnosticModelContentCapturePolicy } from "./diagnostic-llm-content.js";
 import {
   formatDiagnosticTraceparent,
@@ -20,6 +27,7 @@ type DiagnosticBaseEvent = {
 
 export type DiagnosticUsageEvent = DiagnosticBaseEvent & {
   type: "model.usage";
+  runId?: string;
   sessionKey?: string;
   sessionId?: string;
   channel?: string;
@@ -441,6 +449,7 @@ export type DiagnosticToolParamsSummary =
   | { kind: "object" }
   | { kind: "array"; length: number }
   | { kind: "string"; length: number }
+  | { kind: "truncated"; originalBytes?: number }
   | { kind: "number" | "boolean" | "null" | "undefined" | "other" };
 
 export type DiagnosticToolSource = "channel" | "core" | "mcp" | "plugin";
@@ -458,6 +467,9 @@ type DiagnosticToolExecutionBaseEvent = DiagnosticBaseEvent & {
   toolOwner?: string;
   toolCallId?: string;
   paramsSummary?: DiagnosticToolParamsSummary;
+  rolloutSourceOrder?: string;
+  syntheticStart?: boolean;
+  startTimeSource?: "source" | "terminal" | "terminal-duration";
 };
 
 export type DiagnosticToolExecutionStartedEvent = DiagnosticToolExecutionBaseEvent & {
@@ -606,6 +618,17 @@ type DiagnosticModelCallBaseEvent = DiagnosticBaseEvent & {
   contextWindowSource?: "model" | "modelsConfig" | "agentContextTokens" | "default";
   contextWindowReferenceTokens?: number;
   upstreamRequestIdHash?: string;
+  providerRequestIndex?: number;
+  /**
+   * Shape of the model-visible logical request captured by the producer.
+   * `full` does not assert which HTTP/WebSocket transport path was used.
+   */
+  requestForm?: "full" | "ws-delta";
+  previousResponseIdHash?: string;
+  responseIdHash?: string;
+  rolloutSourceOrder?: string;
+  syntheticStart?: boolean;
+  startTimeSource?: "source" | "terminal" | "terminal-duration";
   promptStats?: DiagnosticModelCallPromptStats;
   startTimeMs?: number;
 };
@@ -896,6 +919,34 @@ type QueuedDiagnosticEvent = DiagnosticEventQueueInput & {
   retainedBytes: number;
 };
 
+type DiagnosticDeliveryCursorRecord = {
+  event: DiagnosticEventPayload;
+  pendingTasks: Set<Promise<void>>;
+};
+
+type DiagnosticDeliveryCursorFailureRecord = {
+  identity: InternalDiagnosticDeliveryCursorIdentity;
+  sequence: number;
+  expiresAt: number;
+};
+
+type DiagnosticDeliveryCursorFailureOverflow = {
+  sequence: number;
+  expiresAt: number;
+};
+
+type ActiveDiagnosticDeliveryIdentity = {
+  identity: InternalDiagnosticDeliveryCursorIdentity;
+  count: number;
+};
+
+type DiagnosticListenerTaskLanes<Listener> = Map<Listener, Map<string, Promise<void>>>;
+type DiagnosticListenerNumberLanes<Listener> = Map<Listener, Map<string, number>>;
+type DiagnosticListenerQueueTotals<Listener> = Map<
+  Listener,
+  { depth: number; retainedBytes: number }
+>;
+
 type DiagnosticEventsGlobalState = {
   marker: symbol;
   enabled: boolean;
@@ -913,22 +964,36 @@ type DiagnosticEventsGlobalState = {
   asyncQueueBytes: number;
   asyncDrainScheduled: boolean;
   pendingListenerTasks: Set<Promise<void>>;
-  listenerTasks: Map<DiagnosticEventListener, Promise<void>>;
-  listenerTaskDepths: Map<DiagnosticEventListener, number>;
-  listenerTaskBytes: Map<DiagnosticEventListener, number>;
-  trustedListenerTasks: Map<TrustedDiagnosticEventListener, Promise<void>>;
-  trustedListenerTaskDepths: Map<TrustedDiagnosticEventListener, number>;
-  trustedListenerTaskBytes: Map<TrustedDiagnosticEventListener, number>;
+  listenerTasks: DiagnosticListenerTaskLanes<DiagnosticEventListener>;
+  listenerTaskDepths: DiagnosticListenerNumberLanes<DiagnosticEventListener>;
+  listenerTaskBytes: DiagnosticListenerNumberLanes<DiagnosticEventListener>;
+  listenerQueueTotals: DiagnosticListenerQueueTotals<DiagnosticEventListener>;
+  trustedListenerTasks: DiagnosticListenerTaskLanes<TrustedDiagnosticEventListener>;
+  trustedListenerTaskDepths: DiagnosticListenerNumberLanes<TrustedDiagnosticEventListener>;
+  trustedListenerTaskBytes: DiagnosticListenerNumberLanes<TrustedDiagnosticEventListener>;
+  trustedListenerQueueTotals: DiagnosticListenerQueueTotals<TrustedDiagnosticEventListener>;
   asyncDroppedEvents: number;
   asyncDroppedTrustedEvents: number;
   asyncDroppedUntrustedEvents: number;
   asyncDroppedPriorityEvents: number;
+  deliveryCursorRecords: Map<number, DiagnosticDeliveryCursorRecord>;
+  deliveryCursorCapExhaustedRecords: Map<string, DiagnosticDeliveryCursorFailureRecord>;
+  deliveryCursorListenerFailureRecords: Map<string, DiagnosticDeliveryCursorFailureRecord>;
+  deliveryCursorProducerFailureRecords: Map<string, DiagnosticDeliveryCursorFailureRecord>;
+  activeDeliveryIdentities: Map<string, ActiveDiagnosticDeliveryIdentity>;
+  deliveryCursorCapExhaustedOverflow?: DiagnosticDeliveryCursorFailureOverflow;
+  deliveryCursorListenerFailureOverflow?: DiagnosticDeliveryCursorFailureOverflow;
+  deliveryCursorProducerFailureOverflow?: DiagnosticDeliveryCursorFailureOverflow;
 };
 
 const MAX_ASYNC_DIAGNOSTIC_EVENTS = 10_000;
 const MAX_ASYNC_DIAGNOSTIC_EVENTS_PER_TURN = 100;
 const MAX_ASYNC_DIAGNOSTIC_QUEUE_BYTES = 32 * 1024 * 1024;
 const MAX_ASYNC_DIAGNOSTIC_LISTENER_QUEUE_BYTES = 16 * 1024 * 1024;
+const MAX_DIAGNOSTIC_DELIVERY_CURSOR_PENDING_EVENTS = 8_192;
+const MAX_DIAGNOSTIC_DELIVERY_CURSOR_FAILURE_IDENTITIES = 8_192;
+const DIAGNOSTIC_DELIVERY_CURSOR_FAILURE_RETENTION_MS = 5 * 60 * 1_000;
+const DEFAULT_DIAGNOSTIC_DELIVERY_CURSOR_TIMEOUT_MS = 5_000;
 const DIAGNOSTIC_EVENTS_STATE_KEY = Symbol.for("openclaw.diagnosticEvents.state.v1");
 const dispatchedTrustedDiagnosticMetadata = new WeakSet<object>();
 const TRUSTED_DIAGNOSTIC_DEFAULT_CONTENT_CAPTURE = Object.freeze({
@@ -984,13 +1049,20 @@ function createDiagnosticEventsState(): DiagnosticEventsGlobalState {
     listenerTasks: new Map(),
     listenerTaskDepths: new Map(),
     listenerTaskBytes: new Map(),
+    listenerQueueTotals: new Map(),
     trustedListenerTasks: new Map(),
     trustedListenerTaskDepths: new Map(),
     trustedListenerTaskBytes: new Map(),
+    trustedListenerQueueTotals: new Map(),
     asyncDroppedEvents: 0,
     asyncDroppedTrustedEvents: 0,
     asyncDroppedUntrustedEvents: 0,
     asyncDroppedPriorityEvents: 0,
+    deliveryCursorRecords: new Map(),
+    deliveryCursorCapExhaustedRecords: new Map(),
+    deliveryCursorListenerFailureRecords: new Map(),
+    deliveryCursorProducerFailureRecords: new Map(),
+    activeDeliveryIdentities: new Map(),
   };
 }
 
@@ -1018,12 +1090,25 @@ function isDiagnosticEventsState(value: unknown): value is DiagnosticEventsGloba
     (candidate.listenerTasks === undefined || candidate.listenerTasks instanceof Map) &&
     (candidate.listenerTaskDepths === undefined || candidate.listenerTaskDepths instanceof Map) &&
     (candidate.listenerTaskBytes === undefined || candidate.listenerTaskBytes instanceof Map) &&
+    (candidate.listenerQueueTotals === undefined || candidate.listenerQueueTotals instanceof Map) &&
     (candidate.trustedListenerTasks === undefined ||
       candidate.trustedListenerTasks instanceof Map) &&
     (candidate.trustedListenerTaskDepths === undefined ||
       candidate.trustedListenerTaskDepths instanceof Map) &&
     (candidate.trustedListenerTaskBytes === undefined ||
-      candidate.trustedListenerTaskBytes instanceof Map)
+      candidate.trustedListenerTaskBytes instanceof Map) &&
+    (candidate.trustedListenerQueueTotals === undefined ||
+      candidate.trustedListenerQueueTotals instanceof Map) &&
+    (candidate.deliveryCursorRecords === undefined ||
+      candidate.deliveryCursorRecords instanceof Map) &&
+    (candidate.deliveryCursorCapExhaustedRecords === undefined ||
+      candidate.deliveryCursorCapExhaustedRecords instanceof Map ||
+      Array.isArray(candidate.deliveryCursorCapExhaustedRecords)) &&
+    (candidate.deliveryCursorListenerFailureRecords === undefined ||
+      candidate.deliveryCursorListenerFailureRecords instanceof Map ||
+      Array.isArray(candidate.deliveryCursorListenerFailureRecords)) &&
+    (candidate.deliveryCursorProducerFailureRecords === undefined ||
+      candidate.deliveryCursorProducerFailureRecords instanceof Map)
   );
 }
 
@@ -1047,9 +1132,41 @@ function getDiagnosticEventsState(): DiagnosticEventsGlobalState {
     existing.listenerTasks ??= new Map();
     existing.listenerTaskDepths ??= new Map();
     existing.listenerTaskBytes ??= new Map();
+    existing.listenerQueueTotals ??= new Map();
     existing.trustedListenerTasks ??= new Map();
     existing.trustedListenerTaskDepths ??= new Map();
     existing.trustedListenerTaskBytes ??= new Map();
+    existing.trustedListenerQueueTotals ??= new Map();
+    if (
+      hasLegacyDiagnosticListenerTaskState(existing.listenerTasks) ||
+      hasLegacyDiagnosticListenerTaskState(existing.listenerTaskDepths) ||
+      hasLegacyDiagnosticListenerTaskState(existing.listenerTaskBytes) ||
+      hasLegacyDiagnosticListenerTaskState(existing.trustedListenerTasks) ||
+      hasLegacyDiagnosticListenerTaskState(existing.trustedListenerTaskDepths) ||
+      hasLegacyDiagnosticListenerTaskState(existing.trustedListenerTaskBytes)
+    ) {
+      // A hot reload can preserve the v1 process-global state. Old global listener chains
+      // cannot provide trace isolation, so discard only their settled queue indexes.
+      existing.listenerTasks.clear();
+      existing.listenerTaskDepths.clear();
+      existing.listenerTaskBytes.clear();
+      existing.listenerQueueTotals.clear();
+      existing.trustedListenerTasks.clear();
+      existing.trustedListenerTaskDepths.clear();
+      existing.trustedListenerTaskBytes.clear();
+      existing.trustedListenerQueueTotals.clear();
+    }
+    existing.deliveryCursorRecords ??= new Map();
+    if (!(existing.deliveryCursorCapExhaustedRecords instanceof Map)) {
+      existing.deliveryCursorCapExhaustedRecords = new Map();
+    }
+    if (!(existing.deliveryCursorListenerFailureRecords instanceof Map)) {
+      existing.deliveryCursorListenerFailureRecords = new Map();
+    }
+    existing.deliveryCursorProducerFailureRecords ??= new Map();
+    if (!(existing.activeDeliveryIdentities instanceof Map)) {
+      existing.activeDeliveryIdentities = new Map();
+    }
     return existing;
   }
   const state = createDiagnosticEventsState();
@@ -1060,6 +1177,13 @@ function getDiagnosticEventsState(): DiagnosticEventsGlobalState {
     writable: false,
   });
   return state;
+}
+
+function hasLegacyDiagnosticListenerTaskState(map: Map<unknown, unknown>): boolean {
+  for (const value of map.values()) {
+    return !(value instanceof Map);
+  }
+  return false;
 }
 
 /** Returns whether diagnostics are enabled for a loaded config; missing config defaults enabled. */
@@ -1096,6 +1220,7 @@ function dispatchDiagnosticEvent(
     if (!options.trustedListenersOnly) {
       for (const listener of state.listeners) {
         const onError = (errorMessage: string) => {
+          noteDiagnosticDeliveryCursorListenerFailure(state, enriched);
           console.error(
             `[diagnostic-events] listener error type=${enriched.type} seq=${enriched.seq}: ${errorMessage}`,
           );
@@ -1118,6 +1243,7 @@ function dispatchDiagnosticEvent(
           state.listenerTasks,
           state.listenerTaskDepths,
           state.listenerTaskBytes,
+          state.listenerQueueTotals,
           listener,
           () => {
             const eventForListener = eventSnapshot;
@@ -1130,20 +1256,24 @@ function dispatchDiagnosticEvent(
           snapshotBytes,
           onError,
           () => {
-            console.error(
-              `[diagnostic-events] listener queue saturated type=${enriched.type} seq=${enriched.seq}, dropping event`,
-            );
+            if (noteDiagnosticDeliveryCursorCapExhausted(state, enriched)) {
+              console.error(
+                `[diagnostic-events] listener queue saturated type=${enriched.type} seq=${enriched.seq}, dropping event`,
+              );
+            }
           },
           () => {
             eventSnapshot = undefined;
             metadataSnapshot = undefined;
           },
+          enriched,
         );
       }
     }
     for (const listener of state.trustedListeners) {
       const listenerOptions = state.trustedListenerOptions.get(listener);
       const onError = (errorMessage: string) => {
+        noteDiagnosticDeliveryCursorListenerFailure(state, enriched);
         console.error(
           `[diagnostic-events] trusted listener error type=${enriched.type} seq=${enriched.seq}: ${errorMessage}`,
         );
@@ -1167,6 +1297,7 @@ function dispatchDiagnosticEvent(
         state.trustedListenerTasks,
         state.trustedListenerTaskDepths,
         state.trustedListenerTaskBytes,
+        state.trustedListenerQueueTotals,
         listener,
         () => {
           const eventForListener = eventSnapshot;
@@ -1184,15 +1315,18 @@ function dispatchDiagnosticEvent(
         ),
         onError,
         () => {
-          console.error(
-            `[diagnostic-events] trusted listener queue saturated type=${enriched.type} seq=${enriched.seq}, dropping event`,
-          );
+          if (noteDiagnosticDeliveryCursorCapExhausted(state, enriched)) {
+            console.error(
+              `[diagnostic-events] trusted listener queue saturated type=${enriched.type} seq=${enriched.seq}, dropping event`,
+            );
+          }
         },
         () => {
           eventSnapshot = undefined;
           metadataSnapshot = undefined;
           privateDataSnapshot = undefined;
         },
+        enriched,
       );
     }
   } finally {
@@ -1204,64 +1338,194 @@ function runDiagnosticListenerInOrder<
   Listener extends DiagnosticEventListener | TrustedDiagnosticEventListener,
 >(
   state: DiagnosticEventsGlobalState,
-  listenerTasks: Map<Listener, Promise<void>>,
-  listenerTaskDepths: Map<Listener, number>,
-  listenerTaskBytes: Map<Listener, number>,
+  listenerTasks: DiagnosticListenerTaskLanes<Listener>,
+  listenerTaskDepths: DiagnosticListenerNumberLanes<Listener>,
+  listenerTaskBytes: DiagnosticListenerNumberLanes<Listener>,
+  listenerQueueTotals: DiagnosticListenerQueueTotals<Listener>,
   listener: Listener,
   invoke: () => void | Promise<void>,
   snapshotBytes: number,
   onError: (errorMessage: string) => void,
   onDrop: () => void,
   onRelease: () => void,
+  event: DiagnosticEventPayload,
 ): void {
   if (snapshotBytes > MAX_ASYNC_DIAGNOSTIC_LISTENER_QUEUE_BYTES) {
     onDrop();
     onRelease();
     return;
   }
-  const previousTask = listenerTasks.get(listener);
-  if (!previousTask) {
-    const task = invokeDiagnosticListener(invoke, onError);
-    if (task) {
-      listenerTaskDepths.set(listener, 1);
-      trackDiagnosticListenerQueueTask(
-        state,
-        listenerTasks,
-        listenerTaskDepths,
-        listenerTaskBytes,
-        listener,
-        task,
-        snapshotBytes,
-        onRelease,
-      );
-    } else {
-      onRelease();
-    }
-    return;
-  }
-
-  const depth = listenerTaskDepths.get(listener) ?? 1;
-  const queuedBytes = listenerTaskBytes.get(listener) ?? 0;
+  const queueTotals = listenerQueueTotals.get(listener) ?? { depth: 0, retainedBytes: 0 };
   if (
-    depth >= MAX_ASYNC_DIAGNOSTIC_EVENTS ||
-    queuedBytes + snapshotBytes > MAX_ASYNC_DIAGNOSTIC_LISTENER_QUEUE_BYTES
+    queueTotals.depth >= MAX_ASYNC_DIAGNOSTIC_EVENTS ||
+    queueTotals.retainedBytes + snapshotBytes > MAX_ASYNC_DIAGNOSTIC_LISTENER_QUEUE_BYTES
   ) {
     onDrop();
     onRelease();
     return;
   }
+  const { laneKey, laneKeys, previousTask } = resolveDiagnosticListenerLane(
+    listenerTasks,
+    listenerTaskDepths,
+    listener,
+    event,
+  );
+  const deliveryRecord = reserveDiagnosticDeliveryCursorRecord(state, event);
+  if (!deliveryRecord) {
+    onDrop();
+    onRelease();
+    return;
+  }
+  if (!previousTask) {
+    const task = invokeDiagnosticListener(invoke, onError);
+    if (task) {
+      setDiagnosticListenerLaneValue(listenerTaskDepths, listener, laneKey, 1);
+      trackDiagnosticListenerQueueTask(
+        state,
+        listenerTasks,
+        listenerTaskDepths,
+        listenerTaskBytes,
+        listenerQueueTotals,
+        listener,
+        task,
+        snapshotBytes,
+        onRelease,
+        event,
+        deliveryRecord,
+        laneKey,
+        laneKeys,
+      );
+    } else {
+      releaseDiagnosticDeliveryCursorRecord(state, event, deliveryRecord);
+      onRelease();
+    }
+    return;
+  }
+
+  const depth = listenerTaskDepths.get(listener)?.get(laneKey) ?? 1;
   const queuedTask = previousTask.then(() => invokeDiagnosticListener(invoke, onError));
-  listenerTaskDepths.set(listener, depth + 1);
+  setDiagnosticListenerLaneValue(listenerTaskDepths, listener, laneKey, depth + 1);
   trackDiagnosticListenerQueueTask(
     state,
     listenerTasks,
     listenerTaskDepths,
     listenerTaskBytes,
+    listenerQueueTotals,
     listener,
     queuedTask,
     snapshotBytes,
     onRelease,
+    event,
+    deliveryRecord,
+    laneKey,
+    laneKeys,
   );
+}
+
+function diagnosticListenerLaneKeys(event: DiagnosticEventPayload): string[] {
+  const laneKeys: string[] = [];
+  const sessionKey = diagnosticEventSessionKey(event);
+  if (sessionKey) {
+    laneKeys.push(`session-key:${sessionKey}`);
+  }
+  const sessionId = diagnosticEventSessionId(event);
+  if (sessionId) {
+    laneKeys.push(`session-id:${sessionId}`);
+  }
+  if (event.trace?.traceId) {
+    laneKeys.push(`trace:${event.trace.traceId}`);
+  }
+  const runId = diagnosticEventRunId(event);
+  if (runId) {
+    laneKeys.push(`run:${runId}`);
+  }
+  return laneKeys.length > 0 ? laneKeys.toSorted() : ["global"];
+}
+
+function resolveDiagnosticListenerLane<Listener>(
+  listenerTasks: DiagnosticListenerTaskLanes<Listener>,
+  listenerTaskDepths: DiagnosticListenerNumberLanes<Listener>,
+  listener: Listener,
+  event: DiagnosticEventPayload,
+): {
+  laneKey: string;
+  laneKeys: string[];
+  previousTask: Promise<void> | undefined;
+} {
+  const laneKeys = new Set(diagnosticListenerLaneKeys(event));
+  const listenerLanes = listenerTasks.get(listener);
+  if (!listenerLanes) {
+    const orderedLaneKeys = Array.from(laneKeys);
+    return { laneKey: orderedLaneKeys[0]!, laneKeys: orderedLaneKeys, previousTask: undefined };
+  }
+
+  const previousTasks = new Set<Promise<void>>();
+  const activeLaneKeys = new Set<string>();
+  for (const laneKey of laneKeys) {
+    const task = listenerLanes.get(laneKey);
+    if (task) {
+      previousTasks.add(task);
+    }
+  }
+  if (previousTasks.size > 0) {
+    // Carry every alias in the matched active lane forward so later events can
+    // correlate through any identity field without collapsing unrelated runs.
+    for (const [laneKey, task] of listenerLanes) {
+      if (previousTasks.has(task)) {
+        laneKeys.add(laneKey);
+        if (listenerTaskDepths.get(listener)?.has(laneKey)) {
+          activeLaneKeys.add(laneKey);
+        }
+      }
+    }
+  }
+  const orderedLaneKeys = Array.from(laneKeys).toSorted();
+  // Aliases may sort before the key that owns the active lane counters. Keep
+  // depth and byte accounting on that stable owner until the lane drains.
+  const laneKey = Array.from(activeLaneKeys).toSorted()[0] ?? orderedLaneKeys[0]!;
+  const previousTask =
+    previousTasks.size === 0
+      ? undefined
+      : previousTasks.size === 1
+        ? previousTasks.values().next().value
+        : Promise.all(previousTasks).then(() => undefined);
+  return { laneKey, laneKeys: orderedLaneKeys, previousTask };
+}
+
+function hasQueuedDiagnosticEventForLane(
+  state: DiagnosticEventsGlobalState,
+  event: DiagnosticEventPayload,
+): boolean {
+  const laneKeys = new Set(diagnosticListenerLaneKeys(event));
+  return state.asyncQueue.some((entry) =>
+    diagnosticListenerLaneKeys(entry.event).some((laneKey) => laneKeys.has(laneKey)),
+  );
+}
+
+function setDiagnosticListenerLaneValue<Listener, Value>(
+  lanes: Map<Listener, Map<string, Value>>,
+  listener: Listener,
+  laneKey: string,
+  value: Value,
+): void {
+  const listenerLanes = lanes.get(listener) ?? new Map<string, Value>();
+  listenerLanes.set(laneKey, value);
+  lanes.set(listener, listenerLanes);
+}
+
+function deleteDiagnosticListenerLaneValue<Listener, Value>(
+  lanes: Map<Listener, Map<string, Value>>,
+  listener: Listener,
+  laneKey: string,
+): void {
+  const listenerLanes = lanes.get(listener);
+  if (!listenerLanes) {
+    return;
+  }
+  listenerLanes.delete(laneKey);
+  if (listenerLanes.size === 0) {
+    lanes.delete(listener);
+  }
 }
 
 function invokeDiagnosticListener(
@@ -1287,36 +1551,219 @@ function trackDiagnosticListenerQueueTask<
   Listener extends DiagnosticEventListener | TrustedDiagnosticEventListener,
 >(
   state: DiagnosticEventsGlobalState,
-  listenerTasks: Map<Listener, Promise<void>>,
-  listenerTaskDepths: Map<Listener, number>,
-  listenerTaskBytes: Map<Listener, number>,
+  listenerTasks: DiagnosticListenerTaskLanes<Listener>,
+  listenerTaskDepths: DiagnosticListenerNumberLanes<Listener>,
+  listenerTaskBytes: DiagnosticListenerNumberLanes<Listener>,
+  listenerQueueTotals: DiagnosticListenerQueueTotals<Listener>,
   listener: Listener,
   task: Promise<void>,
   snapshotBytes: number,
   onRelease: () => void,
+  event: DiagnosticEventPayload,
+  deliveryRecord: DiagnosticDeliveryCursorRecord,
+  laneKey: string,
+  laneKeys: readonly string[],
 ): void {
-  listenerTasks.set(listener, task);
-  listenerTaskBytes.set(listener, (listenerTaskBytes.get(listener) ?? 0) + snapshotBytes);
+  for (const alias of laneKeys) {
+    setDiagnosticListenerLaneValue(listenerTasks, listener, alias, task);
+  }
+  setDiagnosticListenerLaneValue(
+    listenerTaskBytes,
+    listener,
+    laneKey,
+    (listenerTaskBytes.get(listener)?.get(laneKey) ?? 0) + snapshotBytes,
+  );
+  const queueTotals = listenerQueueTotals.get(listener) ?? { depth: 0, retainedBytes: 0 };
+  listenerQueueTotals.set(listener, {
+    depth: queueTotals.depth + 1,
+    retainedBytes: queueTotals.retainedBytes + snapshotBytes,
+  });
   state.pendingListenerTasks.add(task);
+  trackDiagnosticDeliveryCursorTask(state, event, deliveryRecord, task);
   void task.finally(() => {
     onRelease();
     state.pendingListenerTasks.delete(task);
-    const depth = listenerTaskDepths.get(listener) ?? 1;
+    const depth = listenerTaskDepths.get(listener)?.get(laneKey) ?? 1;
     if (depth <= 1) {
-      listenerTaskDepths.delete(listener);
+      deleteDiagnosticListenerLaneValue(listenerTaskDepths, listener, laneKey);
     } else {
-      listenerTaskDepths.set(listener, depth - 1);
+      setDiagnosticListenerLaneValue(listenerTaskDepths, listener, laneKey, depth - 1);
     }
-    if (listenerTasks.get(listener) === task) {
-      listenerTasks.delete(listener);
+    for (const alias of laneKeys) {
+      if (listenerTasks.get(listener)?.get(alias) === task) {
+        deleteDiagnosticListenerLaneValue(listenerTasks, listener, alias);
+      }
     }
-    const queuedBytes = listenerTaskBytes.get(listener) ?? snapshotBytes;
+    const queuedBytes = listenerTaskBytes.get(listener)?.get(laneKey) ?? snapshotBytes;
     if (queuedBytes <= snapshotBytes) {
-      listenerTaskBytes.delete(listener);
+      deleteDiagnosticListenerLaneValue(listenerTaskBytes, listener, laneKey);
     } else {
-      listenerTaskBytes.set(listener, queuedBytes - snapshotBytes);
+      setDiagnosticListenerLaneValue(
+        listenerTaskBytes,
+        listener,
+        laneKey,
+        queuedBytes - snapshotBytes,
+      );
+    }
+    const totals = listenerQueueTotals.get(listener);
+    if (!totals || totals.depth <= 1) {
+      listenerQueueTotals.delete(listener);
+    } else {
+      listenerQueueTotals.set(listener, {
+        depth: totals.depth - 1,
+        retainedBytes: Math.max(0, totals.retainedBytes - snapshotBytes),
+      });
     }
   });
+}
+
+function trackDiagnosticDeliveryCursorTask(
+  state: DiagnosticEventsGlobalState,
+  event: DiagnosticEventPayload,
+  record: DiagnosticDeliveryCursorRecord,
+  task: Promise<void>,
+): void {
+  record.pendingTasks.add(task);
+  void task.finally(() => {
+    const currentRecord = state.deliveryCursorRecords.get(event.seq);
+    if (currentRecord !== record) {
+      return;
+    }
+    currentRecord.pendingTasks.delete(task);
+    if (currentRecord.pendingTasks.size === 0) {
+      state.deliveryCursorRecords.delete(event.seq);
+    }
+  });
+}
+
+function reserveDiagnosticDeliveryCursorRecord(
+  state: DiagnosticEventsGlobalState,
+  event: DiagnosticEventPayload,
+): DiagnosticDeliveryCursorRecord | undefined {
+  const existing = state.deliveryCursorRecords.get(event.seq);
+  if (existing) {
+    return existing;
+  }
+  if (state.deliveryCursorRecords.size >= MAX_DIAGNOSTIC_DELIVERY_CURSOR_PENDING_EVENTS) {
+    return undefined;
+  }
+  const record: DiagnosticDeliveryCursorRecord = {
+    event,
+    pendingTasks: new Set(),
+  };
+  state.deliveryCursorRecords.set(event.seq, record);
+  return record;
+}
+
+function releaseDiagnosticDeliveryCursorRecord(
+  state: DiagnosticEventsGlobalState,
+  event: DiagnosticEventPayload,
+  record: DiagnosticDeliveryCursorRecord,
+): void {
+  if (state.deliveryCursorRecords.get(event.seq) === record && record.pendingTasks.size === 0) {
+    state.deliveryCursorRecords.delete(event.seq);
+  }
+}
+
+function noteDiagnosticDeliveryCursorCapExhausted(
+  state: DiagnosticEventsGlobalState,
+  event: DiagnosticEventPayload,
+): boolean {
+  return appendDiagnosticDeliveryCursorFailureRecord(
+    state.deliveryCursorCapExhaustedRecords,
+    event,
+    state.activeDeliveryIdentities,
+    (overflow) => {
+      state.deliveryCursorCapExhaustedOverflow = mergeDiagnosticDeliveryCursorFailureOverflow(
+        state.deliveryCursorCapExhaustedOverflow,
+        overflow,
+        state.activeDeliveryIdentities,
+      );
+    },
+  );
+}
+
+function noteDiagnosticDeliveryCursorListenerFailure(
+  state: DiagnosticEventsGlobalState,
+  event: DiagnosticEventPayload,
+): void {
+  appendDiagnosticDeliveryCursorFailureRecord(
+    state.deliveryCursorListenerFailureRecords,
+    event,
+    state.activeDeliveryIdentities,
+    (overflow) => {
+      state.deliveryCursorListenerFailureOverflow = mergeDiagnosticDeliveryCursorFailureOverflow(
+        state.deliveryCursorListenerFailureOverflow,
+        overflow,
+        state.activeDeliveryIdentities,
+      );
+    },
+  );
+}
+
+function appendDiagnosticDeliveryCursorFailureRecord(
+  records: Map<string, DiagnosticDeliveryCursorFailureRecord>,
+  event: DiagnosticEventPayload,
+  activeIdentities: Map<string, ActiveDiagnosticDeliveryIdentity>,
+  onOverflow: (overflow: DiagnosticDeliveryCursorFailureOverflow) => void,
+): boolean {
+  const now = Date.now();
+  pruneExpiredDiagnosticDeliveryCursorFailures(records, activeIdentities, now);
+  const identity = diagnosticDeliveryIdentityForEvent(event);
+  const key = diagnosticDeliveryIdentityKey(identity);
+  const existing = records.get(key);
+  if (existing && existing.sequence <= event.seq) {
+    existing.expiresAt = now + DIAGNOSTIC_DELIVERY_CURSOR_FAILURE_RETENTION_MS;
+    return false;
+  }
+  const failure = {
+    identity,
+    sequence: event.seq,
+    expiresAt: now + DIAGNOSTIC_DELIVERY_CURSOR_FAILURE_RETENTION_MS,
+  };
+  if (!existing && records.size >= MAX_DIAGNOSTIC_DELIVERY_CURSOR_FAILURE_IDENTITIES) {
+    // Exact identity retention is full. Fail closed for this failure class only
+    // during the diagnostic drain window, then let the bounded marker expire.
+    onOverflow(failure);
+    return true;
+  }
+  records.set(key, failure);
+  return true;
+}
+
+function pruneExpiredDiagnosticDeliveryCursorFailures(
+  records: Map<string, DiagnosticDeliveryCursorFailureRecord>,
+  activeIdentities: Map<string, ActiveDiagnosticDeliveryIdentity>,
+  now = Date.now(),
+): void {
+  for (const [key, record] of records) {
+    if (
+      record.expiresAt <= now &&
+      !diagnosticDeliveryIdentityIsActive(record.identity, activeIdentities)
+    ) {
+      records.delete(key);
+    }
+  }
+}
+
+function activeDiagnosticDeliveryCursorFailureOverflow(
+  overflow: DiagnosticDeliveryCursorFailureOverflow | undefined,
+  activeIdentities: Map<string, ActiveDiagnosticDeliveryIdentity>,
+  now = Date.now(),
+): DiagnosticDeliveryCursorFailureOverflow | undefined {
+  return overflow && (overflow.expiresAt > now || activeIdentities.size > 0) ? overflow : undefined;
+}
+
+function mergeDiagnosticDeliveryCursorFailureOverflow(
+  existing: DiagnosticDeliveryCursorFailureOverflow | undefined,
+  next: DiagnosticDeliveryCursorFailureOverflow,
+  activeIdentities: Map<string, ActiveDiagnosticDeliveryIdentity>,
+): DiagnosticDeliveryCursorFailureOverflow {
+  const activeExisting = activeDiagnosticDeliveryCursorFailureOverflow(existing, activeIdentities);
+  return {
+    sequence: Math.min(activeExisting?.sequence ?? next.sequence, next.sequence),
+    expiresAt: Math.max(activeExisting?.expiresAt ?? next.expiresAt, next.expiresAt),
+  };
 }
 
 function formatDiagnosticListenerError(error: unknown): string {
@@ -1341,6 +1788,8 @@ function estimateDiagnosticValueBytes(value: unknown, seen: WeakSet<object>): nu
     return 0;
   }
   switch (typeof value) {
+    case "undefined":
+      return 0;
     case "boolean":
       return 4;
     case "number":
@@ -1456,6 +1905,7 @@ function noteAsyncDiagnosticDrop(
   state: DiagnosticEventsGlobalState,
   entry: DiagnosticEventQueueInput,
 ): void {
+  noteDiagnosticDeliveryCursorCapExhausted(state, entry.event);
   state.asyncDroppedEvents += 1;
   if (entry.metadata.trusted) {
     state.asyncDroppedTrustedEvents += 1;
@@ -1534,6 +1984,7 @@ function queueAsyncDiagnosticEvent(
   try {
     retainedBytes = queuedDiagnosticEventBytes(entry);
   } catch (error) {
+    noteAsyncDiagnosticDrop(state, entry);
     console.error(
       `[diagnostic-events] async queue size error type=${entry.event.type}: ${formatDiagnosticListenerError(error)}`,
     );
@@ -1561,6 +2012,7 @@ function queueAsyncDiagnosticEvent(
   }
   const queued = snapshotQueuedDiagnosticEvent(entry, retainedBytes);
   if (!queued) {
+    noteAsyncDiagnosticDrop(state, entry);
     return false;
   }
   state.asyncQueue.push(queued);
@@ -1654,6 +2106,433 @@ export async function waitForDiagnosticEventsDrained(): Promise<void> {
   }
 }
 
+/** Captures a process-local diagnostic listener-delivery cursor for internal runtime ordering. */
+function captureInternalDiagnosticDeliveryCursor(
+  identity: InternalDiagnosticDeliveryCursorIdentity = {},
+): InternalDiagnosticDeliveryCursor {
+  const state = getDiagnosticEventsState();
+  return {
+    ...identity,
+    sequence: state.seq,
+  };
+}
+
+/** Waits for accepted listener deliveries matching the captured trace/run cursor only. */
+async function waitForInternalDiagnosticDeliveryCursor(
+  cursor: InternalDiagnosticDeliveryCursor,
+  options: InternalDiagnosticDeliveryCursorOptions = {},
+): Promise<InternalDiagnosticDeliveryCursorDrainResult> {
+  const state = getDiagnosticEventsState();
+  const startedAt = Date.now();
+  const timeoutMs = options.timeoutMs ?? DEFAULT_DIAGNOSTIC_DELIVERY_CURSOR_TIMEOUT_MS;
+  let deliveredEvents = countDiagnosticDeliveryCursorRecords(state, cursor);
+  let failureReason = diagnosticDeliveryCursorFailureReason(state, cursor);
+  while (hasPendingDiagnosticDeliveryCursorWork(state, cursor)) {
+    failureReason ??= diagnosticDeliveryCursorFailureReason(state, cursor);
+    const elapsedMs = Date.now() - startedAt;
+    if (elapsedMs >= timeoutMs) {
+      return { ok: false, reason: failureReason ?? "timeout", deliveredEvents };
+    }
+    await waitForDiagnosticDeliveryCursorProgress(state, cursor, timeoutMs - elapsedMs);
+    deliveredEvents = Math.max(
+      deliveredEvents,
+      countDiagnosticDeliveryCursorRecords(state, cursor),
+    );
+  }
+  failureReason ??= diagnosticDeliveryCursorFailureReason(state, cursor);
+  if (failureReason) {
+    return { ok: false, reason: failureReason, deliveredEvents };
+  }
+  return { ok: true, deliveredEvents };
+}
+
+async function waitForDiagnosticDeliveryCursorProgress(
+  state: DiagnosticEventsGlobalState,
+  cursor: InternalDiagnosticDeliveryCursor,
+  remainingMs: number,
+): Promise<void> {
+  const pendingTasks = new Set<Promise<void>>();
+  for (const [sequence, record] of state.deliveryCursorRecords) {
+    if (sequence <= cursor.sequence && diagnosticEventMatchesCursor(record.event, cursor)) {
+      for (const task of record.pendingTasks) {
+        pendingTasks.add(task);
+      }
+    }
+  }
+  if (pendingTasks.size === 0) {
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, Math.min(5, remainingMs));
+    });
+    return;
+  }
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, remainingMs);
+    void Promise.allSettled(pendingTasks).then(() => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+}
+
+function diagnosticDeliveryCursorFailureReason(
+  state: DiagnosticEventsGlobalState,
+  cursor: InternalDiagnosticDeliveryCursor,
+): "cap_exhausted" | "listener_failure" | "producer_incomplete" | undefined {
+  if (hasDiagnosticDeliveryCursorCapExhausted(state, cursor)) {
+    return "cap_exhausted";
+  }
+  if (hasDiagnosticDeliveryCursorListenerFailure(state, cursor)) {
+    return "listener_failure";
+  }
+  if (hasDiagnosticDeliveryCursorProducerFailure(state, cursor)) {
+    return "producer_incomplete";
+  }
+  return undefined;
+}
+
+installInternalDiagnosticDeliveryApi({
+  begin: beginInternalDiagnosticDeliveryIdentity,
+  capture: captureInternalDiagnosticDeliveryCursor,
+  waitFor: waitForInternalDiagnosticDeliveryCursor,
+  fail: failInternalDiagnosticDeliveryIdentity,
+  complete: completeInternalDiagnosticDeliveryIdentity,
+});
+
+function beginInternalDiagnosticDeliveryIdentity(
+  identity: InternalDiagnosticDeliveryCursorIdentity,
+): void {
+  if (!hasDiagnosticDeliveryIdentity(identity)) {
+    return;
+  }
+  const state = getDiagnosticEventsState();
+  const key = diagnosticDeliveryIdentityKey(identity);
+  const active = state.activeDeliveryIdentities.get(key);
+  if (active) {
+    active.count += 1;
+    return;
+  }
+  state.activeDeliveryIdentities.set(key, { identity, count: 1 });
+}
+
+function hasPendingDiagnosticDeliveryCursorWork(
+  state: DiagnosticEventsGlobalState,
+  cursor: InternalDiagnosticDeliveryCursor,
+): boolean {
+  for (const entry of state.asyncQueue) {
+    if (entry.event.seq <= cursor.sequence && diagnosticEventMatchesCursor(entry.event, cursor)) {
+      return true;
+    }
+  }
+  for (const [sequence, record] of state.deliveryCursorRecords) {
+    if (
+      sequence <= cursor.sequence &&
+      record.pendingTasks.size > 0 &&
+      diagnosticEventMatchesCursor(record.event, cursor)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function countDiagnosticDeliveryCursorRecords(
+  state: DiagnosticEventsGlobalState,
+  cursor: InternalDiagnosticDeliveryCursor,
+): number {
+  const sequences = new Set<number>();
+  for (const entry of state.asyncQueue) {
+    if (entry.event.seq <= cursor.sequence && diagnosticEventMatchesCursor(entry.event, cursor)) {
+      sequences.add(entry.event.seq);
+    }
+  }
+  for (const [sequence, record] of state.deliveryCursorRecords) {
+    if (sequence <= cursor.sequence && diagnosticEventMatchesCursor(record.event, cursor)) {
+      sequences.add(sequence);
+    }
+  }
+  return sequences.size;
+}
+
+function hasDiagnosticDeliveryCursorCapExhausted(
+  state: DiagnosticEventsGlobalState,
+  cursor: InternalDiagnosticDeliveryCursor,
+): boolean {
+  pruneExpiredDiagnosticDeliveryCursorFailures(
+    state.deliveryCursorCapExhaustedRecords,
+    state.activeDeliveryIdentities,
+  );
+  const overflow = activeDiagnosticDeliveryCursorFailureOverflow(
+    state.deliveryCursorCapExhaustedOverflow,
+    state.activeDeliveryIdentities,
+  );
+  if (!overflow) {
+    state.deliveryCursorCapExhaustedOverflow = undefined;
+  } else if (overflow.sequence <= cursor.sequence) {
+    return true;
+  }
+  return Array.from(state.deliveryCursorCapExhaustedRecords.values()).some(
+    (record) =>
+      record.sequence <= cursor.sequence &&
+      diagnosticIdentityMatchesCursor(record.identity, cursor),
+  );
+}
+
+function hasDiagnosticDeliveryCursorListenerFailure(
+  state: DiagnosticEventsGlobalState,
+  cursor: InternalDiagnosticDeliveryCursor,
+): boolean {
+  pruneExpiredDiagnosticDeliveryCursorFailures(
+    state.deliveryCursorListenerFailureRecords,
+    state.activeDeliveryIdentities,
+  );
+  const overflow = activeDiagnosticDeliveryCursorFailureOverflow(
+    state.deliveryCursorListenerFailureOverflow,
+    state.activeDeliveryIdentities,
+  );
+  if (!overflow) {
+    state.deliveryCursorListenerFailureOverflow = undefined;
+  } else if (overflow.sequence <= cursor.sequence) {
+    return true;
+  }
+  return Array.from(state.deliveryCursorListenerFailureRecords.values()).some(
+    (record) =>
+      record.sequence <= cursor.sequence &&
+      diagnosticIdentityMatchesCursor(record.identity, cursor),
+  );
+}
+
+function hasDiagnosticDeliveryCursorProducerFailure(
+  state: DiagnosticEventsGlobalState,
+  cursor: InternalDiagnosticDeliveryCursor,
+): boolean {
+  pruneExpiredDiagnosticDeliveryCursorFailures(
+    state.deliveryCursorProducerFailureRecords,
+    state.activeDeliveryIdentities,
+  );
+  const overflow = activeDiagnosticDeliveryCursorFailureOverflow(
+    state.deliveryCursorProducerFailureOverflow,
+    state.activeDeliveryIdentities,
+  );
+  if (!overflow) {
+    state.deliveryCursorProducerFailureOverflow = undefined;
+  } else {
+    return true;
+  }
+  return Array.from(state.deliveryCursorProducerFailureRecords.values()).some((record) =>
+    diagnosticIdentityMatchesCursor(record.identity, cursor),
+  );
+}
+
+function failInternalDiagnosticDeliveryIdentity(
+  identity: InternalDiagnosticDeliveryCursorIdentity,
+): void {
+  const state = getDiagnosticEventsState();
+  const key = diagnosticDeliveryIdentityKey(identity);
+  const now = Date.now();
+  pruneExpiredDiagnosticDeliveryCursorFailures(
+    state.deliveryCursorProducerFailureRecords,
+    state.activeDeliveryIdentities,
+    now,
+  );
+  const existing = state.deliveryCursorProducerFailureRecords.get(key);
+  if (existing) {
+    existing.expiresAt = now + DIAGNOSTIC_DELIVERY_CURSOR_FAILURE_RETENTION_MS;
+    return;
+  }
+  if (
+    state.deliveryCursorProducerFailureRecords.size >=
+    MAX_DIAGNOSTIC_DELIVERY_CURSOR_FAILURE_IDENTITIES
+  ) {
+    state.deliveryCursorProducerFailureOverflow = mergeDiagnosticDeliveryCursorFailureOverflow(
+      state.deliveryCursorProducerFailureOverflow,
+      {
+        sequence: state.seq,
+        expiresAt: now + DIAGNOSTIC_DELIVERY_CURSOR_FAILURE_RETENTION_MS,
+      },
+      state.activeDeliveryIdentities,
+    );
+    return;
+  }
+  state.deliveryCursorProducerFailureRecords.set(key, {
+    identity,
+    sequence: state.seq,
+    expiresAt: now + DIAGNOSTIC_DELIVERY_CURSOR_FAILURE_RETENTION_MS,
+  });
+}
+
+function completeInternalDiagnosticDeliveryIdentity(
+  identity: InternalDiagnosticDeliveryCursorIdentity,
+): void {
+  const state = getDiagnosticEventsState();
+  releaseActiveDiagnosticDeliveryIdentities(state.activeDeliveryIdentities, identity);
+  clearDiagnosticDeliveryCursorFailures(
+    state.deliveryCursorCapExhaustedRecords,
+    identity,
+    state.activeDeliveryIdentities,
+  );
+  clearDiagnosticDeliveryCursorFailures(
+    state.deliveryCursorListenerFailureRecords,
+    identity,
+    state.activeDeliveryIdentities,
+  );
+  clearDiagnosticDeliveryCursorFailures(
+    state.deliveryCursorProducerFailureRecords,
+    identity,
+    state.activeDeliveryIdentities,
+  );
+}
+
+function releaseActiveDiagnosticDeliveryIdentities(
+  activeIdentities: Map<string, ActiveDiagnosticDeliveryIdentity>,
+  identity: InternalDiagnosticDeliveryCursorIdentity,
+): void {
+  if (!hasDiagnosticDeliveryIdentity(identity)) {
+    return;
+  }
+  for (const [key, active] of activeIdentities) {
+    if (
+      diagnosticIdentityMatchesCursor(active.identity, identity) ||
+      diagnosticIdentityMatchesCursor(identity, active.identity)
+    ) {
+      if (active.count <= 1) {
+        activeIdentities.delete(key);
+      } else {
+        active.count -= 1;
+      }
+    }
+  }
+}
+
+function clearDiagnosticDeliveryCursorFailures(
+  records: Map<string, DiagnosticDeliveryCursorFailureRecord>,
+  identity: InternalDiagnosticDeliveryCursorIdentity,
+  activeIdentities: Map<string, ActiveDiagnosticDeliveryIdentity>,
+): boolean {
+  let cleared = false;
+  for (const [key, record] of records) {
+    if (
+      hasDiagnosticDeliveryIdentity(record.identity) &&
+      hasDiagnosticDeliveryIdentity(identity) &&
+      (diagnosticIdentityMatchesCursor(record.identity, identity) ||
+        diagnosticIdentityMatchesCursor(identity, record.identity)) &&
+      !diagnosticDeliveryIdentityIsActive(record.identity, activeIdentities)
+    ) {
+      records.delete(key);
+      cleared = true;
+    }
+  }
+  return cleared;
+}
+
+function hasDiagnosticDeliveryIdentity(
+  identity: InternalDiagnosticDeliveryCursorIdentity,
+): boolean {
+  return (
+    identity.traceId !== undefined ||
+    identity.runId !== undefined ||
+    identity.sessionKey !== undefined ||
+    identity.sessionId !== undefined
+  );
+}
+
+function diagnosticDeliveryIdentityIsActive(
+  identity: InternalDiagnosticDeliveryCursorIdentity,
+  activeIdentities: Map<string, ActiveDiagnosticDeliveryIdentity>,
+): boolean {
+  for (const active of activeIdentities.values()) {
+    if (
+      diagnosticIdentityMatchesCursor(active.identity, identity) ||
+      diagnosticIdentityMatchesCursor(identity, active.identity)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function diagnosticIdentityMatchesCursor(
+  identity: InternalDiagnosticDeliveryCursorIdentity,
+  cursor: InternalDiagnosticDeliveryCursorIdentity,
+): boolean {
+  if (
+    cursor.traceId === undefined &&
+    cursor.runId === undefined &&
+    cursor.sessionKey === undefined &&
+    cursor.sessionId === undefined
+  ) {
+    return true;
+  }
+  return diagnosticIdentityAliasesMatch(identity, cursor);
+}
+
+function diagnosticDeliveryIdentityForEvent(
+  event: DiagnosticEventPayload,
+): InternalDiagnosticDeliveryCursorIdentity {
+  return {
+    ...(event.trace?.traceId ? { traceId: event.trace.traceId } : {}),
+    ...(diagnosticEventRunId(event) ? { runId: diagnosticEventRunId(event) } : {}),
+    ...(diagnosticEventSessionKey(event) ? { sessionKey: diagnosticEventSessionKey(event) } : {}),
+    ...(diagnosticEventSessionId(event) ? { sessionId: diagnosticEventSessionId(event) } : {}),
+  };
+}
+
+function diagnosticDeliveryIdentityKey(identity: InternalDiagnosticDeliveryCursorIdentity): string {
+  return [
+    identity.traceId ?? "",
+    identity.runId ?? "",
+    identity.sessionKey ?? "",
+    identity.sessionId ?? "",
+  ].join("\u0000");
+}
+
+function diagnosticEventMatchesCursor(
+  event: DiagnosticEventPayload,
+  cursor: InternalDiagnosticDeliveryCursorIdentity,
+): boolean {
+  if (
+    cursor.traceId === undefined &&
+    cursor.runId === undefined &&
+    cursor.sessionKey === undefined &&
+    cursor.sessionId === undefined
+  ) {
+    return true;
+  }
+  return diagnosticIdentityAliasesMatch(diagnosticDeliveryIdentityForEvent(event), cursor);
+}
+
+function diagnosticIdentityAliasesMatch(
+  identity: InternalDiagnosticDeliveryCursorIdentity,
+  cursor: InternalDiagnosticDeliveryCursorIdentity,
+): boolean {
+  let hasSharedMatch = false;
+  for (const key of ["traceId", "runId", "sessionKey", "sessionId"] as const) {
+    const identityValue = identity[key];
+    const cursorValue = cursor[key];
+    if (identityValue === undefined || cursorValue === undefined) {
+      continue;
+    }
+    if (identityValue !== cursorValue) {
+      return false;
+    }
+    hasSharedMatch = true;
+  }
+  return hasSharedMatch;
+}
+
+function diagnosticEventRunId(event: DiagnosticEventPayload): string | undefined {
+  return "runId" in event && typeof event.runId === "string" ? event.runId : undefined;
+}
+
+function diagnosticEventSessionKey(event: DiagnosticEventPayload): string | undefined {
+  return "sessionKey" in event && typeof event.sessionKey === "string"
+    ? event.sessionKey
+    : undefined;
+}
+
+function diagnosticEventSessionId(event: DiagnosticEventPayload): string | undefined {
+  return "sessionId" in event && typeof event.sessionId === "string" ? event.sessionId : undefined;
+}
+
 function enrichDiagnosticEvent(
   state: DiagnosticEventsGlobalState,
   event: DiagnosticDispatchInput,
@@ -1707,7 +2586,10 @@ function emitDiagnosticEventWithTrust(
     ...(trustedTraceContext ? { trustedTraceContext } : {}),
   };
 
-  if (ASYNC_DIAGNOSTIC_EVENT_TYPES.has(enriched.type)) {
+  if (
+    ASYNC_DIAGNOSTIC_EVENT_TYPES.has(enriched.type) ||
+    (enriched.type === "model.usage" && hasQueuedDiagnosticEventForLane(state, enriched))
+  ) {
     queueAsyncDiagnosticEvent(state, { event: enriched, metadata, privateData });
     return;
   }
@@ -1959,12 +2841,22 @@ export function resetDiagnosticEventsForTest(): void {
   state.listenerTasks.clear();
   state.listenerTaskDepths.clear();
   state.listenerTaskBytes.clear();
+  state.listenerQueueTotals.clear();
   state.trustedListenerTasks.clear();
   state.trustedListenerTaskDepths.clear();
   state.trustedListenerTaskBytes.clear();
+  state.trustedListenerQueueTotals.clear();
   state.asyncDroppedEvents = 0;
   state.asyncDroppedTrustedEvents = 0;
   state.asyncDroppedUntrustedEvents = 0;
   state.asyncDroppedPriorityEvents = 0;
+  state.deliveryCursorRecords.clear();
+  state.deliveryCursorCapExhaustedRecords.clear();
+  state.deliveryCursorListenerFailureRecords.clear();
+  state.deliveryCursorProducerFailureRecords.clear();
+  state.activeDeliveryIdentities.clear();
+  state.deliveryCursorCapExhaustedOverflow = undefined;
+  state.deliveryCursorListenerFailureOverflow = undefined;
+  state.deliveryCursorProducerFailureOverflow = undefined;
 }
 /* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

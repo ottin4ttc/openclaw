@@ -1,137 +1,183 @@
 // Feishu helper module supports doc schema behavior.
 import { Type, type Static } from "typebox";
 
-export const FeishuDocSchema = Type.Object({
-  action: Type.String({
-    description:
-      "Action to perform: read | write | append | insert | create | create_and_write | list_blocks | get_block | update_block | delete_block | delete_blocks | create_table | write_table_cells | create_table_with_values | read_table_cells | insert_table_row | insert_table_column | delete_table_rows | delete_table_columns | merge_table_cells | upload_image | upload_file | color_text | list_comments | get_comment | create_comment | list_comment_replies",
-  }),
-  doc_token: Type.Optional(
-    Type.String({
-      description: "Document token (required for most actions, extract from URL /docx/XXX)",
-    }),
-  ),
-  content: Type.Optional(
-    Type.String({
-      description:
-        "Markdown content (for write/append/insert/update_block/create_comment/create_and_write). IMPORTANT: Use proper markdown syntax for good formatting — # for h1, ## for h2, **bold**, - for bullets, 1. for numbered lists, --- for dividers, | for tables. Plain text without markdown syntax will render as ugly unformatted paragraphs.",
-    }),
-  ),
-  title: Type.Optional(
-    Type.String({ description: "Document title (for create/create_and_write)" }),
-  ),
-  folder_token: Type.Optional(
-    Type.String({ description: "Target folder token (for create/create_and_write)" }),
-  ),
-  grant_to_requester: Type.Optional(
-    Type.Boolean({
-      description:
-        "Grant edit permission to requesting user (for create/create_and_write, default: true)",
-    }),
-  ),
-  block_id: Type.Optional(
-    Type.String({
-      description:
-        "Block ID (for get_block/update_block/delete_block/color_text/insert_table_row/insert_table_column/delete_table_rows/delete_table_columns/merge_table_cells)",
-    }),
-  ),
-  block_ids: Type.Optional(
-    Type.Array(Type.String(), {
-      description: "Array of block IDs to delete (for delete_blocks)",
-    }),
-  ),
-  after_block_id: Type.Optional(
-    Type.String({ description: "Insert content after this block ID (for insert action)" }),
-  ),
+const tableCreationProperties = {
+  doc_token: Type.String({ description: "Document token" }),
   parent_block_id: Type.Optional(
-    Type.String({
-      description:
-        "Parent block ID (for create_table/create_table_with_values/upload_image/upload_file)",
-    }),
+    Type.String({ description: "Parent block ID (default: document root)" }),
   ),
-  row_size: Type.Optional(
-    Type.Integer({
-      description: "Table row count (for create_table/create_table_with_values)",
-      minimum: 1,
-    }),
-  ),
-  column_size: Type.Optional(
-    Type.Integer({
-      description: "Table column count (for create_table/create_table_with_values)",
-      minimum: 1,
-    }),
-  ),
+  row_size: Type.Integer({ description: "Table row count", minimum: 1 }),
+  column_size: Type.Integer({ description: "Table column count", minimum: 1 }),
   column_width: Type.Optional(
     Type.Array(Type.Number({ minimum: 1 }), {
-      description: "Column widths in px (for create_table/create_table_with_values)",
+      description: "Column widths in px (length should match column_size)",
     }),
   ),
-  table_block_id: Type.Optional(
-    Type.String({ description: "Table block ID (for write_table_cells/read_table_cells)" }),
-  ),
-  values: Type.Optional(
-    Type.Array(Type.Array(Type.String()), {
-      description: "2D matrix values[row][col] (for write_table_cells/create_table_with_values)",
+};
+
+export const FeishuDocSchema = Type.Union([
+  Type.Object({
+    action: Type.Literal("read"),
+    doc_token: Type.String({ description: "Document token (extract from URL /docx/XXX)" }),
+  }),
+  Type.Object({
+    action: Type.Literal("write"),
+    doc_token: Type.String({ description: "Document token" }),
+    content: Type.String({
+      description: "Markdown content to write (replaces entire document content)",
     }),
-  ),
-  row_index: Type.Optional(
-    Type.Number({ description: "Row index to insert at (-1 for end, for insert_table_row)" }),
-  ),
-  column_index: Type.Optional(
-    Type.Number({
-      description: "Column index to insert at (-1 for end, for insert_table_column)",
+  }),
+  Type.Object({
+    action: Type.Literal("append"),
+    doc_token: Type.String({ description: "Document token" }),
+    content: Type.String({ description: "Markdown content to append to end of document" }),
+  }),
+  Type.Object({
+    action: Type.Literal("insert"),
+    doc_token: Type.String({ description: "Document token" }),
+    content: Type.String({ description: "Markdown content to insert" }),
+    after_block_id: Type.String({
+      description: "Insert content after this block ID. Use list_blocks to find block IDs.",
     }),
-  ),
-  row_start: Type.Optional(
-    Type.Number({
-      description: "Start row index 0-based (for delete_table_rows/merge_table_cells)",
+  }),
+  Type.Object({
+    action: Type.Literal("create"),
+    title: Type.String({ description: "Document title" }),
+    folder_token: Type.Optional(Type.String({ description: "Target folder token (optional)" })),
+    grant_to_requester: Type.Optional(
+      Type.Boolean({
+        description:
+          "Grant edit permission to the trusted requesting Feishu user from runtime context (default: true).",
+      }),
+    ),
+  }),
+  Type.Object({
+    action: Type.Literal("list_blocks"),
+    doc_token: Type.String({ description: "Document token" }),
+  }),
+  Type.Object({
+    action: Type.Literal("get_block"),
+    doc_token: Type.String({ description: "Document token" }),
+    block_id: Type.String({ description: "Block ID (from list_blocks)" }),
+  }),
+  Type.Object({
+    action: Type.Literal("update_block"),
+    doc_token: Type.String({ description: "Document token" }),
+    block_id: Type.String({ description: "Block ID (from list_blocks)" }),
+    content: Type.String({ description: "New text content" }),
+  }),
+  Type.Object({
+    action: Type.Literal("delete_block"),
+    doc_token: Type.String({ description: "Document token" }),
+    block_id: Type.String({ description: "Block ID" }),
+  }),
+  // Table creation (explicit structure)
+  Type.Object({
+    action: Type.Literal("create_table"),
+    ...tableCreationProperties,
+  }),
+  Type.Object({
+    action: Type.Literal("write_table_cells"),
+    doc_token: Type.String({ description: "Document token" }),
+    table_block_id: Type.String({ description: "Table block ID" }),
+    values: Type.Array(Type.Array(Type.String()), {
+      description: "2D matrix values[row][col] to write into table cells",
+      minItems: 1,
     }),
-  ),
-  row_count: Type.Optional(
-    Type.Number({ description: "Number of rows to delete (for delete_table_rows, default: 1)" }),
-  ),
-  row_end: Type.Optional(
-    Type.Number({ description: "End row index exclusive (for merge_table_cells)" }),
-  ),
-  column_start: Type.Optional(
-    Type.Number({
-      description: "Start column index 0-based (for delete_table_columns/merge_table_cells)",
+  }),
+  Type.Object({
+    action: Type.Literal("create_table_with_values"),
+    ...tableCreationProperties,
+    values: Type.Array(Type.Array(Type.String()), {
+      description: "2D matrix values[row][col] to write into table cells",
+      minItems: 1,
     }),
-  ),
-  column_count: Type.Optional(
-    Type.Number({
-      description: "Number of columns to delete (for delete_table_columns, default: 1)",
+  }),
+  // Table row/column manipulation
+  Type.Object({
+    action: Type.Literal("insert_table_row"),
+    doc_token: Type.String({ description: "Document token" }),
+    block_id: Type.String({ description: "Table block ID" }),
+    row_index: Type.Optional(
+      Type.Number({ description: "Row index to insert at (-1 for end, default: -1)" }),
+    ),
+  }),
+  Type.Object({
+    action: Type.Literal("insert_table_column"),
+    doc_token: Type.String({ description: "Document token" }),
+    block_id: Type.String({ description: "Table block ID" }),
+    column_index: Type.Optional(
+      Type.Number({ description: "Column index to insert at (-1 for end, default: -1)" }),
+    ),
+  }),
+  Type.Object({
+    action: Type.Literal("delete_table_rows"),
+    doc_token: Type.String({ description: "Document token" }),
+    block_id: Type.String({ description: "Table block ID" }),
+    row_start: Type.Number({ description: "Start row index (0-based)" }),
+    row_count: Type.Optional(Type.Number({ description: "Number of rows to delete (default: 1)" })),
+  }),
+  Type.Object({
+    action: Type.Literal("delete_table_columns"),
+    doc_token: Type.String({ description: "Document token" }),
+    block_id: Type.String({ description: "Table block ID" }),
+    column_start: Type.Number({ description: "Start column index (0-based)" }),
+    column_count: Type.Optional(
+      Type.Number({ description: "Number of columns to delete (default: 1)" }),
+    ),
+  }),
+  Type.Object({
+    action: Type.Literal("merge_table_cells"),
+    doc_token: Type.String({ description: "Document token" }),
+    block_id: Type.String({ description: "Table block ID" }),
+    row_start: Type.Number({ description: "Start row index" }),
+    row_end: Type.Number({ description: "End row index (exclusive)" }),
+    column_start: Type.Number({ description: "Start column index" }),
+    column_end: Type.Number({ description: "End column index (exclusive)" }),
+  }),
+  // Image / file upload
+  Type.Object({
+    action: Type.Literal("upload_image"),
+    doc_token: Type.String({ description: "Document token" }),
+    url: Type.Optional(Type.String({ description: "Remote image URL (http/https)" })),
+    file_path: Type.Optional(Type.String({ description: "Local image file path" })),
+    image: Type.Optional(
+      Type.String({
+        description:
+          "Image as data URI (data:image/png;base64,...) or plain base64 string. Use instead of url/file_path for DALL-E outputs, canvas screenshots, etc.",
+      }),
+    ),
+    parent_block_id: Type.Optional(
+      Type.String({ description: "Parent block ID (default: document root)" }),
+    ),
+    filename: Type.Optional(Type.String({ description: "Optional filename override" })),
+    index: Type.Optional(
+      Type.Integer({
+        minimum: 0,
+        description: "Insert position (0-based index among siblings). Omit to append.",
+      }),
+    ),
+  }),
+  Type.Object({
+    action: Type.Literal("upload_file"),
+    doc_token: Type.String({ description: "Document token" }),
+    url: Type.Optional(Type.String({ description: "Remote file URL (http/https)" })),
+    file_path: Type.Optional(Type.String({ description: "Local file path" })),
+    parent_block_id: Type.Optional(
+      Type.String({ description: "Parent block ID (default: document root)" }),
+    ),
+    filename: Type.Optional(Type.String({ description: "Optional filename override" })),
+  }),
+  // Text color / style
+  Type.Object({
+    action: Type.Literal("color_text"),
+    doc_token: Type.String({ description: "Document token" }),
+    block_id: Type.String({ description: "Text block ID to update" }),
+    content: Type.String({
+      description:
+        'Text with color markup. Tags: [red], [green], [blue], [orange], [yellow], [purple], [grey], [bold], [bg:yellow]. Example: "Revenue [green]+15%[/green] YoY"',
     }),
-  ),
-  column_end: Type.Optional(
-    Type.Number({ description: "End column index exclusive (for merge_table_cells)" }),
-  ),
-  url: Type.Optional(Type.String({ description: "Remote URL (for upload_image/upload_file)" })),
-  file_path: Type.Optional(
-    Type.String({ description: "Local file path (for upload_image/upload_file)" }),
-  ),
-  image: Type.Optional(
-    Type.String({ description: "Image as data URI or base64 (for upload_image)" }),
-  ),
-  filename: Type.Optional(
-    Type.String({ description: "Optional filename override (for upload_image/upload_file)" }),
-  ),
-  index: Type.Optional(
-    Type.Integer({ minimum: 0, description: "Insert position 0-based (for upload_image)" }),
-  ),
-  comment_id: Type.Optional(
-    Type.String({ description: "Comment ID (for get_comment/list_comment_replies)" }),
-  ),
-  page_size: Type.Optional(
-    Type.Number({
-      description: "Number of items per page (for list_comments/list_comment_replies, default: 50)",
-    }),
-  ),
-  page_token: Type.Optional(
-    Type.String({
-      description: "Pagination token (for list_comments/list_comment_replies)",
-    }),
-  ),
-});
+  }),
+]);
 
 export type FeishuDocParams = Static<typeof FeishuDocSchema>;

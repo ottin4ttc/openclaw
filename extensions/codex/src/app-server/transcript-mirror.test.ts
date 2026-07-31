@@ -671,6 +671,56 @@ describe("mirrorCodexAppServerTranscript", () => {
     );
   });
 
+  it("preserves Codex tool correlation IDs that resemble secret token prefixes", async () => {
+    const target = await createSqliteMirrorTarget("openclaw-codex-mirror-tool-identity-");
+    const toolCallId = "exec-31bc63b8-378f-4b0b-92fc-2d03482cff0d";
+    const assistantMessage = attachCodexMirrorIdentity(
+      makeAgentAssistantMessage({
+        content: [
+          {
+            type: "toolCall",
+            id: toolCallId,
+            name: "bash",
+            arguments: { command: "printf sk-abcdef1234567890xyz" },
+          },
+        ],
+        timestamp: Date.now(),
+      }),
+      `turn-1:tool:${toolCallId}:call`,
+    );
+    const toolResultMessage = attachCodexMirrorIdentity(
+      castAgentMessage({
+        role: "toolResult",
+        toolCallId,
+        toolName: "bash",
+        content: [
+          {
+            type: "toolResult",
+            id: toolCallId,
+            toolCallId,
+            toolUseId: toolCallId,
+            tool_use_id: toolCallId,
+            content: "sk-abcdef1234567890xyz",
+          },
+        ],
+        timestamp: Date.now() + 1,
+      }),
+      `turn-1:tool:${toolCallId}:result`,
+    ) as MirroredAgentMessage;
+
+    await mirrorCodexAppServerTranscript({
+      ...target,
+      config: { logging: { redactSensitive: "tools" } },
+      messages: [assistantMessage, toolResultMessage],
+      idempotencyScope: "codex-app-server:thread-1",
+    });
+
+    const raw = await readMirrorRaw(target);
+    expect(raw).toContain(toolCallId);
+    expect(raw).not.toContain("exec-31bc63b8-378f-4b0b-92***");
+    expect(raw).not.toContain("sk-abcdef1234567890xyz");
+  });
+
   it("preserves gateway user-turn identity across Codex transcript mirroring", async () => {
     const target = await createSqliteMirrorTarget("openclaw-codex-mirror-user-identity-");
     const userMessage = castAgentMessage({

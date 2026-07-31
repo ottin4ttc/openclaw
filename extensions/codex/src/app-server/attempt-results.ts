@@ -105,6 +105,7 @@ export function buildCodexTurnStartFailureResult(params: {
   params: EmbeddedRunAttemptParams;
   message: string;
   promptError?: unknown;
+  promptErrorSource?: EmbeddedRunAttemptResult["promptErrorSource"];
   messagesSnapshot: AgentMessage[];
   systemPromptReport: CodexSystemPromptReport;
 }): EmbeddedRunAttemptResult {
@@ -116,7 +117,7 @@ export function buildCodexTurnStartFailureResult(params: {
     timedOutDuringCompaction: false,
     timedOutDuringToolExecution: false,
     promptError: params.promptError ?? params.message,
-    promptErrorSource: "prompt",
+    promptErrorSource: params.promptErrorSource ?? "prompt",
     sessionIdUsed: params.params.sessionId,
     messagesSnapshot: params.messagesSnapshot,
     assistantTexts: [],

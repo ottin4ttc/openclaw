@@ -9,7 +9,6 @@ import {
   runHarnessContextEngineMaintenance,
   type EmbeddedRunAttemptResult,
 } from "openclaw/plugin-sdk/agent-harness-runtime";
-import { waitForDiagnosticEventsDrained } from "openclaw/plugin-sdk/diagnostic-runtime";
 import { readMirroredSessionHistoryMessages } from "./attempt-context.js";
 import { classifyCodexModelCallFailureKind } from "./attempt-diagnostics.js";
 import {
@@ -20,7 +19,7 @@ import {
 } from "./attempt-results.js";
 import { readCodexRateLimitsRevision, readRecentCodexRateLimits } from "./rate-limit-cache.js";
 import {
-  drainCodexRolloutTraceProviderRequestDiagnostics,
+  finalizeCodexRolloutTraceProviderRequestDiagnostics,
   waitForCodexAttemptDiagnosticEventsDrained,
 } from "./rollout-trace-diagnostics.js";
 import type { CodexAttemptActiveTurn } from "./run-attempt-active-turn.js";
@@ -49,6 +48,22 @@ import {
   markCodexAuthProfileBlockedFromRateLimits,
   refreshCodexUsageLimitPromptError,
 } from "./usage-limit-error.js";
+
+type HostDiagnosticDelivery = {
+  capture: () => unknown;
+  fail: () => void;
+  waitFor: (
+    cursor: unknown,
+    options?: { timeoutMs?: number },
+  ) => Promise<
+    | { ok: true; deliveredEvents: number }
+    | {
+        ok: false;
+        reason: "cap_exhausted" | "listener_failure" | "producer_incomplete" | "timeout";
+        deliveredEvents: number;
+      }
+  >;
+};
 
 export async function finalizeCodexAttempt(
   resources: CodexAttemptResources,
@@ -314,24 +329,54 @@ export async function finalizeCodexAttempt(
       clientClosedAbort: state.clientClosedAbort,
       formatError: formatErrorMessage,
     }) ?? (finalAborted ? "aborted" : undefined);
-  const providerRequestEvents = await drainCodexRolloutTraceProviderRequestDiagnostics(
-    {
-      traceRoot: rolloutTraceRoot,
+  const diagnosticDelivery = (
+    params as typeof params & { internalDiagnosticDelivery?: HostDiagnosticDelivery }
+  ).internalDiagnosticDelivery;
+  const providerRequestDrain = resourceState.rolloutTraceMonitor
+    ? await resourceState.rolloutTraceMonitor.finalDrain().finally(() => {
+        resourceState.rolloutTraceMonitor?.stop();
+        resourceState.rolloutTraceMonitor = undefined;
+      })
+    : rolloutTraceRoot
+      ? await finalizeCodexRolloutTraceProviderRequestDiagnostics({
+          traceRoot: rolloutTraceRoot,
+          threadId: resourceState.thread.threadId,
+          turnId: activeTurnId,
+          baseFields: codexModelCallBaseFields,
+          capture: codexModelContentCapture,
+          log: embeddedAgentLog,
+        })
+      : undefined;
+  const nativeHookRelay = resourceState.nativeHookRelay;
+  resourceState.nativeFailureProjectionDrainAttempted = true;
+  const nativeFailureProjectionsSettled = nativeHookRelay
+    ? await waitForCodexAttemptDiagnosticEventsDrained(() =>
+        nativeHookRelay.settlePreToolUseFailureProjections(),
+      )
+    : true;
+  if (!nativeFailureProjectionsSettled) {
+    diagnosticDelivery?.fail();
+    embeddedAgentLog.warn("codex native hook failure projection drain timed out before agent_end", {
       threadId: resourceState.thread.threadId,
       turnId: activeTurnId,
-      baseFields: codexModelCallBaseFields,
-      capture: codexModelContentCapture,
-      log: embeddedAgentLog,
-    },
-    {
-      allowBackgroundDrain: false,
-    },
+    });
+  }
+  activeProjector.resolveSuppressedNativeToolLifecycleDiagnostics(
+    new Set(providerRequestDrain?.emittedToolLifecycleKeys ?? []),
   );
-  if (providerRequestEvents > 0) {
+  if (providerRequestDrain && providerRequestDrain.emitted > 0) {
     embeddedAgentLog.debug("codex rollout trace provider-request diagnostics emitted", {
       threadId: resourceState.thread.threadId,
       turnId: activeTurnId,
-      count: providerRequestEvents,
+      count: providerRequestDrain.emitted,
+    });
+  }
+  if (providerRequestDrain && !providerRequestDrain.complete) {
+    diagnosticDelivery?.fail();
+    embeddedAgentLog.warn("codex rollout trace final drain incomplete before agent_end", {
+      threadId: resourceState.thread.threadId,
+      turnId: activeTurnId,
+      reason: providerRequestDrain.reason ?? "incomplete_rollout",
     });
   }
   if (modelCallFailureKind) {
@@ -346,11 +391,18 @@ export async function finalizeCodexAttempt(
   } else {
     codexModelCallDiagnostics.emitCompleted(result);
   }
-  // Keep this attempt's model observations ahead of agent_end, but do not let
-  // unrelated stuck diagnostic listeners hold attempt finalization forever.
-  const diagnosticsDrained = await waitForCodexAttemptDiagnosticEventsDrained(
-    waitForDiagnosticEventsDrained,
-  );
+  // Keep this attempt's model observations ahead of agent_end without waiting
+  // for unrelated trace/run listener backlog.
+  const diagnosticCursor = diagnosticDelivery?.capture();
+  const diagnosticsDrained =
+    diagnosticDelivery && diagnosticCursor
+      ? await waitForCodexAttemptDiagnosticEventsDrained(async (timeoutMs) => {
+          const drain = await diagnosticDelivery.waitFor(diagnosticCursor, { timeoutMs });
+          if (!drain.ok) {
+            throw new Error(`diagnostic delivery cursor drain failed: ${drain.reason}`);
+          }
+        })
+      : false;
   if (!diagnosticsDrained) {
     embeddedAgentLog.debug("codex app-server diagnostic drain timed out before agent_end", {
       threadId: resourceState.thread.threadId,

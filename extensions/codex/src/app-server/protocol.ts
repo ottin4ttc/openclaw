@@ -125,6 +125,7 @@ export type CodexThreadStartParams = JsonObject & {
   cwd?: string;
   model?: string;
   modelProvider?: string | null;
+  threadSource?: string | null;
   config?: JsonObject;
   personality?: CodexPersonality | null;
   approvalPolicy?: CodexApprovalPolicy | null;
