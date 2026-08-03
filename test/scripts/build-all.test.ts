@@ -269,6 +269,14 @@ describe("resolveBuildAllStep", () => {
     });
   });
 
+  it("runs tsdown directly without pnpm dependency status checks", () => {
+    const step = getBuildAllStep("tsdown");
+
+    const result = resolveBuildAllStep(step, { env: {} });
+
+    expect(result.options.env).toMatchObject({ OPENCLAW_BUILD_ALL_NO_PNPM: "1" });
+  });
+
   it("keeps export-html build output aligned with runtime template lookup", () => {
     const step = getBuildAllStep("copy-export-html-templates");
 

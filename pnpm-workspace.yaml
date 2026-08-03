@@ -95,8 +95,10 @@ minimumReleaseAgeExclude:
 
 nodeLinker: hoisted
 blockExoticSubdeps: true
+verifyDepsBeforeRun: false
 
 overrides:
+  "@openai/codex": 0.144.5
   "@anthropic-ai/sdk": 0.109.1
   "@opentelemetry/core": 2.8.0
   "@aws-sdk/core": 3.974.27

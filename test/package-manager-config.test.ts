@@ -15,6 +15,7 @@ type PnpmBuildConfig = {
   blockExoticSubdeps?: boolean;
   ignoredBuiltDependencies?: string[];
   onlyBuiltDependencies?: string[];
+  verifyDepsBeforeRun?: boolean | "error" | "install" | "warn";
 };
 
 type RootPackageJson = {
@@ -64,6 +65,7 @@ describe("package manager build policy", () => {
     expect(workspace.allowBuilds?.["node-llama-cpp"]).toBe(false);
     expect(workspace.blockExoticSubdeps).toBe(true);
     expect(workspace.onlyBuiltDependencies).toBeUndefined();
+    expect(workspace.verifyDepsBeforeRun).toBe(false);
   });
 
   it("includes third-party notices in the published root package", () => {

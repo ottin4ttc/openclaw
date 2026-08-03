@@ -64,7 +64,12 @@ const PNPM_STEP_NODE_FALLBACKS = new Map([
 ]);
 export const BUILD_ALL_STEPS = [
   { label: "plugins:assets:build", kind: "pnpm", pnpmArgs: ["plugins:assets:build"] },
-  { label: "tsdown", kind: "node", args: ["scripts/tsdown-build.mjs"] },
+  {
+    label: "tsdown",
+    kind: "node",
+    args: ["scripts/tsdown-build.mjs"],
+    env: { OPENCLAW_BUILD_ALL_NO_PNPM: "1" },
+  },
   {
     label: "check-cli-bootstrap-imports",
     kind: "node",
