@@ -92,6 +92,27 @@ describe("plugin npm runtime build planning", () => {
     ]);
   });
 
+  it("plans the Langfuse plugin as an independently installable package", () => {
+    const plan = expectPluginNpmRuntimeBuildPlan(
+      resolvePluginNpmRuntimeBuildPlan({
+        repoRoot,
+        packageDir: path.join(repoRoot, "extensions", "openclaw-langfuse"),
+      }),
+    );
+
+    expect(plan.runtimeExtensions).toEqual(["./dist/index.js"]);
+    expect(plan.packageFiles).toEqual([
+      "dist/**",
+      "openclaw.plugin.json",
+      "npm-shrinkwrap.json",
+      "README.md",
+    ]);
+    expect(plan.packagePeerMetadata.peerDependencies.openclaw).toBe(">=2026.7.2");
+    expect(plan.packageJson.dependencies).toEqual({
+      langfuse: "3.38.6",
+    });
+  });
+
   it("builds doctor contract surfaces for publishable channel plugins", () => {
     for (const pluginDir of ["msteams", "nostr"]) {
       const plan = expectPluginNpmRuntimeBuildPlan(

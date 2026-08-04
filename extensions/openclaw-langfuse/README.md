@@ -16,10 +16,53 @@ Captures LLM call chains as structured Langfuse traces and optionally injects pr
 
 ## Installation
 
-The plugin is bundled with OpenClaw. Enable it in the active configuration:
+The plugin is available in an OpenClaw source checkout and as an independently
+installable package. Install it when the target OpenClaw distribution does not
+already include it:
+
+```bash
+openclaw plugins install @openclaw/openclaw-langfuse
+```
+
+Then enable it in the active configuration:
 
 ```bash
 openclaw config set plugins.entries.openclaw-langfuse.enabled true
+```
+
+Restart the Gateway after installing or updating the plugin.
+
+## Development and packaging
+
+From the OpenClaw repository root, install workspace dependencies and run the
+plugin tests:
+
+```bash
+pnpm install
+node scripts/run-vitest.mjs extensions/openclaw-langfuse/
+```
+
+Build the package-local JavaScript runtime without rebuilding OpenClaw or any
+other plugin:
+
+```bash
+node scripts/check-plugin-npm-runtime-builds.mjs \
+  --package extensions/openclaw-langfuse
+```
+
+Create an installable npm tarball in an isolated output directory:
+
+```bash
+mkdir -p /tmp/openclaw-langfuse-package
+OPENCLAW_PLUGIN_NPM_PACK_OUTPUT_DIR=/tmp/openclaw-langfuse-package \
+  bash scripts/plugin-npm-publish.sh --pack extensions/openclaw-langfuse
+```
+
+Install that tarball in another OpenClaw instance:
+
+```bash
+openclaw plugins install npm-pack:/tmp/openclaw-langfuse-package/<tarball>.tgz --force
+openclaw plugins inspect openclaw-langfuse --runtime --json
 ```
 
 ## Configuration
