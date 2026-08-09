@@ -1,0 +1,92 @@
+{
+  "plugins": {
+    "entries": {
+      "openclaw-langfuse": {
+        "enabled": true,
+        "hooks": {
+          // Required for LLM/tool tracing hooks. Enables this plugin to read
+          // conversation hook payloads; keep redact=true below unless you need
+          // full payloads in Langfuse.
+          "allowConversationAccess": true
+        },
+        "config": {
+          // ============================================================
+          // Langfuse Connection
+          // ============================================================
+          // Credentials can also be set via environment variables:
+          //   LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, LANGFUSE_BASE_URL
+          // Env vars take precedence over config values.
+
+          "baseUrl": "https://langfuse.your-company.com",
+          "publicKey": "pk-lf-xxxxxxxx",
+          "secretKey": "sk-lf-xxxxxxxx",
+
+          // ============================================================
+          // LLM Tracing
+          // ============================================================
+          // Captures full LLM call chains as nested Langfuse traces:
+          //   Trace (agent turn)
+          //     +-- Generation (llm-call-1, model, input/output, tokens)
+          //     +-- Span (tool:read, params, result, duration)
+          //     +-- Generation (llm-call-2, model, input/output, tokens)
+          //     +-- Span (tool:search, params, result)
+          //     +-- Generation (llm-call-3, final answer)
+
+          "tracing": {
+            "enabled": true,
+            "tags": ["production"],
+            "redact": true
+          },
+
+          // ============================================================
+          // Prompt Management (optional)
+          // ============================================================
+          // Fetches prompts from Langfuse Prompt Management and injects
+          // them into OpenClaw agent system prompts.
+          //
+          // Rules are evaluated in order (first match wins):
+          //   - Exact match:    "main"
+          //   - Wildcard prefix: "support-*"
+          //   - Catch-all:       "*"
+          //
+          // inject modes:
+          //   - "append" (default): add after existing system prompt
+          //   - "prepend": add before existing system prompt
+          //   - "replace": completely replace the system prompt
+          //
+          // If no rule matches or Langfuse is unavailable, the original
+          // OpenClaw prompt is used unchanged (safe degradation).
+
+          "prompts": [
+            {
+              "match": "main",
+              "langfusePrompt": "oh-my-langfuse-prompt",
+              "inject": "replace"
+            },
+            {
+              "match": "support-*",
+              "langfusePrompt": "oh-my-langfuse-support",
+              "label": "production",
+              "inject": "prepend"
+            },
+            {
+              "match": "dev-*",
+              "langfusePrompt": "oh-my-langfuse-dev",
+              "label": "staging",
+              "inject": "prepend"
+            },
+            {
+              "match": "*",
+              "langfusePrompt": "oh-my-langfuse-fallback",
+              "inject": "append"
+            }
+          ],
+
+          // Cache fetched prompts for 60 seconds (default).
+          // Set to 0 to disable caching.
+          "promptCacheTtlMs": 60000
+        }
+      }
+    }
+  }
+}

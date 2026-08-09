@@ -139,6 +139,7 @@ function humanizeId(value) {
     ["nextcloud", "Nextcloud"],
     ["nvidia", "NVIDIA"],
     ["openai", "OpenAI"],
+    ["openclaw", "OpenClaw"],
     ["opencode", "OpenCode"],
     ["openrouter", "OpenRouter"],
     ["otel", "OpenTelemetry"],

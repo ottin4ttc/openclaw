@@ -21,7 +21,10 @@ import {
   type MessagingToolSourceReplyPayload,
   type ToolProgressDetailMode,
 } from "openclaw/plugin-sdk/agent-harness-runtime";
-import { emitTrustedDiagnosticEvent } from "openclaw/plugin-sdk/diagnostic-runtime";
+import {
+  emitTrustedDiagnosticEvent,
+  type DiagnosticEventPayload,
+} from "openclaw/plugin-sdk/diagnostic-runtime";
 import { generatedImageAssetFromBase64 } from "openclaw/plugin-sdk/image-generation";
 import type { AssistantMessage, Usage } from "openclaw/plugin-sdk/llm";
 import { saveMediaBuffer } from "openclaw/plugin-sdk/media-store";
@@ -29,7 +32,7 @@ import { asDateTimestampMs } from "openclaw/plugin-sdk/number-runtime";
 import { resolveCodexToolAbortTerminalReason } from "./dynamic-tool-execution.js";
 import { resolveCodexLocalRuntimeAttribution } from "./local-runtime-attribution.js";
 import {
-  emitCodexNativePreToolUseFailureDiagnostic,
+  CODEX_NATIVE_TOOL_LIFECYCLE_OWNER,
   type CodexNativePreToolUseFailure,
 } from "./native-hook-relay.js";
 import {
@@ -74,6 +77,7 @@ export type CodexAppServerEventProjectorOptions = {
   onNativeToolResultRecorded?: () => void | Promise<void>;
   readRecentRateLimits?: () => JsonValue | undefined;
   runAbortSignal?: AbortSignal;
+  suppressNativeToolLifecycleDiagnostics?: boolean;
   trajectoryRecorder?: CodexTrajectoryRecorder | null;
 };
 
@@ -84,6 +88,7 @@ type CodexNativeToolLifecycleContext = Pick<
 
 type CodexNativeToolLifecycleProjectorOptions = {
   runAbortSignal?: AbortSignal;
+  suppressNativeToolLifecycleDiagnostics?: boolean;
 };
 
 type CodexNativeToolAuditStatus = ReturnType<typeof itemStatus> | "cancelled" | "unknown";
@@ -92,6 +97,11 @@ type CodexNativePreToolUseFailureRecord = {
   failure: CodexNativePreToolUseFailure;
   terminalReason: CodexNativePreToolUseFailure["disposition"];
 };
+
+type WithoutDiagnosticSequence<T> = T extends unknown ? Omit<T, "seq" | "ts"> : never;
+type CodexNativeToolDiagnosticEvent = WithoutDiagnosticSequence<
+  Extract<DiagnosticEventPayload, { type: `tool.execution.${string}` }>
+>;
 
 /** Projects metadata-only lifecycle diagnostics for native tool items. */
 export class CodexNativeToolLifecycleProjector {
@@ -110,6 +120,8 @@ export class CodexNativeToolLifecycleProjector {
     Exclude<BeforeToolCallFailureDisposition, "blocked">
   >();
   private readonly preToolUseFailureByItem = new Map<string, CodexNativePreToolUseFailureRecord>();
+  private readonly suppressedDiagnostics: CodexNativeToolDiagnosticEvent[] = [];
+  private resolvedRolloutLifecycleKeys: ReadonlySet<string> | undefined;
   private finalized = false;
 
   constructor(
@@ -328,13 +340,28 @@ export class CodexNativeToolLifecycleProjector {
               type: "tool.execution.completed" as const,
               durationMs,
             };
-    emitTrustedDiagnosticEvent({
+    const diagnosticEvent = {
       ...this.buildBase(toolCallId, toolName),
       ...terminalEvent,
       ...(options.sourceTimestampMs !== undefined
         ? { sourceTimestampMs: options.sourceTimestampMs }
         : {}),
-    });
+    } satisfies CodexNativeToolDiagnosticEvent;
+    this.emitOrSuppress(diagnosticEvent);
+  }
+
+  resolveSuppressedDiagnostics(rolloutLifecycleKeys: ReadonlySet<string> = new Set()): void {
+    const resolvedRolloutLifecycleKeys = new Set(this.resolvedRolloutLifecycleKeys);
+    for (const lifecycleKey of rolloutLifecycleKeys) {
+      resolvedRolloutLifecycleKeys.add(lifecycleKey);
+    }
+    this.resolvedRolloutLifecycleKeys = resolvedRolloutLifecycleKeys;
+    const diagnostics = this.suppressedDiagnostics.splice(0);
+    for (const diagnostic of diagnostics) {
+      if (!this.isCoveredByRollout(diagnostic)) {
+        emitTrustedDiagnosticEvent(diagnostic);
+      }
+    }
   }
 
   finalizeActive(runWasAborted = this.options.runAbortSignal?.aborted === true): void {
@@ -368,15 +395,15 @@ export class CodexNativeToolLifecycleProjector {
     durationMs: number,
     sourceTimestampMs?: number,
   ): void {
-    emitCodexNativePreToolUseFailureDiagnostic({
-      agentId: this.context.agentId,
-      sessionId: this.context.sessionId,
-      sessionKey: this.context.sessionKey,
-      runId: this.context.runId,
-      failure: { ...record.failure, toolName, durationMs },
+    const diagnosticEvent = {
+      type: "tool.execution.error",
+      ...this.buildBase(record.failure.toolCallId, toolName),
+      durationMs,
+      errorCategory: "before_tool_call",
       terminalReason: record.terminalReason,
-      sourceTimestampMs,
-    });
+      ...(sourceTimestampMs !== undefined ? { sourceTimestampMs } : {}),
+    } satisfies CodexNativeToolDiagnosticEvent;
+    this.emitOrSuppress(diagnosticEvent);
   }
 
   private recordSnapshotItem(item: CodexThreadItem): void {
@@ -406,11 +433,34 @@ export class CodexNativeToolLifecycleProjector {
     }
     this.startedAtByItem.set(toolCallId, sourceTimestampMs ?? Date.now());
     this.activeItems.set(toolCallId, { toolName, unfinishedStatus });
-    emitTrustedDiagnosticEvent({
+    const diagnosticEvent = {
       type: "tool.execution.started",
       ...this.buildBase(toolCallId, toolName),
       ...(sourceTimestampMs !== undefined ? { sourceTimestampMs } : {}),
-    });
+    } satisfies CodexNativeToolDiagnosticEvent;
+    this.emitOrSuppress(diagnosticEvent);
+  }
+
+  private emitOrSuppress(diagnosticEvent: CodexNativeToolDiagnosticEvent): void {
+    if (!this.options.suppressNativeToolLifecycleDiagnostics) {
+      emitTrustedDiagnosticEvent(diagnosticEvent);
+      return;
+    }
+    if (!this.resolvedRolloutLifecycleKeys) {
+      this.suppressedDiagnostics.push(diagnosticEvent);
+      return;
+    }
+    if (!this.isCoveredByRollout(diagnosticEvent)) {
+      emitTrustedDiagnosticEvent(diagnosticEvent);
+    }
+  }
+
+  private isCoveredByRollout(diagnosticEvent: CodexNativeToolDiagnosticEvent): boolean {
+    if (!diagnosticEvent.toolCallId || !this.resolvedRolloutLifecycleKeys) {
+      return false;
+    }
+    const phase = diagnosticEvent.type === "tool.execution.started" ? "started" : "terminal";
+    return this.resolvedRolloutLifecycleKeys.has(`${phase}:${diagnosticEvent.toolCallId}`);
   }
 
   private buildBase(toolCallId: string, toolName: string) {
@@ -420,6 +470,7 @@ export class CodexNativeToolLifecycleProjector {
       sessionId: this.context.sessionId,
       sessionKey: this.context.sessionKey,
       toolName,
+      toolOwner: CODEX_NATIVE_TOOL_LIFECYCLE_OWNER,
       toolCallId,
     };
   }
@@ -565,6 +616,7 @@ export class CodexAppServerEventProjector {
       turnId,
       {
         runAbortSignal: options.runAbortSignal,
+        suppressNativeToolLifecycleDiagnostics: options.suppressNativeToolLifecycleDiagnostics,
       },
     );
   }
@@ -651,6 +703,12 @@ export class CodexAppServerEventProjector {
 
   recordNativeToolPreToolUseFailure(failure: CodexNativePreToolUseFailure): void {
     this.nativeToolLifecycleProjector.recordPreToolUseFailure(failure);
+  }
+
+  resolveSuppressedNativeToolLifecycleDiagnostics(
+    rolloutLifecycleKeys?: ReadonlySet<string>,
+  ): void {
+    this.nativeToolLifecycleProjector.resolveSuppressedDiagnostics(rolloutLifecycleKeys);
   }
 
   async handleNotification(notification: CodexServerNotification): Promise<void> {
@@ -2537,7 +2595,6 @@ function readNonNegativeInteger(record: JsonObject, key: string): number | undef
   const value = readNumber(record, key);
   return value !== undefined && Number.isInteger(value) && value >= 0 ? value : undefined;
 }
-
 
 function readCodexErrorNotificationMessage(record: JsonObject): string | undefined {
   const error = record.error;

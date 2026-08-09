@@ -299,6 +299,24 @@
       }
     },
     {
+      "name": "@openclaw/openclaw-langfuse",
+      "description": "OpenClaw Langfuse tracing and prompt management plugin",
+      "source": "official",
+      "kind": "plugin",
+      "openclaw": {
+        "plugin": {
+          "id": "openclaw-langfuse",
+          "label": "Langfuse"
+        },
+        "install": {
+          "clawhubSpec": "clawhub:@openclaw/openclaw-langfuse",
+          "npmSpec": "@openclaw/openclaw-langfuse",
+          "defaultChoice": "npm",
+          "minHostVersion": ">=2026.7.1"
+        }
+      }
+    },
+    {
       "name": "@openclaw/lobster",
       "description": "Lobster workflow tool plugin (typed pipelines + resumable approvals)",
       "source": "official",

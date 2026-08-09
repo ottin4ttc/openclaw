@@ -1082,6 +1082,13 @@ export type PluginHookBeforeAgentRunEvent = {
   prompt: string;
   /** Loaded session history before the current prompt is submitted. */
   messages: unknown[];
+  /**
+   * Canonical transcript history before the current turn.
+   *
+   * This explicit alias lets runtimes expose the stable pre-turn history
+   * independently from their policy-facing `messages` projection.
+   */
+  priorMessages?: unknown[];
   /** Active system prompt prepared for this run. */
   systemPrompt?: string;
   /** Account identity when available. */

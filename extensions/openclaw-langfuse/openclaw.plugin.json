@@ -1,0 +1,82 @@
+{
+  "id": "openclaw-langfuse",
+  "activation": {
+    "onStartup": true
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "baseUrl": {
+        "type": "string",
+        "description": "Langfuse base URL (default: https://cloud.langfuse.com)"
+      },
+      "publicKey": {
+        "type": "string",
+        "description": "Langfuse public key (fallback: LANGFUSE_PUBLIC_KEY env var)"
+      },
+      "secretKey": {
+        "type": "string",
+        "description": "Langfuse secret key (fallback: LANGFUSE_SECRET_KEY env var)"
+      },
+      "prompts": {
+        "type": "array",
+        "description": "Prompt injection rules",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["match", "langfusePrompt"],
+          "properties": {
+            "match": {
+              "type": "string",
+              "description": "Pattern to match agent/session context"
+            },
+            "langfusePrompt": {
+              "type": "string",
+              "description": "Langfuse prompt name to fetch"
+            },
+            "version": {
+              "type": "number",
+              "description": "Prompt version to fetch (omit for latest)"
+            },
+            "label": {
+              "type": "string",
+              "description": "Prompt label to fetch (e.g. 'production')"
+            },
+            "inject": {
+              "type": "string",
+              "enum": ["prepend", "append", "replace"],
+              "description": "How to inject the fetched prompt (default: append)"
+            }
+          }
+        }
+      },
+      "promptCacheTtlMs": {
+        "type": "number",
+        "description": "How long to cache fetched prompts in milliseconds (default: 60000)"
+      },
+      "tracing": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "LLM tracing configuration",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "Enable LLM tracing (default: true)"
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Tags to attach to every trace"
+          },
+          "redact": {
+            "type": "boolean",
+            "description": "Redact prompt/completion content from traces (default: true)"
+          }
+        }
+      }
+    }
+  }
+}

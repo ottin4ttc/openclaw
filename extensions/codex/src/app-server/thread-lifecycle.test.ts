@@ -1164,6 +1164,51 @@ describe("Codex app-server model provider selection", () => {
     expect(request.modelProvider).toBe("lmstudio");
   });
 
+  it("splits configured custom providers after the Codex provider folds into openai", () => {
+    const params = createAttemptParams({
+      provider: "openai",
+      modelId: "clawos/gpt-5.6-sol",
+    });
+    params.config = {
+      models: {
+        providers: {
+          clawos: {
+            baseUrl: "https://relay.example.test/v1",
+            models: [],
+          },
+        },
+      },
+    };
+
+    const request = buildThreadStartParams(params, {
+      cwd: "/repo",
+      dynamicTools: [],
+      appServer: createAppServerOptions() as never,
+      developerInstructions: "test instructions",
+    });
+
+    expect(request.model).toBe("gpt-5.6-sol");
+    expect(request.modelProvider).toBe("clawos");
+  });
+
+  it("keeps unconfigured OpenAI slashy model ids on the openai provider", () => {
+    const request = buildThreadStartParams(
+      createAttemptParams({
+        provider: "openai",
+        modelId: "owner/slashy-model",
+      }),
+      {
+        cwd: "/repo",
+        dynamicTools: [],
+        appServer: createAppServerOptions() as never,
+        developerInstructions: "test instructions",
+      },
+    );
+
+    expect(request.model).toBe("owner/slashy-model");
+    expect(request.modelProvider).toBe("openai");
+  });
+
   it("uses provider-qualified model refs for thread capability selection", () => {
     expect(
       resolveCodexAppServerThreadModelSelection({

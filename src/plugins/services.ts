@@ -32,9 +32,15 @@ function createServiceContext(params: {
     params.service?.pluginId === params.service?.service.id &&
     (params.service?.service.id === "diagnostics-otel" ||
       params.service?.service.id === "diagnostics-prometheus");
+  const allowsConversationAccess =
+    params.config.plugins?.entries?.[params.service.pluginId]?.hooks?.allowConversationAccess ===
+    true;
+  // Private diagnostics contain raw model/tool content. The explicit conversation-access
+  // grant is the existing operator-controlled boundary for plugins that need that data.
   const grantsInternalDiagnostics =
-    isDiagnosticsExporter &&
-    (params.service?.origin === "bundled" || params.service?.trustedOfficialInstall === true);
+    allowsConversationAccess ||
+    (isDiagnosticsExporter &&
+      (params.service?.origin === "bundled" || params.service?.trustedOfficialInstall === true));
 
   return {
     config: params.config,

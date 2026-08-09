@@ -1737,6 +1737,18 @@ describe("official external plugin catalog", () => {
     );
   });
 
+  it("lists Langfuse as a trusted official external plugin", () => {
+    const langfuse = expectCatalogEntry("openclaw-langfuse");
+
+    expect(resolveOfficialExternalPluginId(langfuse)).toBe("openclaw-langfuse");
+    expect(resolveOfficialExternalPluginInstall(langfuse)).toEqual({
+      clawhubSpec: "clawhub:@openclaw/openclaw-langfuse",
+      npmSpec: "@openclaw/openclaw-langfuse",
+      defaultChoice: "npm",
+      minHostVersion: ">=2026.7.1",
+    });
+  });
+
   it("lists GMI Cloud as an official external provider", () => {
     const gmi = expectCatalogEntry("gmi");
 

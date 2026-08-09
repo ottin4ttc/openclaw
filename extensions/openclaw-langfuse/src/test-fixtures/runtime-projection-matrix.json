@@ -1,0 +1,93 @@
+{
+  "context": {
+    "prompt": "matrix current request",
+    "systemPrompt": "matrix system instructions",
+    "priorMessages": [
+      {
+        "role": "user",
+        "content": "matrix prior question"
+      },
+      {
+        "role": "assistant",
+        "content": "matrix prior answer"
+      }
+    ]
+  },
+  "runtimes": {
+    "openclaw": {
+      "provider": "clawos",
+      "model": "gpt-5.6-sol"
+    },
+    "codex": {
+      "provider": "codex",
+      "model": "aliyun/qwen3.7-plus"
+    }
+  },
+  "successfulToolLoop": {
+    "firstOutput": {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [
+        {
+          "id": "matrix-tool-1",
+          "type": "function",
+          "function": {
+            "name": "lookup",
+            "arguments": "{\"query\":\"matrix\"}"
+          }
+        }
+      ]
+    },
+    "toolResult": {
+      "role": "tool",
+      "tool_call_id": "matrix-tool-1",
+      "content": "{\"result\":\"matrix tool output\"}"
+    },
+    "finalOutput": "matrix final answer",
+    "toolInput": {
+      "query": "matrix"
+    },
+    "toolOutput": {
+      "result": "matrix tool output"
+    },
+    "openclawUsage": [
+      {
+        "input": 80,
+        "output": 12,
+        "cacheRead": 20,
+        "cacheWrite": 5,
+        "total": 117
+      },
+      {
+        "input": 100,
+        "output": 18,
+        "cacheRead": 40,
+        "cacheWrite": 7,
+        "total": 165
+      }
+    ],
+    "codexUsage": [
+      {
+        "input": 80,
+        "output": 12,
+        "cacheRead": 20,
+        "total": 92
+      },
+      {
+        "input": 100,
+        "output": 18,
+        "cacheRead": 40,
+        "total": 118
+      }
+    ]
+  },
+  "failedTurn": {
+    "partialOutput": "matrix partial answer",
+    "error": "matrix provider failure"
+  },
+  "oversizedRedactedContext": {
+    "secret": "sk-matrix-secret-value",
+    "messageCount": 40,
+    "messageSize": 8192
+  }
+}

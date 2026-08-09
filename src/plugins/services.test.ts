@@ -346,7 +346,7 @@ describe("startPluginServices", () => {
     expect(new Set(measured).size).toBe(measured.length);
   });
 
-  it("grants internal diagnostics only to trusted diagnostics exporter services", async () => {
+  it("grants internal diagnostics to trusted exporters or conversation-authorized services", async () => {
     const contexts: OpenClawPluginServiceContext[] = [];
     const diagnosticsService = createTrackingService("diagnostics-otel", { contexts });
     await startPluginServices({
@@ -398,6 +398,35 @@ describe("startPluginServices", () => {
     expect(officialInstallContexts[0]?.internalDiagnostics?.onEvent).toBeTypeOf("function");
     expect(officialInstallContexts[0]?.internalDiagnostics?.emit).toBeTypeOf("function");
 
+    const officialConsumerContexts: OpenClawPluginServiceContext[] = [];
+    const officialConsumer = createTrackingService("trace-consumer", {
+      contexts: officialConsumerContexts,
+    });
+    await startPluginServices({
+      registry: createRegistry([officialConsumer], "trace-consumer", "global", true),
+      config: {
+        plugins: {
+          entries: {
+            "trace-consumer": { hooks: { allowConversationAccess: true } },
+          },
+        },
+      },
+    });
+
+    expect(officialConsumerContexts[0]?.internalDiagnostics?.onEvent).toBeTypeOf("function");
+    expect(officialConsumerContexts[0]?.internalDiagnostics?.emit).toBeTypeOf("function");
+
+    const trustedWithoutGrantContexts: OpenClawPluginServiceContext[] = [];
+    const trustedWithoutGrant = createTrackingService("trace-consumer", {
+      contexts: trustedWithoutGrantContexts,
+    });
+    await startPluginServices({
+      registry: createRegistry([trustedWithoutGrant], "trace-consumer", "global", true),
+      config: createServiceConfig(),
+    });
+
+    expect(trustedWithoutGrantContexts[0]?.internalDiagnostics).toBeUndefined();
+
     const untrustedContexts: OpenClawPluginServiceContext[] = [];
     const untrustedService = createTrackingService("diagnostics-otel", {
       contexts: untrustedContexts,
@@ -408,6 +437,24 @@ describe("startPluginServices", () => {
     });
 
     expect(untrustedContexts[0]?.internalDiagnostics).toBeUndefined();
+
+    const untrustedConsumerContexts: OpenClawPluginServiceContext[] = [];
+    const untrustedConsumer = createTrackingService("trace-consumer", {
+      contexts: untrustedConsumerContexts,
+    });
+    await startPluginServices({
+      registry: createRegistry([untrustedConsumer], "trace-consumer", "workspace"),
+      config: {
+        plugins: {
+          entries: {
+            "trace-consumer": { hooks: { allowConversationAccess: true } },
+          },
+        },
+      },
+    });
+
+    expect(untrustedConsumerContexts[0]?.internalDiagnostics?.onEvent).toBeTypeOf("function");
+    expect(untrustedConsumerContexts[0]?.internalDiagnostics?.emit).toBeTypeOf("function");
 
     const spoofedContexts: OpenClawPluginServiceContext[] = [];
     const spoofedService = createTrackingService("diagnostics-prometheus", {

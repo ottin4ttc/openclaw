@@ -1,4 +1,5 @@
 // Codex tests cover run attempt.hooks plugin behavior.
+import fs from "node:fs/promises";
 import path from "node:path";
 import {
   abortAgentHarnessRun,
@@ -20,6 +21,11 @@ import {
 } from "openclaw/plugin-sdk/plugin-test-runtime";
 import { describe, expect, it, vi } from "vitest";
 import { CODEX_GPT5_BEHAVIOR_CONTRACT } from "../../prompt-overlay.js";
+import { CodexAppServerEventProjector } from "./event-projector.js";
+import {
+  activeRolloutTraceTurnRegistrationCountForTest,
+  CODEX_ROLLOUT_TRACE_ROOT_ENV_VAR,
+} from "./rollout-trace-diagnostics.js";
 import {
   assistantMessage,
   createAppServerHarness,
@@ -33,6 +39,7 @@ import {
   tempDir,
   threadStartResult,
   turnStartResult,
+  userMessage,
 } from "./run-attempt-test-harness.js";
 import {
   readCodexAppServerBinding,
@@ -50,6 +57,169 @@ function flushDiagnosticEvents() {
 setupRunAttemptTestHooks();
 
 describe("runCodexAppServerAttempt hooks and model diagnostics", () => {
+  it("runs before_agent_run with canonical history before model diagnostics and turn start", async () => {
+    const order: string[] = [];
+    const beforeAgentRun = vi.fn(async () => {
+      order.push("before_agent_run:start");
+      await new Promise<void>((resolve) => {
+        setImmediate(resolve);
+      });
+      order.push("before_agent_run:end");
+      return { outcome: "pass" as const };
+    });
+    const llmInput = vi.fn(() => {
+      order.push("llm_input");
+    });
+    initializeGlobalHookRunner(
+      createMockPluginRegistry([
+        { hookName: "before_agent_run", handler: beforeAgentRun },
+        { hookName: "llm_input", handler: llmInput },
+      ]),
+    );
+    onInternalDiagnosticEvent((event) => {
+      if (event.type === "model.call.started" && event.scope === "turn-aggregate") {
+        order.push("model.call.started");
+      }
+    });
+    const sessionFile = path.join(tempDir, "before-agent-run-order.jsonl");
+    const workspaceDir = path.join(tempDir, "before-agent-run-order-workspace");
+    const priorMessages = [
+      userMessage("prior question", 1_783_000_000_000),
+      assistantMessage("prior answer", 1_783_000_001_000),
+    ];
+    const sessionManager = SessionManager.open(sessionFile);
+    for (const message of priorMessages) {
+      sessionManager.appendMessage(message);
+    }
+    const harness = createAppServerHarness(async (method) => {
+      if (method === "thread/start") {
+        return threadStartResult();
+      }
+      if (method === "turn/start") {
+        order.push("turn/start");
+        return turnStartResult("turn-1", "completed");
+      }
+      return {};
+    });
+    const params = createParams(sessionFile, workspaceDir);
+    params.config = {
+      diagnostics: {
+        enabled: true,
+        otel: { enabled: true, traces: true },
+      },
+    } as never;
+
+    await runCodexAppServerAttempt(params, {
+      nativeHookRelay: { enabled: false },
+      turnCompletionIdleTimeoutMs: 5,
+    });
+    await flushDiagnosticEvents();
+
+    const [beforeRunEvent] = mockCall(beforeAgentRun, "before_agent_run") as [
+      {
+        messages?: unknown[];
+        priorMessages?: unknown[];
+        prompt?: string;
+        systemPrompt?: string;
+      },
+    ];
+    expect(beforeRunEvent.prompt).toBe("hello");
+    expect(beforeRunEvent.systemPrompt).toContain(
+      "You are a personal agent running inside OpenClaw.",
+    );
+    expect(beforeRunEvent.messages).toEqual(priorMessages);
+    expect(beforeRunEvent.priorMessages).toEqual(priorMessages);
+    expect(order.slice(0, 2)).toEqual(["before_agent_run:start", "before_agent_run:end"]);
+    expect(order.indexOf("model.call.started")).toBeGreaterThan(
+      order.indexOf("before_agent_run:end"),
+    );
+    expect(order.indexOf("llm_input")).toBeGreaterThan(order.indexOf("before_agent_run:end"));
+    expect(order.indexOf("turn/start")).toBeGreaterThan(order.indexOf("llm_input"));
+  });
+
+  it("stops before model diagnostics and turn/start when before_agent_run blocks", async () => {
+    const beforeAgentRun = vi.fn(async () => ({
+      outcome: "block" as const,
+      reason: "policy denied",
+      message: "blocked by policy",
+    }));
+    const llmInput = vi.fn();
+    const llmOutput = vi.fn();
+    initializeGlobalHookRunner(
+      createMockPluginRegistry([
+        { hookName: "before_agent_run", handler: beforeAgentRun },
+        { hookName: "llm_input", handler: llmInput },
+        { hookName: "llm_output", handler: llmOutput },
+      ]),
+    );
+    const modelEvents = vi.fn();
+    onInternalDiagnosticEvent((event) => {
+      if (event.type === "model.call.started" || event.type === "model.call.error") {
+        modelEvents(event);
+      }
+    });
+    const sessionFile = path.join(tempDir, "before-agent-run-block.jsonl");
+    const workspaceDir = path.join(tempDir, "before-agent-run-block-workspace");
+    const harness = createStartedThreadHarness();
+
+    await expect(
+      runCodexAppServerAttempt(createParams(sessionFile, workspaceDir)),
+    ).resolves.toMatchObject({
+      promptError: expect.objectContaining({
+        message: expect.stringContaining("blocked by policy"),
+      }),
+      promptErrorSource: "hook:before_agent_run",
+    });
+    await flushDiagnosticEvents();
+
+    expect(beforeAgentRun).toHaveBeenCalledTimes(1);
+    expect(llmInput).not.toHaveBeenCalled();
+    expect(llmOutput).not.toHaveBeenCalled();
+    expect(modelEvents).not.toHaveBeenCalled();
+    expect(harness.requests.some((request) => request.method === "turn/start")).toBe(false);
+  });
+
+  it("enables Codex rollout traces for tool-only content capture", async () => {
+    let rolloutTraceRoot: string | undefined;
+    const harness = createAppServerHarness(
+      async (method) => {
+        if (method === "thread/start") {
+          return threadStartResult();
+        }
+        if (method === "turn/start") {
+          return turnStartResult();
+        }
+        return {};
+      },
+      {
+        onStart: (_authProfileId, _agentDir, startOptions) => {
+          rolloutTraceRoot = startOptions.env?.[CODEX_ROLLOUT_TRACE_ROOT_ENV_VAR];
+        },
+      },
+    );
+    const params = createParams(
+      path.join(tempDir, "tool-only-rollout-trace.jsonl"),
+      path.join(tempDir, "tool-only-rollout-trace-workspace"),
+    );
+    params.config = {
+      diagnostics: {
+        enabled: true,
+        otel: {
+          enabled: true,
+          traces: true,
+          captureContent: { enabled: true, toolInputs: true },
+        },
+      },
+    } as never;
+
+    const run = runCodexAppServerAttempt(params);
+    await harness.waitForMethod("turn/start");
+    await harness.completeTurn({ threadId: "thread-1", turnId: "turn-1" });
+    await run;
+
+    expect(rolloutTraceRoot).toBeTypeOf("string");
+  });
+
   it.each([
     { label: "completed", status: "completed" as const, error: undefined, legacy: false },
     { label: "failed", status: "failed" as const, error: "codex exploded", legacy: false },
@@ -145,6 +315,9 @@ describe("runCodexAppServerAttempt hooks and model diagnostics", () => {
         model?: string;
         prompt?: string;
         provider?: string;
+        runtime?: string;
+        runtimeEngine?: string;
+        transport?: string;
         runId?: string;
         sessionId?: string;
         systemPrompt?: string;
@@ -155,6 +328,9 @@ describe("runCodexAppServerAttempt hooks and model diagnostics", () => {
     expect(llmInputPayload.sessionId).toBe("session-1");
     expect(llmInputPayload.provider).toBe("codex");
     expect(llmInputPayload.model).toBe("gpt-5.4-codex");
+    expect(llmInputPayload.runtime).toBe("codex");
+    expect(llmInputPayload.runtimeEngine).toBe("codex-app-server");
+    expect(llmInputPayload.transport).toBe("stdio");
     expect(llmInputPayload.prompt).toBe("hello");
     expect(llmInputPayload.imagesCount).toBe(0);
     expect(llmInputPayload.historyMessages).toEqual([]);
@@ -286,6 +462,8 @@ describe("runCodexAppServerAttempt hooks and model diagnostics", () => {
     const diagnosticEvents: DiagnosticEventPayload[] = [];
     const diagnosticContentByType = new Map<string, DiagnosticEventPrivateData>();
     let diagnosticTypesAtLlmOutput: string[] = [];
+    let rolloutTraceRoot: string | undefined;
+    let startedAgentDir: string | undefined;
     const llmOutput = vi.fn(() => {
       diagnosticTypesAtLlmOutput = diagnosticEvents.map((event) => event.type);
     });
@@ -301,27 +479,35 @@ describe("runCodexAppServerAttempt hooks and model diagnostics", () => {
     try {
       const sessionFile = path.join(tempDir, "session.jsonl");
       const workspaceDir = path.join(tempDir, "workspace");
-      const harness = createAppServerHarness(async (method) => {
-        if (method === "thread/start") {
-          return threadStartResult();
-        }
-        if (method === "turn/start") {
-          return {
-            turn: {
-              ...turnStartResult("turn-1", "completed").turn,
-              items: [
-                {
-                  id: "msg-1",
-                  type: "agentMessage",
-                  text: "hello back",
-                  status: "completed",
-                },
-              ],
-            },
-          };
-        }
-        return {};
-      });
+      const harness = createAppServerHarness(
+        async (method) => {
+          if (method === "thread/start") {
+            return threadStartResult();
+          }
+          if (method === "turn/start") {
+            return {
+              turn: {
+                ...turnStartResult("turn-1", "completed").turn,
+                items: [
+                  {
+                    id: "msg-1",
+                    type: "agentMessage",
+                    text: "hello back",
+                    status: "completed",
+                  },
+                ],
+              },
+            };
+          }
+          return {};
+        },
+        {
+          onStart: (_authProfileId, agentDir, startOptions) => {
+            startedAgentDir = agentDir;
+            rolloutTraceRoot = startOptions.env?.[CODEX_ROLLOUT_TRACE_ROOT_ENV_VAR];
+          },
+        },
+      );
       const params = createParams(sessionFile, workspaceDir);
       const sessionManager = SessionManager.open(sessionFile);
       sessionManager.appendMessage(assistantMessage("existing context", Date.now()));
@@ -363,6 +549,15 @@ describe("runCodexAppServerAttempt hooks and model diagnostics", () => {
         (event) => event.type === "model.call.completed",
       );
       expect(startedEvent?.callId).toBe("diagnostic-run-1:codex-model:1");
+      expect(startedEvent).toMatchObject({
+        runtime: "codex",
+        runtimeEngine: "codex-app-server",
+        transport: "stdio",
+      });
+      expect(
+        (startedEvent as (DiagnosticEventPayload & { scope?: string }) | undefined)?.scope,
+      ).toBe("turn-aggregate");
+      expect(rolloutTraceRoot).toBe(path.join(startedAgentDir!, "codex-home", "rollout-traces"));
       expect(startedEvent?.trace?.traceId).toBeTypeOf("string");
       expect(JSON.stringify(startedEvent)).not.toContain("hello");
       const startedContent = diagnosticContentByType.get("model.call.started")?.modelContent;
@@ -372,6 +567,11 @@ describe("runCodexAppServerAttempt hooks and model diagnostics", () => {
         "You are a personal agent running inside OpenClaw.",
       );
       expect(completedEvent?.callId).toBe("diagnostic-run-1:codex-model:1");
+      expect(completedEvent).toMatchObject({
+        runtime: "codex",
+        runtimeEngine: "codex-app-server",
+        transport: "stdio",
+      });
       expect(JSON.stringify(completedEvent)).not.toContain("hello back");
       expect(
         JSON.stringify(diagnosticContentByType.get("model.call.completed")?.modelContent),
@@ -380,6 +580,402 @@ describe("runCodexAppServerAttempt hooks and model diagnostics", () => {
       expect(llmOutput).toHaveBeenCalledTimes(1);
       expect(diagnosticTypesAtLlmOutput).toContain("model.call.completed");
       expect(diagnosticTypesAtLlmOutput).not.toContain("model.call.error");
+    } finally {
+      stopDiagnostics();
+    }
+  }, 240_000);
+
+  it("drains provider-request diagnostics before llm_output", async () => {
+    const diagnosticEvents: Array<DiagnosticEventPayload & Record<string, unknown>> = [];
+    let providerRequestsAtLlmOutput = 0;
+    let rolloutToolEventsAtLlmOutput = 0;
+    const llmOutput = vi.fn(() => {
+      providerRequestsAtLlmOutput = diagnosticEvents.filter(
+        (event) => event.scope === "provider-request",
+      ).length;
+      rolloutToolEventsAtLlmOutput = diagnosticEvents.filter(
+        (event) => event.toolOwner === "codex-rollout-trace",
+      ).length;
+    });
+    initializeGlobalHookRunner(
+      createMockPluginRegistry([{ hookName: "llm_output", handler: llmOutput }]),
+    );
+    const stopDiagnostics = onInternalDiagnosticEvent((event) => {
+      if (event.type.startsWith("model.call.") || event.type.startsWith("tool.execution.")) {
+        diagnosticEvents.push(event as DiagnosticEventPayload & Record<string, unknown>);
+      }
+    });
+    let rolloutTraceRoot: string | undefined;
+    let rolloutTraceFile: string | undefined;
+    try {
+      const sessionFile = path.join(tempDir, "provider-request-session.jsonl");
+      const workspaceDir = path.join(tempDir, "provider-request-workspace");
+      const harness = createAppServerHarness(
+        async (method) => {
+          if (method === "thread/start") {
+            return threadStartResult();
+          }
+          if (method === "turn/start") {
+            if (!rolloutTraceRoot) {
+              throw new Error("rollout trace root was not configured before turn/start");
+            }
+            const bundleDir = path.join(rolloutTraceRoot, "attempt-one", "trace-one");
+            const payloadsDir = path.join(bundleDir, "payloads");
+            await fs.mkdir(payloadsDir, { recursive: true });
+            await fs.writeFile(path.join(bundleDir, "manifest.json"), "{}\n");
+            await fs.writeFile(
+              path.join(payloadsDir, "request.json"),
+              `${JSON.stringify({
+                model: "openai/gpt-5.4-codex",
+                input: [{ role: "user", content: "hello" }],
+              })}\n`,
+            );
+            await fs.writeFile(
+              path.join(payloadsDir, "response.json"),
+              `${JSON.stringify({
+                token_usage: { input_tokens: 10, output_tokens: 4, total_tokens: 14 },
+                output_items: [{ type: "message", content: "hello back" }],
+              })}\n`,
+            );
+            await fs.writeFile(
+              path.join(payloadsDir, "tool-input.json"),
+              `${JSON.stringify({
+                tool_name: "exec_command",
+                payload: { type: "function", arguments: JSON.stringify({ cmd: "pwd" }) },
+              })}\n`,
+            );
+            await fs.writeFile(
+              path.join(payloadsDir, "tool-output.json"),
+              `${JSON.stringify({
+                type: "direct_response",
+                response_item: { output: JSON.stringify({ exit_code: 0, output: "/workspace" }) },
+              })}\n`,
+            );
+            const traceEvent = (
+              seq: number,
+              wallTimeMs: number,
+              type: string,
+              payload: Record<string, unknown>,
+            ) =>
+              `${JSON.stringify({
+                schema_version: 1,
+                seq,
+                wall_time_unix_ms: wallTimeMs,
+                rollout_id: "rollout-1",
+                thread_id: "thread-1",
+                codex_turn_id: "turn-1",
+                payload: {
+                  type,
+                  ...payload,
+                  thread_id: "thread-1",
+                  codex_turn_id: "turn-1",
+                },
+              })}\n`;
+            const payloadRef = (id: string) => ({
+              raw_payload_id: `raw_payload:${id}`,
+              kind: { type: "inference_request" },
+              path: `payloads/${id}.json`,
+            });
+            rolloutTraceFile = path.join(bundleDir, "trace.jsonl");
+            await fs.writeFile(
+              rolloutTraceFile,
+              [
+                traceEvent(1, 1_000, "inference_started", {
+                  inference_call_id: "provider-call-1",
+                  model: "openai/gpt-5.4-codex",
+                  provider_name: "openai",
+                  request_payload: payloadRef("request"),
+                }),
+                traceEvent(2, 1_050, "inference_completed", {
+                  inference_call_id: "provider-call-1",
+                  response_payload: payloadRef("response"),
+                }),
+                traceEvent(3, 1_055, "tool_call_started", {
+                  tool_call_id: "tool-call-1",
+                  invocation_payload: payloadRef("tool-input"),
+                }),
+                traceEvent(4, 1_058, "tool_call_ended", {
+                  tool_call_id: "tool-call-1",
+                  status: "completed",
+                  result_payload: payloadRef("tool-output"),
+                }),
+              ].join(""),
+            );
+            return turnStartResult("turn-1", "inProgress");
+          }
+          return {};
+        },
+        {
+          onStart: (_authProfileId, _agentDir, startOptions) => {
+            rolloutTraceRoot = startOptions.env?.[CODEX_ROLLOUT_TRACE_ROOT_ENV_VAR];
+          },
+        },
+      );
+      const params = createParams(sessionFile, workspaceDir);
+      params.config = {
+        diagnostics: {
+          enabled: true,
+          otel: {
+            enabled: true,
+            traces: true,
+            captureContent: { enabled: true, inputMessages: true, outputMessages: true },
+          },
+        },
+      } as never;
+      const run = runCodexAppServerAttempt(params, {
+        nativeHookRelay: { enabled: false },
+        turnCompletionIdleTimeoutMs: 5,
+      });
+      await harness.waitForMethod("turn/start");
+      await vi.waitFor(
+        () => {
+          expect(
+            diagnosticEvents.filter((event) => event.scope === "provider-request"),
+          ).toHaveLength(2);
+        },
+        { timeout: 3_000 },
+      );
+      expect(llmOutput).not.toHaveBeenCalled();
+      await harness.notify({
+        method: "item/started",
+        params: {
+          threadId: "thread-1",
+          turnId: "turn-1",
+          item: {
+            type: "commandExecution",
+            id: "tool-call-1",
+            command: "pwd",
+            cwd: "/workspace",
+            processId: null,
+            source: "agent",
+            status: "inProgress",
+            commandActions: [],
+            aggregatedOutput: null,
+            exitCode: null,
+            durationMs: null,
+          },
+        },
+      });
+      await harness.notify({
+        method: "item/completed",
+        params: {
+          threadId: "thread-1",
+          turnId: "turn-1",
+          item: {
+            type: "commandExecution",
+            id: "tool-call-1",
+            command: "pwd",
+            cwd: "/workspace",
+            processId: null,
+            source: "agent",
+            status: "completed",
+            commandActions: [],
+            aggregatedOutput: "/workspace",
+            exitCode: 0,
+            durationMs: 3,
+          },
+        },
+      });
+      if (!rolloutTraceFile) {
+        throw new Error("rollout trace file was not created");
+      }
+      await fs.appendFile(
+        rolloutTraceFile,
+        `${JSON.stringify({
+          schema_version: 1,
+          seq: 5,
+          wall_time_unix_ms: 1_060,
+          rollout_id: "rollout-1",
+          thread_id: "thread-1",
+          codex_turn_id: "turn-1",
+          payload: {
+            type: "codex_turn_ended",
+            status: "completed",
+            thread_id: "thread-1",
+            codex_turn_id: "turn-1",
+          },
+        })}\n`,
+      );
+      await harness.notify({
+        method: "item/agentMessage/delta",
+        params: {
+          threadId: "thread-1",
+          turnId: "turn-1",
+          itemId: "msg-1",
+          delta: "hello back",
+        },
+      });
+      await harness.completeTurn({ threadId: "thread-1", turnId: "turn-1" });
+      await run;
+      await flushDiagnosticEvents();
+
+      const providerEvents = diagnosticEvents.filter((event) => event.scope === "provider-request");
+      expect(providerEvents).toEqual([
+        expect.objectContaining({
+          type: "model.call.started",
+          callId: "provider-call-1",
+          provider: "openai",
+          model: "openai/gpt-5.4-codex",
+          runtime: "codex",
+          runtimeEngine: "codex-app-server",
+          transport: "stdio",
+        }),
+        expect.objectContaining({
+          type: "model.call.completed",
+          callId: "provider-call-1",
+          durationMs: 50,
+          usageSource: "provider",
+          usage: { input: 10, output: 4, total: 14 },
+          runtime: "codex",
+          runtimeEngine: "codex-app-server",
+          transport: "stdio",
+        }),
+      ]);
+      expect(providerRequestsAtLlmOutput).toBe(2);
+      const rolloutToolEvents = diagnosticEvents.filter(
+        (event) => event.toolOwner === "codex-rollout-trace",
+      );
+      expect(rolloutToolEvents).toEqual([
+        expect.objectContaining({
+          type: "tool.execution.started",
+          toolCallId: "tool-call-1",
+        }),
+        expect.objectContaining({
+          type: "tool.execution.completed",
+          toolCallId: "tool-call-1",
+        }),
+      ]);
+      expect(
+        diagnosticEvents.filter((event) => event.toolOwner === "codex-native-tool-lifecycle"),
+      ).toEqual([]);
+      expect(rolloutToolEventsAtLlmOutput).toBe(2);
+      expect(llmOutput).toHaveBeenCalledOnce();
+    } finally {
+      stopDiagnostics();
+    }
+  }, 240_000);
+
+  it("finalizes rollout diagnostics and replays native fallback after terminal cleanup errors", async () => {
+    const diagnosticEvents: Array<DiagnosticEventPayload & Record<string, unknown>> = [];
+    const stopDiagnostics = onInternalDiagnosticEvent((event) => {
+      if (event.type.startsWith("tool.execution.")) {
+        diagnosticEvents.push(event as DiagnosticEventPayload & Record<string, unknown>);
+      }
+    });
+    let rolloutTraceRoot: string | undefined;
+    try {
+      vi.spyOn(CodexAppServerEventProjector.prototype, "getCompletedTurnStatus").mockImplementation(
+        () => {
+          throw new Error("simulated terminal projection failure");
+        },
+      );
+      const harness = createStartedThreadHarness(undefined, {
+        onStart: (_authProfileId, agentDir) => {
+          rolloutTraceRoot = agentDir
+            ? path.join(agentDir, "codex-home", "rollout-traces")
+            : undefined;
+        },
+      });
+      const params = createParams(
+        path.join(tempDir, "cleanup-error-session.jsonl"),
+        path.join(tempDir, "cleanup-error-workspace"),
+      );
+      params.config = {
+        diagnostics: {
+          enabled: true,
+          otel: {
+            enabled: true,
+            traces: true,
+            captureContent: { enabled: true, inputMessages: true, outputMessages: true },
+          },
+        },
+      } as never;
+      const run = runCodexAppServerAttempt(params, {
+        nativeHookRelay: { enabled: false },
+      });
+      await harness.waitForMethod("turn/start");
+      const activeTraceRoot = rolloutTraceRoot;
+      if (!activeTraceRoot) {
+        throw new Error("rollout trace root was not configured");
+      }
+      expect(
+        activeRolloutTraceTurnRegistrationCountForTest({
+          traceRoot: activeTraceRoot,
+          threadId: "thread-1",
+          turnId: "turn-1",
+        }),
+      ).toBe(1);
+      await harness.notify({
+        method: "item/started",
+        params: {
+          threadId: "thread-1",
+          turnId: "turn-1",
+          item: {
+            type: "commandExecution",
+            id: "native-fallback-tool",
+            command: "pwd",
+            cwd: "/workspace",
+            processId: null,
+            source: "agent",
+            status: "inProgress",
+            commandActions: [],
+            aggregatedOutput: null,
+            exitCode: null,
+            durationMs: null,
+          },
+        },
+      });
+      await harness.notify({
+        method: "item/completed",
+        params: {
+          threadId: "thread-1",
+          turnId: "turn-1",
+          item: {
+            type: "commandExecution",
+            id: "native-fallback-tool",
+            command: "pwd",
+            cwd: "/workspace",
+            processId: null,
+            source: "agent",
+            status: "completed",
+            commandActions: [],
+            aggregatedOutput: "/workspace",
+            exitCode: 0,
+            durationMs: 3,
+          },
+        },
+      });
+      expect(diagnosticEvents).toEqual([]);
+
+      await harness.completeTurn({ threadId: "thread-1", turnId: "turn-1" });
+      await expect(run).rejects.toThrow("simulated terminal projection failure");
+      await flushDiagnosticEvents();
+
+      expect(
+        activeRolloutTraceTurnRegistrationCountForTest({
+          traceRoot: activeTraceRoot,
+          threadId: "thread-1",
+          turnId: "turn-1",
+        }),
+      ).toBe(0);
+      expect(
+        diagnosticEvents.map((event) => ({
+          type: event.type,
+          toolCallId: event.toolCallId,
+          toolOwner: event.toolOwner,
+        })),
+      ).toEqual([
+        {
+          type: "tool.execution.started",
+          toolCallId: "native-fallback-tool",
+          toolOwner: "codex-native-tool-lifecycle",
+        },
+        {
+          type: "tool.execution.completed",
+          toolCallId: "native-fallback-tool",
+          toolOwner: "codex-native-tool-lifecycle",
+        },
+      ]);
     } finally {
       stopDiagnostics();
     }
@@ -413,6 +1009,11 @@ describe("runCodexAppServerAttempt hooks and model diagnostics", () => {
       expect(result.timedOut).toBe(true);
       expect(errorEvent?.failureKind).toBe("timeout");
       expect(errorEvent?.errorCategory).toBe("timeout");
+      expect(errorEvent).toMatchObject({
+        runtime: "codex",
+        runtimeEngine: "codex-app-server",
+        transport: "stdio",
+      });
     } finally {
       stopDiagnostics();
     }

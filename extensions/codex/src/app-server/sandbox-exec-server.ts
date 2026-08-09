@@ -28,6 +28,7 @@ import {
   sendError,
   sendResult,
 } from "./sandbox-exec-server/json-rpc.js";
+import { formatExecServerPathUri } from "./sandbox-exec-server/path-uri.js";
 import {
   readProcess,
   startProcess,
@@ -320,6 +321,15 @@ async function dispatchRequest(
   switch (request.method) {
     case "initialize":
       return { sessionId: randomUUID() };
+    case "environment/info":
+      // The shell and cwd describe the sandbox target, not the Gateway host.
+      return {
+        shell: { name: "sh", path: "/bin/sh" },
+        cwd: formatExecServerPathUri(execServer.sandbox.containerWorkdir),
+        capabilities: { networkProxyLaunch: false },
+      };
+    case "environment/status":
+      return { status: "ready" };
     // These method names are the Codex exec-server remote-environment RPCs.
     // The app-server process-control surface uses different names such as
     // process/spawn, but those are not sent to registered exec-server URLs.

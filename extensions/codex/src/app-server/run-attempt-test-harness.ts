@@ -361,7 +361,11 @@ export function createAppServerHarness(
     options?: { signal?: AbortSignal },
   ) => Promise<unknown>,
   options: {
-    onStart?: (authProfileId: string | undefined, agentDir: string | undefined) => void;
+    onStart?: (
+      authProfileId: string | undefined,
+      agentDir: string | undefined,
+      startOptions: Parameters<CodexTestAppServerClientFactory>[0],
+    ) => void;
   } = {},
 ) {
   const requests: Array<{ method: string; params: unknown }> = [];
@@ -393,8 +397,8 @@ export function createAppServerHarness(
       return () => closeHandlers.delete(handler);
     },
   } as unknown as CodexAppServerClient;
-  setCodexAppServerClientFactoryForTest(async (_startOptions, authProfileId, agentDir) => {
-    options.onStart?.(authProfileId, agentDir);
+  setCodexAppServerClientFactoryForTest(async (startOptions, authProfileId, agentDir) => {
+    options.onStart?.(authProfileId, agentDir, startOptions);
     return client;
   });
 

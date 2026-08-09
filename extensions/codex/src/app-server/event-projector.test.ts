@@ -25,6 +25,7 @@ import {
   type CodexAppServerEventProjectorOptions,
   type CodexAppServerToolTelemetry,
 } from "./event-projector.js";
+import { CODEX_NATIVE_TOOL_LIFECYCLE_OWNER } from "./native-hook-relay.js";
 import { createCodexTestModel } from "./test-support.js";
 
 const THREAD_ID = "thread-1";
@@ -1958,6 +1959,76 @@ describe("CodexAppServerEventProjector", () => {
     expect(toolResultContentItem.toolName).toBe("bash");
     expect(toolResultContentItem.toolCallId).toBe("cmd-1");
     expect(toolResultContentItem.content).toBe("ok");
+  });
+
+  it("replays only native tool lifecycle phases not covered by rollout diagnostics", async () => {
+    const projector = await createProjector(undefined, {
+      suppressNativeToolLifecycleDiagnostics: true,
+    });
+    const diagnosticEvents: DiagnosticEventPayload[] = [];
+    const unsubscribe = onInternalDiagnosticEvent((event) => diagnosticEvents.push(event));
+    const commandItem = (id: string, status: "inProgress" | "completed") => ({
+      type: "commandExecution" as const,
+      id,
+      command: "pwd",
+      cwd: "/workspace",
+      processId: null,
+      source: "agent" as const,
+      status,
+      commandActions: [],
+      aggregatedOutput: status === "completed" ? "/workspace" : null,
+      exitCode: status === "completed" ? 0 : null,
+      durationMs: status === "completed" ? 10 : null,
+    });
+
+    try {
+      for (const toolCallId of ["covered-tool", "fallback-tool"]) {
+        await projector.handleNotification(
+          forCurrentTurn("item/started", {
+            item: commandItem(toolCallId, "inProgress"),
+          }),
+        );
+        await projector.handleNotification(
+          forCurrentTurn("item/completed", {
+            item: commandItem(toolCallId, "completed"),
+          }),
+        );
+      }
+      await flushDiagnosticEvents();
+      expect(diagnosticEvents.filter((event) => event.type.startsWith("tool.execution."))).toEqual(
+        [],
+      );
+
+      projector.resolveSuppressedNativeToolLifecycleDiagnostics(
+        new Set(["started:covered-tool", "terminal:covered-tool"]),
+      );
+      await flushDiagnosticEvents();
+      projector.resolveSuppressedNativeToolLifecycleDiagnostics();
+      await flushDiagnosticEvents();
+    } finally {
+      unsubscribe();
+    }
+
+    expect(
+      diagnosticEvents
+        .filter((event) => event.type.startsWith("tool.execution."))
+        .map((event) => ({
+          type: event.type,
+          toolCallId: "toolCallId" in event ? event.toolCallId : undefined,
+          toolOwner: "toolOwner" in event ? event.toolOwner : undefined,
+        })),
+    ).toEqual([
+      {
+        type: "tool.execution.started",
+        toolCallId: "fallback-tool",
+        toolOwner: CODEX_NATIVE_TOOL_LIFECYCLE_OWNER,
+      },
+      {
+        type: "tool.execution.completed",
+        toolCallId: "fallback-tool",
+        toolOwner: CODEX_NATIVE_TOOL_LIFECYCLE_OWNER,
+      },
+    ]);
   });
 
   it.each([

@@ -1,0 +1,3 @@
+.omc/
+/dist/
+scripts/verify-*.ts

@@ -1433,7 +1433,12 @@ export function resolveCodexAppServerRequestModelSelection(params: {
 }): { model: string; modelProvider?: string } {
   const model = params.model.trim();
   const modelProvider = params.modelProvider?.trim();
-  if (modelProvider) {
+  const configuredNestedProvider = resolveConfiguredNestedModelProvider({
+    model,
+    modelProvider,
+    config: params.config,
+  });
+  if (modelProvider && !configuredNestedProvider) {
     return { model, modelProvider };
   }
   // Codex app-server expects provider-qualified refs as separate fields. Keep
@@ -1442,7 +1447,7 @@ export function resolveCodexAppServerRequestModelSelection(params: {
   if (slashIndex <= 0 || slashIndex >= model.length - 1) {
     return { model };
   }
-  const inferredProvider = model.slice(0, slashIndex);
+  const inferredProvider = configuredNestedProvider ?? model.slice(0, slashIndex);
   const inferredModelProvider = resolveCodexAppServerModelProvider({
     provider: inferredProvider,
     authProfileId: params.authProfileId,
@@ -1454,6 +1459,27 @@ export function resolveCodexAppServerRequestModelSelection(params: {
     model: model.slice(slashIndex + 1).trim(),
     ...(inferredModelProvider ? { modelProvider: inferredModelProvider } : {}),
   };
+}
+
+function resolveConfiguredNestedModelProvider(params: {
+  model: string;
+  modelProvider?: string;
+  config?: CodexAppServerAuthProfileLookup["config"];
+}): string | undefined {
+  if (params.modelProvider?.trim().toLowerCase() !== "openai") {
+    return undefined;
+  }
+  const slashIndex = params.model.indexOf("/");
+  if (slashIndex <= 0 || slashIndex >= params.model.length - 1) {
+    return undefined;
+  }
+  const candidate = params.model.slice(0, slashIndex).trim().toLowerCase();
+  if (!candidate || candidate === "openai" || candidate === "codex") {
+    return undefined;
+  }
+  return Object.keys(params.config?.models?.providers ?? {}).find(
+    (providerId) => providerId.trim().toLowerCase() === candidate,
+  );
 }
 
 function hasProviderQualifiedModelRef(model: string | undefined): boolean {

@@ -214,6 +214,7 @@ export function queueAgentHarnessMessage(
   return queueEmbeddedAgentMessageWithOutcome(sessionId, text, options).queued;
 }
 export { disposeRegisteredAgentHarnesses } from "../agents/harness/registry.js";
+export { resolveAgentHarnessSkillsPromptForRun } from "../agents/harness/skills-prompt.js";
 export {
   logAgentRuntimeToolDiagnostics,
   normalizeAgentRuntimeTools,

@@ -1,20 +1,9 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import {
-  listAgentIds,
-  resolveAgentDir,
-  resolveSessionAgentIds,
-} from "openclaw/plugin-sdk/agent-runtime";
-import { withFileLock, type FileLockOptions } from "openclaw/plugin-sdk/file-lock";
+import type { FileLockOptions } from "openclaw/plugin-sdk/file-lock";
 import type { PluginStateKeyedStore } from "openclaw/plugin-sdk/plugin-state-runtime";
 import type { PluginDoctorStateMigration } from "openclaw/plugin-sdk/runtime-doctor";
-import {
-  listSessionEntries,
-  resolveSessionFilePath,
-  resolveStorePath,
-  updateSessionStoreEntry,
-} from "openclaw/plugin-sdk/session-store-runtime";
 import {
   CODEX_APP_SERVER_BINDING_MAX_ENTRIES,
   CODEX_APP_SERVER_BINDING_NAMESPACE,
@@ -73,6 +62,33 @@ type SourceMigrationResult = {
   notice?: string;
 };
 
+async function importMigrationRuntimeHelpers() {
+  const [agentRuntime, fileLock, sessionStoreRuntime] = await Promise.all([
+    import("openclaw/plugin-sdk/agent-runtime"),
+    import("openclaw/plugin-sdk/file-lock"),
+    import("openclaw/plugin-sdk/session-store-runtime"),
+  ]);
+  return {
+    listAgentIds: agentRuntime.listAgentIds,
+    resolveAgentDir: agentRuntime.resolveAgentDir,
+    resolveSessionAgentIds: agentRuntime.resolveSessionAgentIds,
+    withFileLock: fileLock.withFileLock,
+    listSessionEntries: sessionStoreRuntime.listSessionEntries,
+    resolveSessionFilePath: sessionStoreRuntime.resolveSessionFilePath,
+    resolveStorePath: sessionStoreRuntime.resolveStorePath,
+    updateSessionStoreEntry: sessionStoreRuntime.updateSessionStoreEntry,
+  };
+}
+
+type MigrationRuntimeHelpers = Awaited<ReturnType<typeof importMigrationRuntimeHelpers>>;
+
+let migrationRuntimeHelpersPromise: Promise<MigrationRuntimeHelpers> | undefined;
+
+function loadMigrationRuntimeHelpers(): Promise<MigrationRuntimeHelpers> {
+  migrationRuntimeHelpersPromise ??= importMigrationRuntimeHelpers();
+  return migrationRuntimeHelpersPromise;
+}
+
 // Keep the doctor contract graph independent from the full Codex runtime.
 // The runtime parser loaded in migrateSource validates binding payloads before writes.
 type MigratedBindingRow =
@@ -90,6 +106,8 @@ type MigratedBindingRow =
     };
 
 async function collectSessionSurfaces(params: MigrationEnvironment): Promise<SessionSurface[]> {
+  const { listAgentIds, resolveSessionAgentIds, resolveStorePath } =
+    await loadMigrationRuntimeHelpers();
   const surfaces = new Map<string, SessionSurface>();
   const stateRoot = await canonicalizePath(params.stateDir);
   const add = async (root: string, storePath: string, agentId: string, scan: boolean) => {
@@ -179,6 +197,7 @@ async function readLegacySessionIndex(
 ): Promise<
   { entries: Array<{ sessionKey: string; entry: LegacySessionIndexEntry }> } | { failure: string }
 > {
+  const { listSessionEntries } = await loadMigrationRuntimeHelpers();
   let contents: string;
   try {
     contents = await fs.readFile(storePath, "utf8");
@@ -247,13 +266,14 @@ async function* iterateIndexedSidecars(
   surface: SessionSurface,
   params: MigrationEnvironment,
 ): AsyncGenerator<string> {
+  const { resolveSessionFilePath } = await loadMigrationRuntimeHelpers();
   for (const storePath of surface.storePaths) {
     const index = await readLegacySessionIndex(storePath);
     if ("failure" in index) {
       continue;
     }
     for (const { sessionKey, entry } of index.entries) {
-      const agentId = resolveLegacyBindingOwnerAgentId({
+      const agentId = await resolveLegacyBindingOwnerAgentId({
         sessionKey,
         config: params.config,
         storeAgentIds: surface.agentIds,
@@ -295,11 +315,33 @@ async function* walkSidecars(root: string): AsyncGenerator<string> {
   }
 }
 
+async function hasLegacyBindingSidecarInDefaultState(stateDir: string): Promise<boolean> {
+  const roots = [path.join(stateDir, "sessions")];
+  const agentsDir = path.join(stateDir, "agents");
+  for (const entry of await readDirectoryEntries(agentsDir)) {
+    if (entry.isDirectory() && !entry.isSymbolicLink()) {
+      roots.push(path.join(agentsDir, entry.name, "sessions"));
+    }
+  }
+  for (const root of roots) {
+    for await (const _sidecarPath of walkSidecars(root)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function hasConfiguredSessionStore(config: MigrationEnvironment["config"]): boolean {
+  const store = config.session?.store;
+  return typeof store === "string" && store.trim().length > 0;
+}
+
 async function collectBindingOwners(
   sources: LegacyBindingSource[],
   surfaces: SessionSurface[],
   params: MigrationEnvironment,
 ): Promise<BindingOwnerCollection> {
+  const { resolveSessionFilePath, resolveStorePath } = await loadMigrationRuntimeHelpers();
   const sourcePaths = new Set(
     await Promise.all(sources.map((source) => canonicalizePath(source.transcriptPath))),
   );
@@ -326,7 +368,7 @@ async function collectBindingOwners(
     const sessionsDir = path.dirname(storePath);
     for (const { sessionKey, entry } of index.entries) {
       const sessionId = entry.sessionId;
-      const agentId = resolveLegacyBindingOwnerAgentId({
+      const agentId = await resolveLegacyBindingOwnerAgentId({
         sessionKey,
         config: params.config,
         storeAgentIds: storeAgentIds.get(storePath),
@@ -374,11 +416,12 @@ async function collectBindingOwners(
   };
 }
 
-function resolveLegacyBindingOwnerAgentId(params: {
+async function resolveLegacyBindingOwnerAgentId(params: {
   sessionKey: string;
   config: MigrationEnvironment["config"];
   storeAgentIds?: Set<string>;
-}): string {
+}): Promise<string> {
+  const { resolveSessionAgentIds } = await loadMigrationRuntimeHelpers();
   if (params.sessionKey.trim().toLowerCase().startsWith("agent:")) {
     return resolveSessionAgentIds({
       sessionKey: params.sessionKey,
@@ -410,6 +453,7 @@ async function migrateSource(
   params: MigrationParams,
   store: PluginStateKeyedStore<MigratedBindingRow>,
 ): Promise<SourceMigrationResult> {
+  const { resolveAgentDir, withFileLock } = await loadMigrationRuntimeHelpers();
   let importedKeys = 0;
   const retain = (reason: string): SourceMigrationResult => ({
     archived: false,
@@ -629,6 +673,7 @@ async function migrateSource(
 }
 
 async function recordSessionOwner(owner: LegacyBindingOwner): Promise<string | undefined> {
+  const { resolveSessionFilePath, updateSessionStoreEntry } = await loadMigrationRuntimeHelpers();
   let observedForeignHarness: string | undefined;
   const updated = await updateSessionStoreEntry({
     storePath: owner.storePath,
@@ -636,7 +681,7 @@ async function recordSessionOwner(owner: LegacyBindingOwner): Promise<string | u
     skipMaintenance: true,
     requireWriteSuccess: true,
     update: (entry) => {
-      const transcriptPath = resolveOwnerTranscriptPath(owner, entry);
+      const transcriptPath = resolveOwnerTranscriptPath(owner, entry, resolveSessionFilePath);
       if (
         entry.sessionId.trim() !== owner.sessionId ||
         transcriptPath !== owner.transcriptPath ||
@@ -661,7 +706,7 @@ async function recordSessionOwner(owner: LegacyBindingOwner): Promise<string | u
       ? `its session is owned by agent harness ${observedForeignHarness}`
       : "its session owner changed before Codex ownership could be recorded";
   }
-  const transcriptPath = resolveOwnerTranscriptPath(owner, updated);
+  const transcriptPath = resolveOwnerTranscriptPath(owner, updated, resolveSessionFilePath);
   if (
     updated.sessionId.trim() !== owner.sessionId ||
     transcriptPath !== owner.transcriptPath ||
@@ -680,6 +725,7 @@ async function recordSessionOwner(owner: LegacyBindingOwner): Promise<string | u
 function resolveOwnerTranscriptPath(
   owner: LegacyBindingOwner,
   entry: { sessionFile?: string; sessionId: string },
+  resolveSessionFilePath: MigrationRuntimeHelpers["resolveSessionFilePath"],
 ): string | undefined {
   try {
     return resolveSessionFilePath(entry.sessionId, entry, {
@@ -774,6 +820,14 @@ export const stateMigrations: PluginDoctorStateMigration[] = [
     id: "codex-app-server-sidecars-to-plugin-state",
     label: "Codex app-server thread bindings",
     async detectLegacyState(params) {
+      // Most starts have no shipped sidecars. Avoid loading the full session/runtime SDK graph
+      // unless default state contains one or a custom store needs canonical resolution.
+      if (
+        !hasConfiguredSessionStore(params.config) &&
+        !(await hasLegacyBindingSidecarInDefaultState(params.stateDir))
+      ) {
+        return null;
+      }
       const { sources } = await collectLegacyBindingSources(params, { firstOnly: true });
       return sources.length > 0
         ? {

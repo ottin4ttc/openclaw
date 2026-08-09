@@ -51,7 +51,7 @@ Each entry lists the package, distribution route, and description.
 
 ## Core npm package
 
-62 plugins
+63 plugins
 
 - **[admin-http-rpc](/plugins/reference/admin-http-rpc)** (`@openclaw/admin-http-rpc`) - included in OpenClaw. OpenClaw admin HTTP RPC endpoint.
 
@@ -136,6 +136,8 @@ Each entry lists the package, distribution route, and description.
 - **[open-prose](/plugins/reference/open-prose)** (`@openclaw/open-prose`) - included in OpenClaw. OpenProse VM skill pack with a /prose slash command.
 
 - **[openai](/plugins/reference/openai)** (`@openclaw/openai-provider`) - included in OpenClaw. Adds OpenAI model provider support to OpenClaw.
+
+- **[openclaw-langfuse](/plugins/reference/openclaw-langfuse)** (`@openclaw/openclaw-langfuse`) - included in OpenClaw; npm; ClawHub: `clawhub:@openclaw/openclaw-langfuse`. Langfuse tracing and prompt management for OpenClaw.
 
 - **[opencode](/plugins/reference/opencode)** (`@openclaw/opencode-provider`) - included in OpenClaw. Adds OpenCode model provider support to OpenClaw.
 
