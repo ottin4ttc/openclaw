@@ -237,6 +237,53 @@ describe("finalizeCodexRolloutTraceProviderRequestDiagnostics", () => {
     }
   });
 
+  it("classifies a Responses stream that closes before response.completed", async () => {
+    const traceRoot = await createTraceRoot("provider-stream-disconnected");
+    try {
+      const bundleDir = path.join(traceRoot, "trace-one");
+      await writeTrace(bundleDir, [
+        traceEvent(1, 2_000, "inference_started", {
+          inference_call_id: "stream-call",
+        }),
+        traceEvent(2, 2_050, "inference_failed", {
+          inference_call_id: "stream-call",
+          error: "stream disconnected before completion: stream closed before response.completed",
+        }),
+        traceEvent(3, 2_060, "codex_turn_ended", { status: "completed" }),
+      ]);
+      const events: DiagnosticRecord[] = [];
+      onInternalDiagnosticEvent((event) => {
+        if (event.type === "model.call.error") {
+          events.push(event as DiagnosticRecord);
+        }
+      });
+
+      await finalizeCodexRolloutTraceProviderRequestDiagnostics({
+        traceRoot,
+        threadId: "thread-1",
+        turnId: "turn-1",
+        baseFields: {
+          runId: "run-stream-disconnected",
+          callId: "turn-call",
+          provider: "codex",
+          model: "gpt-5.5",
+        },
+        emitToolDiagnostics: false,
+      });
+      await waitForDiagnosticEventsDrained();
+
+      expect(events).toEqual([
+        expect.objectContaining({
+          callId: "stream-call",
+          errorCategory: "response_stream_disconnected",
+          failureKind: "connection_closed",
+        }),
+      ]);
+    } finally {
+      await fs.rm(traceRoot, { recursive: true, force: true });
+    }
+  });
+
   it("orders three provider requests by rollout source and de-duplicates repeated final drains", async () => {
     const traceRoot = await createTraceRoot("provider-order");
     try {
@@ -371,7 +418,9 @@ describe("finalizeCodexRolloutTraceProviderRequestDiagnostics", () => {
         client: client as never,
       });
       closeHandler?.();
-      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, 0);
+      });
       await expect(fs.access(bundleDir)).resolves.toBeUndefined();
     } finally {
       await fs.rm(traceRoot, { recursive: true, force: true });

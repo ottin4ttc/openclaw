@@ -227,6 +227,7 @@ const transcriptTaskTails = new Map<string, Promise<void>>();
 const transcriptTaskPendingCounts = new Map<string, number>();
 const transcriptTaskPendingBytes = new Map<string, number>();
 const transcriptQueueLimitWarnedSessions = new Set<string>();
+const diagnosticTaskTails = new Map<string, Promise<void>>();
 const runtimeTaskDrainWaiters = new Set<() => void>();
 const SHUTDOWN_DRAIN_TIMEOUT_MS = 5_000;
 const BACKGROUND_TRACE_DELIVERY_TIMEOUT_MS = 30_000;
@@ -258,6 +259,10 @@ type PendingRootTraceIdentity = {
 const PENDING_ROOT_TRACE_IDENTITY_TTL_MS = 5 * 60 * 1000;
 const PENDING_ROOT_TRACE_IDENTITY_MAX_ENTRIES = 256;
 const pendingRootTraceIdentities = new Map<string, PendingRootTraceIdentity>();
+
+function objectRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+}
 
 function trackRuntimeTask<T>(task: Promise<T>): Promise<T> {
   inFlightRuntimeTasks.add(task);
@@ -378,6 +383,74 @@ async function waitForTranscriptTasksWithTimeout(
   }
 }
 
+function diagnosticTaskKey(event: unknown): string {
+  const record = objectRecord(event);
+  for (const key of ["sessionKey", "runId", "sessionId"] as const) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim()) {
+      return value;
+    }
+  }
+  return "__unkeyed__";
+}
+
+/**
+ * The 7.1 diagnostic dispatcher invokes async listeners without awaiting them.
+ * Track each session's listener tail so agent_end can establish a stable
+ * boundary before replacing the root trace metadata.
+ */
+function trackDiagnosticTask(task: Promise<void>, event: unknown): void {
+  const key = diagnosticTaskKey(event);
+  const previous = diagnosticTaskTails.get(key);
+  const settledTask = task.catch(() => undefined);
+  const current = previous ? previous.catch(() => undefined).then(() => settledTask) : settledTask;
+  diagnosticTaskTails.set(key, current);
+  trackRuntimeTask(current);
+  void current.finally(() => {
+    if (diagnosticTaskTails.get(key) === current) {
+      diagnosticTaskTails.delete(key);
+    }
+  });
+}
+
+async function waitForDiagnosticQuiescence(identity: unknown, timeoutMs: number): Promise<boolean> {
+  const key = diagnosticTaskKey(identity);
+  const deadline = Date.now() + timeoutMs;
+  let observedTail: Promise<void> | undefined;
+  while (true) {
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) {
+      return false;
+    }
+    if (!(await waitForPromiseWithTimeout(waitForDiagnosticEventsDrained(), remainingMs))) {
+      return false;
+    }
+    const tail = diagnosticTaskTails.get(key);
+    if (tail && tail !== observedTail) {
+      observedTail = tail;
+      const taskRemainingMs = deadline - Date.now();
+      if (taskRemainingMs <= 0 || !(await waitForPromiseWithTimeout(tail, taskRemainingMs))) {
+        return false;
+      }
+      continue;
+    }
+    // A listener can enqueue another diagnostic event while it is completing.
+    // One more dispatcher drain makes the boundary stable without a global poll.
+    const finalRemainingMs = deadline - Date.now();
+    if (
+      finalRemainingMs <= 0 ||
+      !(await waitForPromiseWithTimeout(waitForDiagnosticEventsDrained(), finalRemainingMs))
+    ) {
+      return false;
+    }
+    const nextTail = diagnosticTaskTails.get(key);
+    if (nextTail && nextTail !== observedTail) {
+      continue;
+    }
+    return true;
+  }
+}
+
 async function closeTranscriptAdmissionAndDrain(
   entry: TraceContextEntry,
   sessionKey: string | undefined,
@@ -484,6 +557,7 @@ async function cleanupRuntimeState(): Promise<void> {
     runtimeTaskDrainWaiters.clear();
   }
   transcriptTaskTails.clear();
+  diagnosticTaskTails.clear();
   transcriptTaskPendingCounts.clear();
   transcriptTaskPendingBytes.clear();
   transcriptQueueLimitWarnedSessions.clear();
@@ -623,7 +697,7 @@ function mergeTraceMetadata(
   entry: TraceContextEntry,
   patch: Record<string, unknown>,
 ): Record<string, unknown> {
-  const metadata = { ...entry.traceMetadata, ...patch };
+  const metadata = { ...entry.traceMetadata, ...runtimeMetadata(entry), ...patch };
   entry.traceMetadata = metadata;
   return metadata;
 }
@@ -1895,7 +1969,13 @@ export function createLangfuseService(
         return;
       }
       entry.finalizationDiagnosticSequence = diagnosticCursor?.sequence;
-      entry.diagnosticAdmissionClosed = true;
+      // When the host does not expose the 7.2 delivery cursor, keep diagnostic
+      // admission open until the plugin-local async listener tail is drained.
+      // Closing it first drops the queued model.call event that carries runtime
+      // identity, leaving only a generation update and a stale root metadata set.
+      if (diagnosticCursor) {
+        entry.diagnosticAdmissionClosed = true;
+      }
       entry.transcriptAdmissionClosed = true;
       entry.finalizationInProgress = true;
       let finalizationDeferred = false;
@@ -1906,12 +1986,16 @@ export function createLangfuseService(
       try {
         const agentId = ctx.agentId ?? "unknown";
         const sessionId = entry.sessionId ?? ctx.sessionId ?? "";
-        const diagnosticDrain =
-          diagnosticCursor && internalDiagnosticDelivery
-            ? await internalDiagnosticDelivery.waitForDeliveryCursor(diagnosticCursor, {
-                timeoutMs: SHUTDOWN_DRAIN_TIMEOUT_MS,
-              })
-            : { ok: true as const };
+        const diagnosticDrain = diagnosticCursor
+          ? await internalDiagnosticDelivery!.waitForDeliveryCursor(diagnosticCursor, {
+              timeoutMs: SHUTDOWN_DRAIN_TIMEOUT_MS,
+            })
+          : (await waitForDiagnosticQuiescence(ctx, SHUTDOWN_DRAIN_TIMEOUT_MS))
+            ? { ok: true as const, deliveredEvents: 0 }
+            : { ok: false as const, reason: "timeout" as const, deliveredEvents: 0 };
+        if (!diagnosticCursor) {
+          entry.diagnosticAdmissionClosed = true;
+        }
         if (!diagnosticDrain.ok) {
           markObservationBarrierFailed(
             entry,
@@ -2205,6 +2289,7 @@ export function createLangfuseService(
               ? { provider: entry.lastProvider, model: entry.lastModel }
               : undefined,
           ...entry.modelContextMetadata,
+          ...runtimeMetadata(entry),
           prompt: truncatePayload(entry.promptMatch),
           ...(entry.observationReconciliation
             ? { observationReconciliation: entry.observationReconciliation }
@@ -3517,6 +3602,7 @@ export function createLangfuseService(
             }
             return beginSdkEnqueue(entry, observationId, eventType, source);
           },
+          onDiagnosticTask: trackDiagnosticTask,
           onTraceFinalized: async (entry, agentId, sessionId) => {
             if (entry.deliveryFinalized || entry.finalizationInProgress) {
               return;

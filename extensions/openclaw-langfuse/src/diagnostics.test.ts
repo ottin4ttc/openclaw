@@ -209,7 +209,7 @@ describe("Langfuse diagnostic subscription", () => {
     );
     await waitForDiagnosticEventsDrained();
 
-    expect(trace.generation).toHaveBeenCalledOnce();
+    await vi.waitFor(() => expect(trace.generation).toHaveBeenCalledOnce());
     expect(trace.generation.mock.calls[0][0]).toMatchObject({
       name: "llm-call-1",
       model: "codex/aliyun/qwen3.7-plus",
@@ -236,7 +236,6 @@ describe("Langfuse diagnostic subscription", () => {
         }),
       }),
     );
-
     unsubscribe?.();
   });
 
@@ -4602,23 +4601,30 @@ describe("Langfuse diagnostic subscription", () => {
       internalDiagnostics,
     });
 
-    emitTrustedDiagnosticEvent({
-      type: "model.call.error",
-      runId: "run-err",
-      callId: "call-err",
-      scope: "provider-request",
-      sessionKey: "agent:openmai-u1:openresponses:s1",
-      sessionId: "session-1",
-      provider: "codex",
-      model: "baidu/glm-5.2",
-      runtime: "codex",
-      runtimeEngine: "codex-app-server",
-      transport: "stdio",
-      durationMs: 1000,
-      usageSource: "unknown",
-      errorCategory: "invalid_request",
-      failureKind: "terminated",
-    });
+    emitTrustedDiagnosticEventWithPrivateData(
+      {
+        type: "model.call.error",
+        runId: "run-err",
+        callId: "call-err",
+        scope: "provider-request",
+        sessionKey: "agent:openmai-u1:openresponses:s1",
+        sessionId: "session-1",
+        provider: "codex",
+        model: "baidu/glm-5.2",
+        runtime: "codex",
+        runtimeEngine: "codex-app-server",
+        transport: "stdio",
+        durationMs: 1000,
+        usageSource: "unknown",
+        errorCategory: "response_stream_disconnected",
+        failureKind: "connection_closed",
+        upstreamRequestIdHash: "sha256:request-hash",
+      },
+      {
+        errorMessage:
+          "stream disconnected before completion: stream closed before response.completed",
+      },
+    );
     await waitForDiagnosticEventsDrained();
 
     expect(trace.generation).toHaveBeenCalledOnce();
@@ -4636,13 +4642,17 @@ describe("Langfuse diagnostic subscription", () => {
     expect(generation.update).toHaveBeenCalledWith(
       expect.objectContaining({
         level: "ERROR",
-        statusMessage: "invalid_request",
+        statusMessage:
+          "stream disconnected before completion: stream closed before response.completed",
         metadata: expect.objectContaining({
           runtime: "codex",
           runtimeEngine: "codex-app-server",
           runtimeTransport: "stdio",
           usageSource: "unknown",
-          failureKind: "terminated",
+          errorCategory: "response_stream_disconnected",
+          failureKind: "connection_closed",
+          providerRequestCallId: "call-err",
+          upstreamRequestIdHash: "sha256:request-hash",
         }),
       }),
     );

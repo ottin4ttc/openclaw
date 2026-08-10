@@ -390,7 +390,10 @@ function baseModelCallEvent(
     provider: ctx.provider,
     model: ctx.model,
     ...(ctx.api && { api: ctx.api }),
+    runtime: "openclaw",
+    runtimeEngine: "embedded-agent-runner",
     ...(ctx.transport && { transport: ctx.transport }),
+    observationUnit: "request",
     ...(ctx.contextTokenBudget ? { contextTokenBudget: ctx.contextTokenBudget } : {}),
     ...(ctx.contextWindowSource ? { contextWindowSource: ctx.contextWindowSource } : {}),
     ...(ctx.contextWindowReferenceTokens

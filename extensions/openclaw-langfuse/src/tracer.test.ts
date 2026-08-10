@@ -291,6 +291,22 @@ function makeServiceCtx(
   } as OpenClawPluginServiceContext;
 }
 
+function makeLegacyServiceCtxOverrides(): Partial<OpenClawPluginServiceContext> {
+  const ctx = makeServiceCtx();
+  const diagnostics = ctx.internalDiagnostics;
+  if (!diagnostics) {
+    return { internalDiagnostics: diagnostics };
+  }
+  const {
+    captureDeliveryCursor: _captureDeliveryCursor,
+    waitForDeliveryCursor: _waitForDeliveryCursor,
+    ...legacyDiagnostics
+  } = diagnostics;
+  return {
+    internalDiagnostics: legacyDiagnostics as OpenClawPluginServiceContext["internalDiagnostics"],
+  };
+}
+
 const agentCtx = {
   agentId: "agent-1",
   sessionKey: "session-key-1",
@@ -466,6 +482,12 @@ function projectionContext(runtime: ProjectionRuntime, scenario: string) {
   };
 }
 
+function projectionRuntimeIdentity(runtime: ProjectionRuntime) {
+  return runtime === "codex"
+    ? { runtime, runtimeEngine: "codex-app-server", transport: "stdio" }
+    : { runtime, runtimeEngine: "embedded-agent-runner", transport: "http" };
+}
+
 function finalTraceUpdate(): Record<string, unknown> | undefined {
   return mockTrace.update.mock.calls
     .map((call: unknown[]) => call[0] as Record<string, unknown>)
@@ -517,6 +539,7 @@ function emitMatrixModelStart(params: {
       sessionId: params.ctx.sessionId,
       provider: runtimeConfig.provider,
       model: runtimeConfig.model,
+      ...projectionRuntimeIdentity(params.runtime),
       requestForm: "full",
       startTimeMs: 1_000 + params.callIndex * 100,
     },
@@ -555,6 +578,7 @@ function emitMatrixModelTerminal(params: {
       sessionId: params.ctx.sessionId,
       provider: runtimeConfig.provider,
       model: runtimeConfig.model,
+      ...projectionRuntimeIdentity(params.runtime),
       startTimeMs: 1_000 + params.callIndex * 100,
       endTimeMs: 1_050 + params.callIndex * 100,
       durationMs: 50,
@@ -817,6 +841,93 @@ describe("LangfuseService tracer", () => {
       sessionId: ctx.sessionId,
     });
     await service.stop?.(makeServiceCtx());
+  });
+
+  it("drains legacy diagnostics by run id when session key is absent", async () => {
+    const service = await startService(config, undefined, makeLegacyServiceCtxOverrides());
+    const { beforeAgentRun, agentEnd } = service.getHookHandlers();
+    const ctx = {
+      ...agentCtx,
+      runId: "run-legacy-diagnostic-drain",
+      sessionKey: undefined,
+      sessionId: "session-legacy-diagnostic-drain",
+    };
+    beforeAgentRun({ prompt: "hello", messages: [] }, ctx);
+
+    diagnosticRuntime.listener?.({
+      type: "model.call.started",
+      runId: ctx.runId,
+      callId: "legacy-provider-call",
+      sessionKey: ctx.sessionKey,
+      sessionId: ctx.sessionId,
+      provider: "openai",
+      model: "gpt-5.5",
+      runtime: "openclaw",
+      runtimeEngine: "embedded-agent-runner",
+      transport: "auto",
+      startTimeMs: 1_000,
+    });
+    await vi.waitFor(() => expect(mockTrace.generation).toHaveBeenCalledOnce());
+    let diagnosticDrainCount = 0;
+    diagnosticRuntime.waitForDiagnosticEventsDrained.mockImplementation(async () => {
+      diagnosticDrainCount += 1;
+      if (diagnosticDrainCount !== 2) {
+        return;
+      }
+      diagnosticRuntime.listener?.({
+        type: "model.call.completed",
+        runId: ctx.runId,
+        callId: "legacy-provider-call",
+        sessionKey: ctx.sessionKey,
+        sessionId: ctx.sessionId,
+        provider: "openai",
+        model: "gpt-5.5",
+        runtime: "openclaw",
+        runtimeEngine: "embedded-agent-runner",
+        transport: "auto",
+        startTimeMs: 1_000,
+        endTimeMs: 1_050,
+        usage: { input: 2, output: 1, total: 3 },
+      });
+    });
+
+    await agentEnd(
+      {
+        messages: [
+          { role: "user", content: "hello" },
+          {
+            role: "assistant",
+            content: [{ type: "text", text: "hi" }],
+            provider: "openai",
+            model: "gpt-5.5",
+            usage: { input: 2, output: 1, totalTokens: 3 },
+          },
+        ],
+        success: true,
+        durationMs: 10,
+      },
+      ctx,
+    );
+
+    expect(mockTrace.generation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        metadata: expect.objectContaining({
+          runtime: "openclaw",
+          runtimeEngine: "embedded-agent-runner",
+          runtimeTransport: "auto",
+        }),
+      }),
+    );
+    expect(mockGeneration.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        endTime: new Date(1_050),
+        metadata: expect.objectContaining({
+          runtime: "openclaw",
+          runtimeEngine: "embedded-agent-runner",
+          runtimeTransport: "auto",
+        }),
+      }),
+    );
   });
 
   it("skips the end marker when the SDK flush callback reports ingestion failure", async () => {
@@ -3312,6 +3423,20 @@ describe("LangfuseService tracer", () => {
             messages: [fixture.firstOutput, fixture.toolResult],
           },
         ]);
+        const runtimeGenerationUpdates = mockGeneration.update.mock.calls
+          .map((call) => call[0] as Record<string, unknown>)
+          .filter((update) => {
+            const metadata = update.metadata as Record<string, unknown> | undefined;
+            return update.endTime !== undefined && metadata?.runtime === runtime;
+          });
+        expect(runtimeGenerationUpdates.length).toBeGreaterThanOrEqual(2);
+        for (const update of runtimeGenerationUpdates) {
+          expect(update.metadata).toMatchObject({
+            runtime,
+            runtimeEngine: runtime === "codex" ? "codex-app-server" : "embedded-agent-runner",
+            runtimeTransport: runtime === "codex" ? "stdio" : "http",
+          });
+        }
         const spanCreates = [
           ...mockTrace.span.mock.calls.map((call) => call[0]),
           ...mockGeneration.span.mock.calls.map((call) => call[0]),

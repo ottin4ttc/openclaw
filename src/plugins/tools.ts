@@ -19,6 +19,7 @@ import type { PluginManifestRecord } from "./manifest-registry.js";
 import { hasManifestToolAvailability } from "./manifest-tool-availability.js";
 import type { PluginMetadataManifestView } from "./plugin-metadata-snapshot.types.js";
 import type { PluginRegistry, PluginToolRegistration } from "./registry-types.js";
+import { getPluginRegistryState } from "./runtime-state.js";
 import { withPluginRuntimePluginScope } from "./runtime/gateway-request-scope.js";
 import {
   buildPluginRuntimeLoadOptions,
@@ -916,35 +917,102 @@ function resolvePluginToolRegistry(params: {
   retainedRegistry?: PluginRegistry;
   onRetainRegistry?: (registry: PluginRegistry) => void;
 }) {
-  const lookup = {
-    env: params.loadOptions.env,
-    loadOptions: params.loadOptions,
-    workspaceDir: params.loadOptions.workspaceDir,
-    requiredPluginIds: params.onlyPluginIds,
+  const requestedPluginIds = params.onlyPluginIds;
+  // Retained registries belong to one cached descriptor execution. Reusing one
+  // across a multi-owner request would split hook and tool closure state.
+  const retainedRegistry =
+    requestedPluginIds === undefined || requestedPluginIds.length === 1
+      ? params.retainedRegistry
+      : undefined;
+  const registries: PluginRegistry[] = [];
+  const seenRegistries = new Set<PluginRegistry>();
+  const ownerRegistryByPluginId = new Map<string, PluginRegistry>();
+  const addRegistry = (registry: PluginRegistry | undefined) => {
+    if (!registry || seenRegistries.has(registry)) {
+      return;
+    }
+    seenRegistries.add(registry);
+    registries.push(registry);
+    if (requestedPluginIds === undefined) {
+      return;
+    }
+    const toolPluginIds = new Set(registry.tools.map((entry) => entry.pluginId));
+    for (const pluginId of requestedPluginIds) {
+      if (toolPluginIds.has(pluginId) && !ownerRegistryByPluginId.has(pluginId)) {
+        ownerRegistryByPluginId.set(pluginId, registry);
+      }
+    }
   };
-  const channelRegistry = getLoadedRuntimePluginRegistry({
-    ...lookup,
-    surface: "channel",
-  });
-  if (registryHasScopedPluginTools(channelRegistry, params.onlyPluginIds)) {
-    return channelRegistry;
+  const missingPluginIds = () =>
+    requestedPluginIds?.filter((pluginId) => !ownerRegistryByPluginId.has(pluginId));
+  const composeSelectedRegistries = () =>
+    composePluginToolRegistries({
+      registries,
+      ownerRegistryByPluginId,
+      requestedPluginIds: requestedPluginIds ?? [],
+    });
+
+  // Reuse the Gateway-owned registrations first. Their factories accept
+  // request context directly; reloading them would replace initialized hooks
+  // with fresh service closures that were never started.
+  const runtimeState = getPluginRegistryState();
+  const gatewayRegistry = runtimeState?.channel.pinned
+    ? (runtimeState.channel.registry ?? undefined)
+    : undefined;
+  if (
+    requestedPluginIds === undefined &&
+    registryHasScopedPluginTools(gatewayRegistry, undefined)
+  ) {
+    return gatewayRegistry;
+  }
+  addRegistry(gatewayRegistry);
+  let requiredPluginIds = missingPluginIds();
+  if (requiredPluginIds?.length === 0) {
+    return composeSelectedRegistries();
   }
 
-  const activeRegistry = getLoadedRuntimePluginRegistry({
-    env: lookup.env,
-    workspaceDir: lookup.workspaceDir,
-    requiredPluginIds: lookup.requiredPluginIds,
-    surface: "active",
-  });
-  if (registryHasScopedPluginTools(activeRegistry, params.onlyPluginIds)) {
+  let activeRegistry: PluginRegistry | undefined;
+  if (requiredPluginIds === undefined) {
+    activeRegistry = getLoadedRuntimePluginRegistry({
+      env: params.loadOptions.env,
+      workspaceDir: params.loadOptions.workspaceDir,
+      surface: "active",
+    });
+  } else {
+    for (const pluginId of requiredPluginIds) {
+      activeRegistry = getLoadedRuntimePluginRegistry({
+        env: params.loadOptions.env,
+        workspaceDir: params.loadOptions.workspaceDir,
+        requiredPluginIds: [pluginId],
+        surface: "active",
+      });
+      if (activeRegistry) {
+        break;
+      }
+    }
+  }
+  if (requestedPluginIds === undefined && registryHasScopedPluginTools(activeRegistry, undefined)) {
     return activeRegistry;
   }
-
-  if (registryHasScopedPluginTools(params.retainedRegistry, params.onlyPluginIds)) {
-    return params.retainedRegistry;
+  addRegistry(activeRegistry);
+  requiredPluginIds = missingPluginIds();
+  if (requiredPluginIds?.length === 0) {
+    return composeSelectedRegistries();
   }
 
-  const forceStandaloneLoad = Boolean(channelRegistry || activeRegistry);
+  if (
+    requestedPluginIds === undefined &&
+    registryHasScopedPluginTools(retainedRegistry, undefined)
+  ) {
+    return retainedRegistry;
+  }
+  addRegistry(retainedRegistry);
+  requiredPluginIds = missingPluginIds();
+  if (requiredPluginIds?.length === 0) {
+    return composeSelectedRegistries();
+  }
+
+  const forceStandaloneLoad = Boolean(gatewayRegistry || activeRegistry || retainedRegistry);
   const shouldRetainColdLoadedToolRegistry =
     forceStandaloneLoad &&
     params.loadOptions.activate === false &&
@@ -954,16 +1022,58 @@ function resolvePluginToolRegistry(params: {
     surface: "active",
     forceLoad: forceStandaloneLoad,
     installRegistry: !forceStandaloneLoad,
-    requiredPluginIds: params.onlyPluginIds,
-    loadOptions: params.loadOptions,
+    requiredPluginIds,
+    loadOptions:
+      requestedPluginIds === undefined
+        ? params.loadOptions
+        : { ...params.loadOptions, onlyPluginIds: requiredPluginIds },
   });
-  if (registryHasScopedPluginTools(standaloneRegistry, params.onlyPluginIds)) {
-    if (shouldRetainColdLoadedToolRegistry) {
-      params.onRetainRegistry?.(standaloneRegistry);
-    }
-    return standaloneRegistry;
+  if (standaloneRegistry && shouldRetainColdLoadedToolRegistry) {
+    params.onRetainRegistry?.(standaloneRegistry);
   }
-  return standaloneRegistry ?? channelRegistry ?? activeRegistry;
+  addRegistry(standaloneRegistry);
+  if (requestedPluginIds === undefined) {
+    return standaloneRegistry ?? gatewayRegistry ?? activeRegistry;
+  }
+  return composeSelectedRegistries();
+}
+
+function composePluginToolRegistries(params: {
+  registries: PluginRegistry[];
+  ownerRegistryByPluginId: ReadonlyMap<string, PluginRegistry>;
+  requestedPluginIds: readonly string[];
+}): PluginRegistry | undefined {
+  if (params.registries.length === 0) {
+    return undefined;
+  }
+  const contributingRegistries = params.registries.filter((registry) =>
+    params.requestedPluginIds.some(
+      (pluginId) => params.ownerRegistryByPluginId.get(pluginId) === registry,
+    ),
+  );
+  const baseRegistry = params.registries.at(-1);
+  if (!baseRegistry) {
+    return undefined;
+  }
+  if (contributingRegistries.length === 1 && contributingRegistries[0] === baseRegistry) {
+    return baseRegistry;
+  }
+  const selectedPluginIds = new Set(params.requestedPluginIds);
+  return {
+    ...baseRegistry,
+    plugins: contributingRegistries.flatMap((registry) =>
+      registry.plugins.filter(
+        (plugin) =>
+          selectedPluginIds.has(plugin.id) &&
+          params.ownerRegistryByPluginId.get(plugin.id) === registry,
+      ),
+    ),
+    tools: contributingRegistries.flatMap((registry) =>
+      registry.tools.filter(
+        (entry) => params.ownerRegistryByPluginId.get(entry.pluginId) === registry,
+      ),
+    ),
+  };
 }
 
 function registryHasScopedPluginTools(

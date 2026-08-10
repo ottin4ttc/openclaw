@@ -1276,6 +1276,7 @@ async function emitTraceBundleDiagnostics(params: {
         capture: params.capture,
         responsePayload,
       });
+      const failureFields = providerRequestFailureFields(terminal);
       const baseFields = buildProviderRequestBaseFields({
         baseFields: params.baseFields,
         callId: terminal.callId,
@@ -1302,12 +1303,7 @@ async function emitTraceBundleDiagnostics(params: {
               }
             : {}),
           rolloutSourceOrder: rolloutTraceSourceOrder(terminal.event),
-          ...(terminal.kind === "completed"
-            ? {}
-            : {
-                errorCategory: terminal.kind === "cancelled" ? "aborted" : "error",
-                ...(terminal.kind === "cancelled" ? { failureKind: "aborted" } : {}),
-              }),
+          ...(terminal.kind === "completed" ? {} : failureFields),
           ...(usage ? { usage } : {}),
         } as TrustedDiagnosticEventInput,
         privateModelCallData({
@@ -2515,6 +2511,25 @@ function boundedTraceFailureMessage(value: unknown): string | undefined {
     .replace(/\b(?:api[_-]?key|token|secret|password)\s*[:=]\s*[^\s,;]+/giu, "$1=[REDACTED]")
     .replace(/\b(?:sk|pk)-[A-Za-z0-9_-]+/gu, "[REDACTED_KEY]")
     .slice(0, 512);
+}
+
+function providerRequestFailureFields(terminal: InferenceTerminal): {
+  errorCategory: string;
+  failureKind?: "aborted" | "connection_closed";
+} {
+  if (terminal.kind === "cancelled") {
+    return { errorCategory: "aborted", failureKind: "aborted" };
+  }
+  const message = boundedTraceFailureMessage(
+    terminal.payload.error ?? terminal.payload.reason,
+  )?.toLowerCase();
+  if (message?.includes("stream closed before response.completed")) {
+    return {
+      errorCategory: "response_stream_disconnected",
+      failureKind: "connection_closed",
+    };
+  }
+  return { errorCategory: "error" };
 }
 
 function matchesTraceTurn(

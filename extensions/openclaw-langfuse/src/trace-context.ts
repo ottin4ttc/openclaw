@@ -155,6 +155,10 @@ export function rememberRuntimeIdentity(
   if (runtimeTransport) {
     entry.lastRuntimeTransport = runtimeTransport;
   }
+  const runtimePatch = runtimeMetadata(entry);
+  if (Object.keys(runtimePatch).length > 0) {
+    entry.traceMetadata = { ...entry.traceMetadata, ...runtimePatch };
+  }
 }
 
 export function runtimeMetadata(entry: TraceContextEntry): Record<string, string> {

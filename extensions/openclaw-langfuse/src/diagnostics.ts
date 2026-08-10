@@ -17,6 +17,7 @@ import {
   completeProviderRequestUsageTotals,
   rememberRuntimeIdentity,
   resolveCurrentGeneration,
+  runtimeMetadata,
   TraceContextMap,
 } from "./trace-context.js";
 import type { TraceContextEntry } from "./trace-context.js";
@@ -54,9 +55,18 @@ export interface DiagnosticsOptions {
     agentId: string,
     sessionId: string,
   ) => Promise<void>;
+  /**
+   * The host diagnostic dispatcher accepts async listeners but does not await
+   * them. Keep the plugin-local task visible to agent_end so its final trace
+   * update cannot race ahead of runtime metadata and generation reconciliation.
+   */
+  onDiagnosticTask?: (task: Promise<void>, event: unknown) => void;
 }
 
 type DiagnosticRecord = Record<string, unknown>;
+type DiagnosticListener = Parameters<
+  NonNullable<OpenClawPluginServiceContext["internalDiagnostics"]>["onEvent"]
+>[0];
 type DiagnosticPrivateData = {
   errorMessage?: string;
   modelContent?: {
@@ -444,6 +454,7 @@ function updateAuthoritativeProviderUsage(
 
   const nextMetadata = {
     ...objectRecord(entry.traceMetadata),
+    ...runtimeMetadata(entry),
     usage: {
       inputTokens: usage.input,
       outputTokens: usage.output,
@@ -866,10 +877,21 @@ function providerRequestProjectionMetadata(
   prepared: PreparedProviderRequestInput,
 ): Record<string, unknown> {
   return {
+    ...providerRequestIdentityMetadata(diagEvt),
     ...(prepared.requestForm ? { requestForm: prepared.requestForm } : {}),
     inputProjection: prepared.projection,
     ...(typeof diagEvt.previousResponseIdHash === "string"
       ? { previousResponseIdHash: diagEvt.previousResponseIdHash }
+      : {}),
+  };
+}
+
+function providerRequestIdentityMetadata(diagEvt: DiagnosticRecord): Record<string, unknown> {
+  const callId = diagnosticString(diagEvt.callId);
+  return {
+    ...(callId ? { providerRequestCallId: callId } : {}),
+    ...(typeof diagEvt.upstreamRequestIdHash === "string"
+      ? { upstreamRequestIdHash: diagEvt.upstreamRequestIdHash }
       : {}),
   };
 }
@@ -1170,6 +1192,7 @@ function updateProviderRequestTraceStats(
   const existingStats = objectRecord(existingMetadata.stats);
   const nextMetadata = {
     ...existingMetadata,
+    ...runtimeMetadata(entry),
     sessionKey,
     agentId,
     channelId: diagEvt.channel,
@@ -1222,7 +1245,12 @@ function publishModelContextMetadata(
     return false;
   }
   entry.modelContextMetadataPublished = true;
-  entry.trace.update({ metadata: objectRecord(entry.traceMetadata) });
+  entry.trace.update({
+    metadata: {
+      ...objectRecord(entry.traceMetadata),
+      ...runtimeMetadata(entry),
+    },
+  });
   return true;
 }
 
@@ -1263,6 +1291,7 @@ function deferProviderRequestCompletion(
     ...diagnosticRuntimeMetadata(diagEvt),
     scope: diagEvt.scope,
     usageSource: diagEvt.usageSource,
+    ...providerRequestIdentityMetadata(diagEvt),
     requestPayloadBytes: diagEvt.requestPayloadBytes,
     responseStreamBytes: diagEvt.responseStreamBytes,
     timeToFirstByteMs: diagEvt.timeToFirstByteMs,
@@ -1283,6 +1312,7 @@ function deferProviderRequestCompletion(
           ),
           metadata: {
             ...baseMetadata,
+            errorCategory: diagEvt.errorCategory,
             failureKind: diagEvt.failureKind,
           },
         }
@@ -1323,7 +1353,7 @@ export async function subscribeDiagnosticEvents(
   }
   const pendingTraceIdentities = new Map<string, PendingDiagnosticTraceIdentity>();
 
-  const unsubscribe = internalDiagnostics.onEvent(async (evt, _metadata, privateData) => {
+  const diagnosticListener: DiagnosticListener = async (evt, _metadata, privateData) => {
     try {
       if (!langfuse || !contextMap) {
         return;
@@ -1908,6 +1938,7 @@ export async function subscribeDiagnosticEvents(
               ...diagnosticRuntimeMetadata(diagEvt),
               scope: diagEvt.scope,
               usageSource: diagEvt.usageSource,
+              errorCategory: diagEvt.errorCategory,
               failureKind: diagEvt.failureKind,
               requestPayloadBytes: diagEvt.requestPayloadBytes,
               responseStreamBytes: diagEvt.responseStreamBytes,
@@ -2016,6 +2047,7 @@ export async function subscribeDiagnosticEvents(
           const existingStats = objectRecord(existingMetadata.stats);
           const nextMetadata = {
             ...existingMetadata,
+            ...runtimeMetadata(entry),
             sessionKey,
             agentId,
             channelId: diagEvt.channel,
@@ -2413,6 +2445,7 @@ export async function subscribeDiagnosticEvents(
             ? { lastModel: { provider: entry.lastProvider, model: entry.lastModel } }
             : {}),
           ...entry.modelContextMetadata,
+          ...runtimeMetadata(entry),
           ...(entry.promptMatch && "name" in entry.promptMatch
             ? { prompt: entry.promptMatch }
             : {}),
@@ -2438,6 +2471,11 @@ export async function subscribeDiagnosticEvents(
         `Langfuse: diagnostic event handler error: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`,
       );
     }
+  };
+  const unsubscribe = internalDiagnostics.onEvent((evt, metadata, privateData) => {
+    const task = diagnosticListener(evt, metadata, privateData);
+    opts.onDiagnosticTask?.(task, evt);
+    void task;
   });
 
   return () => {

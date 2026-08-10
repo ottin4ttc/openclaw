@@ -214,7 +214,10 @@ describe("wrapStreamFnWithDiagnosticModelCallEvents", () => {
     expect(startedEvent.provider).toBe("openai");
     expect(startedEvent.model).toBe("gpt-5.4");
     expect(startedEvent.api).toBe("openai-responses");
+    expect(startedEvent.runtime).toBe("openclaw");
+    expect(startedEvent.runtimeEngine).toBe("embedded-agent-runner");
     expect(startedEvent.transport).toBe("http");
+    expect(startedEvent.observationUnit).toBe("request");
     expect(events[0]?.trace?.parentSpanId).toBe("00f067aa0ba902b7");
     const completedEvent = getEvent(events, 1);
     expect(completedEvent.type).toBe("model.call.completed");
