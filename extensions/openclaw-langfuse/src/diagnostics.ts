@@ -3,6 +3,19 @@ import type { LangfuseGenerationClient } from "langfuse";
 /* eslint-disable @typescript-eslint/no-base-to-string, @typescript-eslint/restrict-template-expressions, @typescript-eslint/no-redundant-type-constituents */
 import type { OpenClawPluginServiceContext, PluginLogger } from "openclaw/plugin-sdk/plugin-entry";
 import type { LangfusePluginConfig } from "./config.js";
+import {
+  NATIVE_CHILD_MAX_PENDING_DIAGNOSTICS,
+  clearNativeChildPending,
+  findNativeChildObservation,
+  markNativeChildPending,
+  nativeChildLineage,
+  noteNativeChildPartial,
+  noteNativeChildPendingJoin,
+  noteNativeChildPostFinalization,
+  rememberNativeChildProviderOwner,
+  rememberNativeChildSpawnRole,
+  nativeChildTurnKey,
+} from "./native-child.js";
 import { countToolCallsFromMessages } from "./observations.js";
 import type { PromptManager } from "./prompt-manager.js";
 import { redactObject, redactText } from "./redact.js";
@@ -20,7 +33,7 @@ import {
   runtimeMetadata,
   TraceContextMap,
 } from "./trace-context.js";
-import type { TraceContextEntry } from "./trace-context.js";
+import type { NativeChildObservation, TraceContextEntry } from "./trace-context.js";
 import {
   generateObservationId,
   generateTraceId,
@@ -61,6 +74,22 @@ export interface DiagnosticsOptions {
    * update cannot race ahead of runtime metadata and generation reconciliation.
    */
   onDiagnosticTask?: (task: Promise<void>, event: unknown) => void;
+  onNativeChildDiagnostic?: (
+    entry: TraceContextEntry,
+    event: Extract<
+      Parameters<DiagnosticListener>[0],
+      { type: "codex.native_child.lifecycle" | "codex.native_child.status" }
+    >,
+  ) => void;
+  onNativeChildDiagnosticBatchComplete?: (entry: TraceContextEntry) => void;
+  onNativeChildPostFinalization?: (entry: TraceContextEntry) => void;
+  resolveNativeChildParent?: (
+    entry: TraceContextEntry,
+    childThreadId: string,
+    childTurnId: string,
+    timestamp: number,
+    source: string,
+  ) => NativeChildObservation | undefined;
 }
 
 type DiagnosticRecord = Record<string, unknown>;
@@ -180,6 +209,44 @@ function diagnosticString(value: unknown): string | undefined {
     return String(value);
   }
   return undefined;
+}
+
+function nativeChildDiagnosticMetadata(diagEvt: DiagnosticRecord): Record<string, string> {
+  const nativeChildThreadId = diagnosticString(diagEvt.nativeChildThreadId);
+  const nativeChildTurnId = diagnosticString(diagEvt.nativeChildTurnId);
+  const parentTurnId = diagnosticString(diagEvt.parentTurnId);
+  const triggeringProviderCallId = diagnosticString(diagEvt.triggeringProviderCallId);
+  return {
+    ...(nativeChildThreadId ? { nativeChildThreadId } : {}),
+    ...(nativeChildTurnId ? { nativeChildTurnId } : {}),
+    ...(parentTurnId ? { parentTurnId } : {}),
+    ...(triggeringProviderCallId ? { triggeringProviderCallId } : {}),
+  };
+}
+
+function providerGenerationForCall(
+  entry: TraceContextEntry,
+  providerCallId: string,
+): LangfuseGenerationClient | undefined {
+  const pending = entry.pendingGenerations.get(providerCallId);
+  if (pending) {
+    return pending;
+  }
+  const generationIndex =
+    entry.providerRequestGenerationIndexes?.get(providerCallId) ??
+    entry.providerRequestCallIndexes?.get(providerCallId);
+  return generationIndex === undefined
+    ? undefined
+    : entry.completedGenerations.get(generationIndex);
+}
+
+function nativeChildGenerationName(
+  _entry: TraceContextEntry,
+  _childThreadId: string | undefined,
+  fallbackIndex: number,
+  _callId?: string,
+): string {
+  return `llm-call-${fallbackIndex}`;
 }
 
 function diagnosticRuntimeMetadata(diagEvt: DiagnosticRecord) {
@@ -583,8 +650,16 @@ function codexToolOutputErrorCategory(toolName: string, output: unknown): string
   return "codex_native_tool_nonzero_exit";
 }
 
+function codexSpawnAgentRole(toolName: string, input: unknown): string | undefined {
+  if (toolName !== "collaboration.spawn_agent") {
+    return undefined;
+  }
+  return diagnosticString(objectRecord(input)?.agent_type);
+}
+
 function recordCodexToolExecution(params: {
   entry: TraceContextEntry;
+  lineageEntry: TraceContextEntry;
   diagEvt: DiagnosticRecord;
   privateData?: DiagnosticPrivateData;
   redactEnabled: boolean;
@@ -596,6 +671,7 @@ function recordCodexToolExecution(params: {
 }): void {
   const {
     entry,
+    lineageEntry,
     diagEvt,
     privateData,
     redactEnabled,
@@ -607,7 +683,15 @@ function recordCodexToolExecution(params: {
   } = params;
   const toolCallId = String(diagEvt.toolCallId ?? "");
   const toolName = String(diagEvt.toolName ?? "");
-  if (!toolCallId || !toolName || entry.diagnosticCorrectedSpanToolCallIds?.has(toolCallId)) {
+  if (!toolCallId || !toolName) {
+    return;
+  }
+  const rawInput = privateData?.toolContent?.toolInput;
+  const spawnAgentRole = codexSpawnAgentRole(toolName, rawInput);
+  if (spawnAgentRole) {
+    rememberNativeChildSpawnRole(lineageEntry, toolCallId, spawnAgentRole);
+  }
+  if (entry.diagnosticCorrectedSpanToolCallIds?.has(toolCallId)) {
     return;
   }
   const durationMs = typeof diagEvt.durationMs === "number" ? diagEvt.durationMs : 0;
@@ -620,10 +704,50 @@ function recordCodexToolExecution(params: {
         ? new Date(Math.max(0, endTime.getTime() - durationMs))
         : eventDate(diagEvt, "endTimeMs");
   const existingSpan = entry.pendingSpans.get(toolCallId) ?? entry.completedSpans?.get(toolCallId);
-  const input = truncatePayload(redactObject(privateData?.toolContent?.toolInput, redactEnabled));
+  const input = truncatePayload(redactObject(rawInput, redactEnabled));
   const output = truncatePayload(redactObject(privateData?.toolContent?.toolOutput, redactEnabled));
   const source = privateData?.toolContent ? "diagnostic-tool-content" : "diagnostic-tool-lifecycle";
   const spanId = generateObservationId(entry.traceId, "span", toolCallId);
+  const nativeChildThreadId = diagnosticString(diagEvt.nativeChildThreadId);
+  const nativeChildTurnId = diagnosticString(diagEvt.nativeChildTurnId);
+  const triggeringProviderCallId = diagnosticString(diagEvt.triggeringProviderCallId);
+  const providerGeneration = triggeringProviderCallId
+    ? providerGenerationForCall(entry, triggeringProviderCallId)
+    : undefined;
+  const recordedProviderOwner = triggeringProviderCallId
+    ? nativeChildLineage(lineageEntry).providerCallOwners.get(triggeringProviderCallId)
+    : undefined;
+  const nativeChildOwnerKey =
+    nativeChildThreadId && nativeChildTurnId
+      ? nativeChildTurnKey(nativeChildThreadId, nativeChildTurnId)
+      : undefined;
+  const providerOwnerMismatch =
+    nativeChildOwnerKey !== undefined &&
+    recordedProviderOwner !== undefined &&
+    recordedProviderOwner !== nativeChildOwnerKey;
+  if (providerOwnerMismatch) {
+    noteNativeChildPartial(lineageEntry, "provider_owner_mismatch");
+  }
+  const provenProviderParent = nativeChildThreadId
+    ? recordedProviderOwner === nativeChildOwnerKey
+      ? providerGeneration
+      : undefined
+    : providerGeneration;
+  const triggeringProviderGenerationIndex = triggeringProviderCallId
+    ? (entry.providerRequestGenerationIndexes?.get(triggeringProviderCallId) ??
+      entry.providerRequestCallIndexes?.get(triggeringProviderCallId))
+    : undefined;
+  // Child ownership without provider-call ownership is a valid, but partial,
+  // hierarchy only after the native-child parent was actually resolved.
+  const partialParenting = Boolean(
+    nativeChildThreadId && entry.actorKind === "native-child" && !provenProviderParent,
+  );
+  if (partialParenting) {
+    noteNativeChildPartial(lineageEntry, "partial_parenting");
+  }
+  if (nativeChildThreadId && triggeringProviderCallId && !provenProviderParent) {
+    noteNativeChildPendingJoin(lineageEntry);
+  }
   const spanArgs = {
     id: spanId,
     name: `tool:${toolName}`,
@@ -633,6 +757,8 @@ function recordCodexToolExecution(params: {
       toolName,
       toolCallId,
       source,
+      ...nativeChildDiagnosticMetadata(diagEvt),
+      ...(partialParenting ? { partial_parenting: true } : {}),
     },
   };
   if (!existingSpan) {
@@ -658,7 +784,7 @@ function recordCodexToolExecution(params: {
       return;
     }
   }
-  const currentGeneration = resolveCurrentGeneration(entry);
+  const currentGeneration = nativeChildThreadId ? undefined : resolveCurrentGeneration(entry);
   let span = existingSpan;
   if (!existingSpan) {
     if (
@@ -672,8 +798,18 @@ function recordCodexToolExecution(params: {
     ) {
       return;
     }
-    span = currentGeneration ? currentGeneration.span(spanArgs) : entry.trace.span(spanArgs);
+    span = provenProviderParent
+      ? provenProviderParent.span(spanArgs)
+      : currentGeneration
+        ? currentGeneration.span(spanArgs)
+        : entry.trace.span(spanArgs);
     entry.pendingSpans.set(toolCallId, span);
+    if (provenProviderParent && triggeringProviderGenerationIndex !== undefined) {
+      (entry.toolParentCallIndexes ??= new Map()).set(
+        toolCallId,
+        triggeringProviderGenerationIndex,
+      );
+    }
     entry.toolCallCount += 1;
   }
   if (isStart) {
@@ -730,6 +866,8 @@ function recordCodexToolExecution(params: {
       toolCallId,
       durationMs,
       source,
+      ...nativeChildDiagnosticMetadata(diagEvt),
+      ...(partialParenting ? { partial_parenting: true } : {}),
       ...(isError ? { isError: true } : {}),
     },
     ...(isError
@@ -1295,6 +1433,7 @@ function deferProviderRequestCompletion(
     requestPayloadBytes: diagEvt.requestPayloadBytes,
     responseStreamBytes: diagEvt.responseStreamBytes,
     timeToFirstByteMs: diagEvt.timeToFirstByteMs,
+    ...nativeChildDiagnosticMetadata(diagEvt),
   };
   entry.deferredProviderRequestCompletions.set(providerRequestIndex, {
     endTime,
@@ -1340,6 +1479,10 @@ export async function subscribeDiagnosticEvents(
     internalDiagnostics,
     onBeforeSdkEnqueue,
     onTraceFinalized,
+    onNativeChildDiagnostic,
+    onNativeChildDiagnosticBatchComplete,
+    onNativeChildPostFinalization,
+    resolveNativeChildParent,
   } = opts;
   if (config.tracing?.enabled === false) {
     return null;
@@ -1352,14 +1495,176 @@ export async function subscribeDiagnosticEvents(
     return null;
   }
   const pendingTraceIdentities = new Map<string, PendingDiagnosticTraceIdentity>();
+  const nativeChildDiagnosticDepth = new WeakMap<TraceContextEntry, number>();
 
-  const diagnosticListener: DiagnosticListener = async (evt, _metadata, privateData) => {
+  function publishNativeChildExecutionContext(
+    lineageEntry: TraceContextEntry,
+    childThreadId: string,
+    childTurnId: string,
+    diagEvt: DiagnosticRecord,
+  ): void {
+    const promptStats = diagEvt.promptStats;
+    if (!promptStats || typeof promptStats !== "object" || Array.isArray(promptStats)) {
+      noteNativeChildPartial(lineageEntry, "child_context_unavailable");
+      return;
+    }
+    const boundedPromptStats = Object.fromEntries(
+      Object.entries(promptStats).filter(
+        ([, value]) => typeof value === "number" || typeof value === "string",
+      ),
+    );
+    if (Object.keys(boundedPromptStats).length === 0) {
+      noteNativeChildPartial(lineageEntry, "child_context_unavailable");
+      return;
+    }
+    const observation = findNativeChildObservation(lineageEntry, childThreadId, childTurnId);
+    if (!observation) {
+      noteNativeChildPartial(lineageEntry, "child_observation_unavailable");
+      return;
+    }
+    const callId = diagnosticString(diagEvt.callId);
+    if (!callId) {
+      noteNativeChildPartial(lineageEntry, "child_context_unavailable");
+      return;
+    }
+    const callIds = (observation.executionContextCallIds ??= new Set());
+    if (callIds.has(callId)) {
+      return;
+    }
+    const previousLatestSummary = observation.latestExecutionContextSummary;
+    const requestSummary = {
+      source: "codex-rollout-request",
+      ...(typeof diagEvt.provider === "string" ? { provider: diagEvt.provider } : {}),
+      ...(typeof diagEvt.model === "string" ? { model: diagEvt.model } : {}),
+      promptStats: boundedPromptStats,
+    };
+    callIds.add(callId);
+    observation.firstExecutionContextSummary ??= requestSummary;
+    observation.latestExecutionContextSummary = requestSummary;
+    if (typeof diagEvt.model === "string") {
+      observation.model = diagEvt.model;
+    }
+    const summary = {
+      source: "codex-rollout-request",
+      requestCount: callIds.size,
+      firstRequest: observation.firstExecutionContextSummary,
+      latestRequest: observation.latestExecutionContextSummary,
+    };
+    const childEntry = observation.traceEntry;
+    if (
+      !prepareDiagnosticSdkEnqueue(
+        childEntry,
+        onBeforeSdkEnqueue,
+        childEntry.traceId,
+        "trace-create",
+        "child execution context",
+      )
+    ) {
+      callIds.delete(callId);
+      if (callIds.size === 0) {
+        observation.firstExecutionContextSummary = undefined;
+        observation.latestExecutionContextSummary = undefined;
+      } else {
+        observation.latestExecutionContextSummary = previousLatestSummary;
+      }
+      noteNativeChildPartial(lineageEntry, "child_delivery_rejected");
+      return;
+    }
+    childEntry.traceMetadata = {
+      ...childEntry.traceMetadata,
+      executionContextSummary: summary,
+    };
+    childEntry.trace.update({ input: summary, metadata: childEntry.traceMetadata });
+  }
+
+  function publishNativeChildTraceOutput(
+    lineageEntry: TraceContextEntry,
+    observation: NativeChildObservation | undefined,
+    output: unknown,
+  ): void {
+    if (!observation) {
+      return;
+    }
+    const childEntry = observation.traceEntry;
+    if (
+      !prepareDiagnosticSdkEnqueue(
+        childEntry,
+        onBeforeSdkEnqueue,
+        childEntry.traceId,
+        "trace-create",
+        "child generation output",
+      )
+    ) {
+      noteNativeChildPartial(lineageEntry, "child_delivery_rejected");
+      return;
+    }
+    childEntry.trace.update({ output });
+    observation.traceOutputPublished = true;
+  }
+
+  async function drainPendingNativeChildDiagnostics(
+    entry: TraceContextEntry,
+    childThreadId: string,
+    childTurnId?: string,
+  ): Promise<void> {
+    const pending = entry.pendingNativeChildDiagnostics;
+    if (!pending || pending.length === 0) {
+      return;
+    }
+    const ready = pending.filter(
+      (item) =>
+        item.childThreadId === childThreadId &&
+        (!childTurnId || !item.childTurnId || item.childTurnId === childTurnId),
+    );
+    if (ready.length === 0) {
+      return;
+    }
+    const readySet = new Set(ready);
+    entry.pendingNativeChildDiagnostics = pending.filter((item) => !readySet.has(item));
+    for (const item of ready) {
+      await diagnosticListener(
+        item.event as Parameters<DiagnosticListener>[0],
+        item.metadata as Parameters<DiagnosticListener>[1],
+        item.privateData as Parameters<DiagnosticListener>[2],
+      );
+    }
+    clearNativeChildPending(entry, childThreadId);
+  }
+
+  function deferPendingNativeChildDiagnostic(
+    entry: TraceContextEntry,
+    item: NonNullable<TraceContextEntry["pendingNativeChildDiagnostics"]>[number],
+  ): void {
+    const pending = (entry.pendingNativeChildDiagnostics ??= []);
+    if (pending.length >= NATIVE_CHILD_MAX_PENDING_DIAGNOSTICS) {
+      const state = nativeChildLineage(entry);
+      state.droppedEvents += 1;
+      noteNativeChildPartial(entry, "pending_diagnostic_limit");
+      return;
+    }
+    markNativeChildPending(entry, item.childThreadId);
+    pending.push(item);
+  }
+
+  const diagnosticListener = async (
+    evt: Parameters<DiagnosticListener>[0],
+    _metadata: Parameters<DiagnosticListener>[1],
+    privateData: Parameters<DiagnosticListener>[2],
+  ): Promise<void> => {
+    let diagnosticRootEntry: TraceContextEntry | undefined;
     try {
       if (!langfuse || !contextMap) {
         return;
       }
+      const nativeChildDiagnostic =
+        evt.type === "codex.native_child.lifecycle" || evt.type === "codex.native_child.status";
       const codexToolExecution = isCodexToolExecution(evt);
-      if (evt.type !== "model.usage" && !isRealtimeModelCall(evt) && !codexToolExecution) {
+      if (
+        evt.type !== "model.usage" &&
+        !isRealtimeModelCall(evt) &&
+        !codexToolExecution &&
+        !nativeChildDiagnostic
+      ) {
         return;
       }
 
@@ -1407,56 +1712,136 @@ export async function subscribeDiagnosticEvents(
           : undefined;
       const reusableEntry =
         matchingRunEntry ?? matchingModelCallEntry ?? matchingLateAggregateEntry ?? activeEntry;
-      const entry =
-        reusableEntry ??
-        (() => {
-          if (existingEntry?.finalized && !realtimeModelCall) {
-            contextMap.delete(key);
-          }
-          return getOrCreateDiagnosticTraceEntry({
-            langfuse,
-            contextMap,
-            config,
-            promptManager,
-            diagEvt,
-            sessionKey,
-            agentId,
-            key,
-            stateDir,
-            logger,
-            onBeforeSdkEnqueue,
-            pendingTraceIdentities,
-          });
-        })();
+      const rootEntry =
+        nativeChildDiagnostic && !reusableEntry
+          ? undefined
+          : (reusableEntry ??
+            (() => {
+              if (existingEntry?.finalized && !realtimeModelCall) {
+                contextMap.delete(key);
+              }
+              return getOrCreateDiagnosticTraceEntry({
+                langfuse,
+                contextMap,
+                config,
+                promptManager,
+                diagEvt,
+                sessionKey,
+                agentId,
+                key,
+                stateDir,
+                logger,
+                onBeforeSdkEnqueue,
+                pendingTraceIdentities,
+              });
+            })());
 
-      if (!entry) {
+      if (!rootEntry) {
         logger?.warn?.(
           `Langfuse: skipped diagnostic trace because the SDK delivery tracker rejected its root enqueue (agent=${agentId})`,
         );
         return;
       }
-      rememberRuntimeIdentity(entry, {
+      diagnosticRootEntry = rootEntry;
+      nativeChildDiagnosticDepth.set(
+        rootEntry,
+        (nativeChildDiagnosticDepth.get(rootEntry) ?? 0) + 1,
+      );
+      rememberRuntimeIdentity(rootEntry, {
         runtime: diagEvt.runtime,
         runtimeEngine: diagEvt.runtimeEngine,
         transport: diagEvt.transport,
         runtimeTransport: diagEvt.runtimeTransport,
       });
+      const nativeChildThreadId = diagnosticString(
+        diagEvt.nativeChildThreadId ?? diagEvt.childThreadId,
+      );
+      const nativeChildTurnId = diagnosticString(diagEvt.nativeChildTurnId ?? diagEvt.childTurnId);
+      const existingChildObservation =
+        nativeChildThreadId && nativeChildTurnId
+          ? findNativeChildObservation(rootEntry, nativeChildThreadId, nativeChildTurnId)
+          : undefined;
+      const admissionEntry = existingChildObservation?.traceEntry ?? rootEntry;
+      const pendingDetachedChildTurn = Boolean(
+        nativeChildDiagnostic &&
+        nativeChildThreadId &&
+        nativeChildTurnId &&
+        diagnosticString(diagEvt.triggeringToolCallId) &&
+        nativeChildLineage(rootEntry).pendingChildThreads.has(nativeChildThreadId),
+      );
       const diagnosticSequence = diagnosticNumber(diagEvt.seq);
       const acceptedByFinalizationBarrier =
-        entry.diagnosticAdmissionClosed === true &&
+        admissionEntry.diagnosticAdmissionClosed === true &&
         diagnosticSequence !== undefined &&
-        entry.finalizationDiagnosticSequence !== undefined &&
-        diagnosticSequence <= entry.finalizationDiagnosticSequence;
+        admissionEntry.finalizationDiagnosticSequence !== undefined &&
+        diagnosticSequence <= admissionEntry.finalizationDiagnosticSequence;
       if (
-        entry.deliveryFinalized ||
-        (entry.diagnosticAdmissionClosed && !acceptedByFinalizationBarrier)
+        !pendingDetachedChildTurn &&
+        (admissionEntry.deliveryFinalized ||
+          (admissionEntry.diagnosticAdmissionClosed && !acceptedByFinalizationBarrier))
       ) {
+        if (nativeChildDiagnostic) {
+          // The captured cursor is the final admissible event. Recording a later
+          // child fact would materialize lineage outside this turn's drain window.
+          noteNativeChildPostFinalization(rootEntry);
+          onNativeChildPostFinalization?.(rootEntry);
+        }
+        return;
+      }
+
+      if (nativeChildDiagnostic) {
+        onNativeChildDiagnostic?.(
+          rootEntry,
+          evt as Extract<
+            Parameters<DiagnosticListener>[0],
+            { type: "codex.native_child.lifecycle" | "codex.native_child.status" }
+          >,
+        );
+        const lifecycle = evt as Extract<
+          Parameters<DiagnosticListener>[0],
+          { type: "codex.native_child.lifecycle" }
+        >;
+        if (lifecycle.type === "codex.native_child.lifecycle") {
+          await drainPendingNativeChildDiagnostics(
+            rootEntry,
+            lifecycle.childThreadId,
+            lifecycle.childTurnId,
+          );
+        }
         return;
       }
 
       if (codexToolExecution) {
+        let toolEntry = rootEntry;
+        if (nativeChildThreadId && nativeChildTurnId && resolveNativeChildParent) {
+          const nativeChildParent = resolveNativeChildParent(
+            rootEntry,
+            nativeChildThreadId,
+            nativeChildTurnId,
+            diagnosticNumber(diagEvt.startTimeMs) ??
+              diagnosticNumber(diagEvt.endTimeMs) ??
+              Date.now(),
+            "diagnostic_tool",
+          );
+          if (!nativeChildParent) {
+            noteNativeChildPartial(rootEntry, "child_observation_unavailable");
+            deferPendingNativeChildDiagnostic(rootEntry, {
+              event: evt,
+              metadata: _metadata,
+              privateData,
+              childThreadId: nativeChildThreadId,
+              childTurnId: nativeChildTurnId,
+            });
+            return;
+          }
+          toolEntry = nativeChildParent.traceEntry;
+        } else if (nativeChildThreadId) {
+          noteNativeChildPartial(rootEntry, "child_turn_identity_unavailable");
+          return;
+        }
         recordCodexToolExecution({
-          entry,
+          entry: toolEntry,
+          lineageEntry: rootEntry,
           diagEvt,
           privateData,
           redactEnabled,
@@ -1466,6 +1851,32 @@ export async function subscribeDiagnosticEvents(
           logger,
           onBeforeSdkEnqueue,
         });
+        const triggeringToolCallId = diagnosticString(diagEvt.toolCallId);
+        if (triggeringToolCallId && resolveNativeChildParent) {
+          for (const [childThreadId, toolCallId] of nativeChildLineage(rootEntry)
+            .childTriggeringToolCallIds) {
+            if (toolCallId !== triggeringToolCallId) {
+              continue;
+            }
+            const childTurnId =
+              nativeChildLineage(rootEntry).currentChildTurnIds.get(childThreadId);
+            if (!childTurnId) {
+              continue;
+            }
+            const nativeChildParent = resolveNativeChildParent(
+              rootEntry,
+              childThreadId,
+              childTurnId,
+              diagnosticNumber(diagEvt.startTimeMs) ??
+                diagnosticNumber(diagEvt.endTimeMs) ??
+                Date.now(),
+              "diagnostic_spawn_tool",
+            );
+            if (nativeChildParent) {
+              await drainPendingNativeChildDiagnostics(rootEntry, childThreadId, childTurnId);
+            }
+          }
+        }
         return;
       }
 
@@ -1474,6 +1885,54 @@ export async function subscribeDiagnosticEvents(
         if (!callId) {
           return;
         }
+        const nativeChildParent =
+          nativeChildThreadId && nativeChildTurnId
+            ? resolveNativeChildParent?.(
+                rootEntry,
+                nativeChildThreadId,
+                nativeChildTurnId,
+                diagnosticNumber(diagEvt.startTimeMs) ??
+                  diagnosticNumber(diagEvt.endTimeMs) ??
+                  Date.now(),
+                "diagnostic_provider",
+              )
+            : undefined;
+        if (
+          nativeChildThreadId &&
+          nativeChildTurnId &&
+          !rememberNativeChildProviderOwner(
+            rootEntry,
+            callId,
+            nativeChildThreadId,
+            nativeChildTurnId,
+          )
+        ) {
+          noteNativeChildPartial(rootEntry, "provider_owner_unavailable");
+        }
+        if (nativeChildThreadId && !nativeChildTurnId) {
+          noteNativeChildPartial(rootEntry, "child_turn_identity_unavailable");
+          return;
+        }
+        if (nativeChildThreadId && nativeChildTurnId && !nativeChildParent) {
+          noteNativeChildPartial(rootEntry, "child_observation_unavailable");
+          deferPendingNativeChildDiagnostic(rootEntry, {
+            event: evt,
+            metadata: _metadata,
+            privateData,
+            childThreadId: nativeChildThreadId,
+            childTurnId: nativeChildTurnId,
+          });
+          return;
+        }
+        if (nativeChildThreadId && nativeChildTurnId && nativeChildParent) {
+          publishNativeChildExecutionContext(
+            rootEntry,
+            nativeChildThreadId,
+            nativeChildTurnId,
+            diagEvt,
+          );
+        }
+        const entry = nativeChildParent?.traceEntry ?? rootEntry;
         const providerRequestIndex = claimProviderRequestIndex(entry, callId, diagEvt);
         if (typeof diagEvt.responseIdHash === "string") {
           (entry.providerRequestResponseIdHashes ??= new Map()).set(
@@ -1716,7 +2175,7 @@ export async function subscribeDiagnosticEvents(
           }
           const gen = entry.trace.generation({
             id: genId,
-            name: `llm-call-${genIndex}`,
+            name: nativeChildGenerationName(entry, nativeChildThreadId, genIndex, callId),
             model: qualifiedModel(String(diagEvt.provider ?? ""), String(diagEvt.model ?? "")),
             startTime: eventDate(diagEvt, "startTimeMs"),
             ...(generationInput !== undefined ? { input: generationInput } : {}),
@@ -1729,6 +2188,7 @@ export async function subscribeDiagnosticEvents(
               usageSource: diagEvt.usageSource,
               promptStats: diagEvt.promptStats,
               upstreamRequestIdHash: diagEvt.upstreamRequestIdHash,
+              ...nativeChildDiagnosticMetadata(diagEvt),
               ...providerRequestProjectionMetadata(diagEvt, preparedGenerationInput),
             },
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1736,7 +2196,9 @@ export async function subscribeDiagnosticEvents(
           });
           entry.pendingGenerations.set(callId, gen);
           entry.pendingGenIds.set(callId, genId);
-          entry.currentGenerationId = genId;
+          if (!nativeChildThreadId) {
+            entry.currentGenerationId = genId;
+          }
           return;
         }
 
@@ -1862,7 +2324,7 @@ export async function subscribeDiagnosticEvents(
             clearDiagnosticSdkFailuresForObservation(entry, genId);
             gen = entry.trace.generation({
               id: genId,
-              name: `llm-call-${generationIndex}`,
+              name: nativeChildGenerationName(entry, nativeChildThreadId, generationIndex, callId),
               model: qualifiedModel(String(diagEvt.provider ?? ""), String(diagEvt.model ?? "")),
               startTime: syntheticStartTime,
               ...(generationInput !== undefined ? { input: generationInput } : {}),
@@ -1873,6 +2335,7 @@ export async function subscribeDiagnosticEvents(
                 ...diagnosticRuntimeMetadata(diagEvt),
                 scope: diagEvt.scope,
                 orphanedStart: true,
+                ...nativeChildDiagnosticMetadata(diagEvt),
                 ...providerRequestProjectionMetadata(diagEvt, preparedGenerationInput),
               },
               // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1880,7 +2343,9 @@ export async function subscribeDiagnosticEvents(
             });
           }
           entry.pendingGenIds.set(callId, genId);
-          entry.currentGenerationId = genId;
+          if (!nativeChildThreadId) {
+            entry.currentGenerationId = genId;
+          }
         }
 
         const usage = diagnosticUsage(diagEvt);
@@ -1943,6 +2408,7 @@ export async function subscribeDiagnosticEvents(
               requestPayloadBytes: diagEvt.requestPayloadBytes,
               responseStreamBytes: diagEvt.responseStreamBytes,
               timeToFirstByteMs: diagEvt.timeToFirstByteMs,
+              ...nativeChildDiagnosticMetadata(diagEvt),
               ...providerRequestProjectionMetadata(diagEvt, preparedGenerationInput),
             },
           });
@@ -1961,9 +2427,13 @@ export async function subscribeDiagnosticEvents(
               requestPayloadBytes: diagEvt.requestPayloadBytes,
               responseStreamBytes: diagEvt.responseStreamBytes,
               timeToFirstByteMs: diagEvt.timeToFirstByteMs,
+              ...nativeChildDiagnosticMetadata(diagEvt),
               ...providerRequestProjectionMetadata(diagEvt, preparedGenerationInput),
             },
           });
+        }
+        if (generationOutput !== undefined) {
+          publishNativeChildTraceOutput(rootEntry, nativeChildParent, generationOutput);
         }
         const genIndex = providerRequestGenerationIndex(entry, callId, providerRequestIndex);
         entry.completedGenerations.set(genIndex, gen);
@@ -1981,6 +2451,7 @@ export async function subscribeDiagnosticEvents(
         return;
       }
 
+      const entry = rootEntry;
       // If agent_end already finalized this entry (created generations from JSONL),
       // skip aggregate usage events so finalized metadata is not overwritten.
       if (entry.finalized) {
@@ -2470,6 +2941,16 @@ export async function subscribeDiagnosticEvents(
       logger?.error?.(
         `Langfuse: diagnostic event handler error: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`,
       );
+    } finally {
+      if (diagnosticRootEntry) {
+        const depth = nativeChildDiagnosticDepth.get(diagnosticRootEntry) ?? 1;
+        if (depth <= 1) {
+          nativeChildDiagnosticDepth.delete(diagnosticRootEntry);
+          onNativeChildDiagnosticBatchComplete?.(diagnosticRootEntry);
+        } else {
+          nativeChildDiagnosticDepth.set(diagnosticRootEntry, depth - 1);
+        }
+      }
     }
   };
   const unsubscribe = internalDiagnostics.onEvent((evt, metadata, privateData) => {

@@ -2019,6 +2019,89 @@ describe("runCodexAppServerAttempt", () => {
     );
   });
 
+  it("defers one-shot client retirement while a detached native child is active", async () => {
+    const retireSpy = vi.spyOn(sharedClientModule, "retireSharedCodexAppServerClientIfCurrent");
+    retireSpy.mockReturnValue({ activeLeases: 0, closed: true });
+    const closeAndWait = vi.fn(async () => true);
+    let notify: ((notification: CodexServerNotification) => Promise<void>) | undefined;
+    const request = vi.fn(async (method: string) => {
+      if (method === "thread/start") {
+        return threadStartResult();
+      }
+      if (method === "turn/start") {
+        return turnStartResult();
+      }
+      return {};
+    });
+    setCodexAppServerClientFactoryForTest(
+      async () =>
+        ({
+          ...mockClientRuntimeMethods(),
+          request,
+          addNotificationHandler: vi.fn((handler) => {
+            notify = handler;
+            return () => undefined;
+          }),
+          addRequestHandler: vi.fn(() => () => undefined),
+          addCloseHandler: vi.fn(() => () => undefined),
+          closeAndWait,
+        }) as never,
+    );
+    const params = createParams(
+      path.join(tempDir, "session.jsonl"),
+      path.join(tempDir, "workspace"),
+    );
+    params.cleanupBundleMcpOnRunEnd = true;
+
+    const run = runCodexAppServerAttempt(params);
+    await vi.waitFor(
+      () => expect(request.mock.calls.map(([method]) => method)).toContain("turn/start"),
+      fastWait,
+    );
+    if (!notify) {
+      throw new Error("expected turn notification handler");
+    }
+    await notify({
+      method: "item/completed",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        item: {
+          id: "spawn-call-1",
+          type: "subAgentActivity",
+          senderThreadId: "thread-1",
+          agentThreadId: "child-thread-1",
+          agentPath: "/root/detached-child",
+          kind: "started",
+        },
+      },
+    });
+    await notify({
+      method: "turn/completed",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        turn: { id: "turn-1", status: "completed" },
+      },
+    });
+    await run;
+
+    expect(retireSpy).not.toHaveBeenCalled();
+    expect(closeAndWait).not.toHaveBeenCalled();
+
+    await notify({
+      method: "turn/completed",
+      params: {
+        threadId: "child-thread-1",
+        turnId: "child-turn-1",
+        turn: { id: "child-turn-1", status: "interrupted", items: [] },
+      },
+    });
+
+    expect(retireSpy).toHaveBeenCalledOnce();
+    expect(closeAndWait).toHaveBeenCalledWith({ exitTimeoutMs: 2_000, forceKillDelayMs: 250 });
+  });
+
   it("retires the shared Codex app-server client after one-shot turn start failures", async () => {
     const retireSpy = vi.spyOn(sharedClientModule, "retireSharedCodexAppServerClientIfCurrent");
     retireSpy.mockReturnValue({ activeLeases: 0, closed: true });

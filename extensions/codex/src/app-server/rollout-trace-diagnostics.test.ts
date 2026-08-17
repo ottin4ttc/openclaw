@@ -103,6 +103,8 @@ describe("finalizeCodexRolloutTraceProviderRequestDiagnostics", () => {
             runtime: "codex",
             runtimeEngine: "codex-app-server",
             transport: "stdio",
+            nativeChildThreadId: "child-thread-1",
+            parentTurnId: "parent-turn-1",
           },
           capture: { inputMessages: true, outputMessages: true, systemPrompt: true },
         }),
@@ -125,6 +127,14 @@ describe("finalizeCodexRolloutTraceProviderRequestDiagnostics", () => {
             runtime: "codex",
             runtimeEngine: "codex-app-server",
             transport: "stdio",
+            nativeChildThreadId: "child-thread-1",
+            parentTurnId: "parent-turn-1",
+            promptStats: expect.objectContaining({
+              inputMessagesCount: 1,
+              systemPromptSource: "instructions",
+              systemPromptChars: 6,
+              systemPromptHash: expect.stringMatching(/^sha256:/u),
+            }),
           }),
         ]),
       );
@@ -141,17 +151,28 @@ describe("finalizeCodexRolloutTraceProviderRequestDiagnostics", () => {
             type: event.type,
             toolCallId: "toolCallId" in event ? event.toolCallId : undefined,
             toolOwner: "toolOwner" in event ? event.toolOwner : undefined,
+            nativeChildThreadId:
+              "nativeChildThreadId" in event ? event.nativeChildThreadId : undefined,
+            parentTurnId: "parentTurnId" in event ? event.parentTurnId : undefined,
+            triggeringProviderCallId:
+              "triggeringProviderCallId" in event ? event.triggeringProviderCallId : undefined,
           })),
       ).toEqual([
         {
           type: "tool.execution.started",
           toolCallId: "tool-call",
           toolOwner: "codex-rollout-trace",
+          nativeChildThreadId: "child-thread-1",
+          parentTurnId: "parent-turn-1",
+          triggeringProviderCallId: undefined,
         },
         {
           type: "tool.execution.completed",
           toolCallId: "tool-call",
           toolOwner: "codex-rollout-trace",
+          nativeChildThreadId: "child-thread-1",
+          parentTurnId: "parent-turn-1",
+          triggeringProviderCallId: undefined,
         },
       ]);
       expect(privateData.get("model.call.started:provider-call")?.modelContent).toMatchObject({
@@ -162,6 +183,159 @@ describe("finalizeCodexRolloutTraceProviderRequestDiagnostics", () => {
         outputMessages: [{ type: "message", content: "done" }],
       });
       expect(JSON.stringify(events)).not.toContain("request-secret");
+    } finally {
+      await fs.rm(traceRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("summarizes Responses Lite developer instructions without exposing prompt text", async () => {
+    const traceRoot = await createTraceRoot("provider-responses-lite-prompt");
+    const developerInstructions = "private child developer instructions";
+    try {
+      const bundleDir = path.join(traceRoot, "attempt-one", "trace-one");
+      const input = [
+        {
+          type: "additional_tools",
+          role: "developer",
+          tools: [{ type: "function", name: "read" }],
+        },
+        {
+          type: "message",
+          role: "developer",
+          content: [{ type: "input_text", text: developerInstructions }],
+        },
+        {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: "evaluate the candidate" }],
+        },
+      ];
+      await writePayload(bundleDir, "request", {
+        model: "gpt-5.6-luna",
+        instructions: "",
+        input,
+      });
+      await writePayload(bundleDir, "response", {
+        output_items: [{ type: "message", content: "done" }],
+      });
+      await writeTrace(bundleDir, [
+        traceEvent(1, 1_000, "inference_started", {
+          inference_call_id: "provider-call",
+          model: "gpt-5.6-luna",
+          provider_name: "openai",
+          request_payload: payloadRef("request"),
+        }),
+        traceEvent(2, 1_050, "inference_completed", {
+          inference_call_id: "provider-call",
+          response_payload: payloadRef("response"),
+        }),
+        traceEvent(3, 1_060, "codex_turn_ended", { status: "completed" }),
+      ]);
+
+      const events: DiagnosticRecord[] = [];
+      onInternalDiagnosticEvent((event) => events.push(event as DiagnosticRecord));
+      await finalizeCodexRolloutTraceProviderRequestDiagnostics({
+        traceRoot,
+        threadId: "thread-1",
+        turnId: "turn-1",
+        baseFields: {
+          runId: "run-1",
+          provider: "codex",
+          model: "gpt-5.6-luna",
+          nativeChildThreadId: "child-thread-1",
+          parentTurnId: "parent-turn-1",
+        },
+      });
+      await waitForDiagnosticEventsDrained();
+
+      const inputMessagesChars = JSON.stringify(input).length;
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          type: "model.call.started",
+          promptStats: expect.objectContaining({
+            systemPromptSource: "input_messages",
+            systemPromptChars: developerInstructions.length,
+            systemPromptHash: expect.stringMatching(/^sha256:/u),
+            inputMessagesChars,
+            totalChars: inputMessagesChars,
+          }),
+        }),
+      );
+      expect(JSON.stringify(events)).not.toContain(developerInstructions);
+    } finally {
+      await fs.rm(traceRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("links a child tool only when model-visible response ownership proves the provider call", async () => {
+    const traceRoot = await createTraceRoot("provider-tool-owner");
+    try {
+      const bundleDir = path.join(traceRoot, "trace-one");
+      await writePayload(bundleDir, "response", {
+        output_items: [
+          {
+            type: "function_call",
+            name: "read",
+            call_id: "model-call-1",
+            arguments: "{}",
+          },
+        ],
+      });
+      await writeTrace(bundleDir, [
+        traceEvent(1, 1_000, "inference_started", {
+          inference_call_id: "provider-call-1",
+        }),
+        traceEvent(2, 1_010, "inference_completed", {
+          inference_call_id: "provider-call-1",
+          response_payload: payloadRef("response"),
+        }),
+        traceEvent(3, 1_020, "tool_call_started", {
+          tool_call_id: "tool-call-1",
+          model_visible_call_id: "model-call-1",
+        }),
+        traceEvent(4, 1_030, "tool_call_ended", {
+          tool_call_id: "tool-call-1",
+          status: "completed",
+        }),
+        traceEvent(5, 1_040, "codex_turn_ended", { status: "completed" }),
+      ]);
+
+      const toolEvents: DiagnosticRecord[] = [];
+      onInternalDiagnosticEvent((event) => {
+        if (event.type.startsWith("tool.execution.")) {
+          toolEvents.push(event as DiagnosticRecord);
+        }
+      });
+
+      await finalizeCodexRolloutTraceProviderRequestDiagnostics({
+        traceRoot,
+        threadId: "thread-1",
+        turnId: "turn-1",
+        baseFields: {
+          runId: "run-provider-tool-owner",
+          provider: "codex",
+          model: "gpt-5.5",
+          nativeChildThreadId: "child-thread-1",
+          parentTurnId: "parent-turn-1",
+        },
+      });
+      await waitForDiagnosticEventsDrained();
+
+      expect(toolEvents).toHaveLength(2);
+      expect(toolEvents).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            type: "tool.execution.started",
+            toolCallId: "tool-call-1",
+            triggeringProviderCallId: "provider-call-1",
+          }),
+          expect.objectContaining({
+            type: "tool.execution.completed",
+            toolCallId: "tool-call-1",
+            triggeringProviderCallId: "provider-call-1",
+          }),
+        ]),
+      );
     } finally {
       await fs.rm(traceRoot, { recursive: true, force: true });
     }

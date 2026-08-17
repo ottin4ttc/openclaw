@@ -14,6 +14,7 @@ import {
   type AgentHarnessTaskRuntime,
   type AgentHarnessTaskRecord,
 } from "openclaw/plugin-sdk/agent-harness-task-runtime";
+import { emitTrustedDiagnosticEvent } from "openclaw/plugin-sdk/diagnostic-runtime";
 import { asFiniteNumber, normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import type { CodexAppServerClient } from "./client.js";
 import {
@@ -32,14 +33,61 @@ import {
 } from "./native-subagent-task-mirror.js";
 import type { CodexServerNotification, JsonObject, JsonValue } from "./protocol.js";
 import { isJsonObject } from "./protocol.js";
+import {
+  startCodexRolloutTraceMonitor,
+  type CodexRolloutTraceFinalDrainResult,
+  type CodexRolloutTraceMonitor,
+  type RolloutTraceContentCapture,
+  type RolloutTraceModelBaseFields,
+} from "./rollout-trace-diagnostics.js";
+
+type TrustedDiagnosticEventInput = Parameters<typeof emitTrustedDiagnosticEvent>[0];
 
 type NativeSubagentMonitorRuntime = {
   createAgentHarnessTaskRuntime: typeof createAgentHarnessTaskRuntime;
   deliverAgentHarnessTaskCompletion: typeof deliverAgentHarnessTaskCompletion;
+  emitTrustedDiagnosticEvent?: typeof emitTrustedDiagnosticEvent;
+  startCodexRolloutTraceMonitor?: typeof startCodexRolloutTraceMonitor;
+};
+
+type ParentTurnDiagnostics = {
+  runId: string;
+  parentTurnId: string;
+  sessionKey?: string;
+  sessionId?: string;
+  agentId?: string;
+  traceRoot?: string;
+  baseFields: RolloutTraceModelBaseFields;
+  capture?: RolloutTraceContentCapture;
+  sourceEventIds: Set<string>;
+  observedChildThreadIds: Set<string>;
+  startFactChildThreadIds: Set<string>;
+  endedChildThreadIds: Set<string>;
+  activeChildThreadIds: Set<string>;
+  partialReasons: Set<string>;
+  admitted: number;
+  duplicates: number;
+  dropped: number;
+  rolloutTurnsStarted: number;
+  rolloutTurnsCompleted: number;
+  drainTimedOut: boolean;
+  lateEventReported: boolean;
+  finalizing: boolean;
+  finalized: boolean;
+};
+
+type ChildTurnDiagnostics = {
+  parentTurnId: string;
+  childTurnId: string;
+  diagnostics: ParentTurnDiagnostics;
+  monitor?: CodexRolloutTraceMonitor;
+  finalization?: Promise<CodexRolloutTraceFinalDrainResult | undefined>;
+  completed?: boolean;
 };
 
 type ParentState = {
   parentThreadId: string;
+  transcriptPath?: string;
   requesterSessionKey?: string;
   taskRuntimeScope?: AgentHarnessTaskRuntimeScope;
   agentId?: string;
@@ -47,11 +95,15 @@ type ParentState = {
   mirror?: CodexNativeSubagentTaskMirror;
   deferredSettlement?: () => Promise<void> | void;
   deliveredCompletionKeys: Set<string>;
+  diagnostics?: ParentTurnDiagnostics;
 };
 
 type ChildState = {
   childThreadId: string;
   parentThreadId: string;
+  agentPath?: string;
+  agentRole?: string;
+  triggeringToolCallId?: string;
   assistantMessagesByTurn: Map<string, ChildAssistantMessages>;
   transcriptPath?: string;
   transcriptPollAttempt: number;
@@ -64,6 +116,9 @@ type ChildState = {
   deliveringCompletionKey?: string;
   noFinalCompletionFallbackTimer?: ReturnType<typeof setTimeout>;
   settledWithoutCompletion: boolean;
+  completionObservedInParentMailbox: boolean;
+  diagnostics?: ParentTurnDiagnostics;
+  diagnosticTurns: Map<string, ChildTurnDiagnostics>;
 };
 
 type ChildAssistantMessages = {
@@ -93,13 +148,23 @@ const DEFAULT_COMPLETION_DELIVERY_RETRY_DELAYS_MS = [
 ];
 const DEFAULT_TASK_ROW_RECONCILE_INTERVAL_MS = 10_000;
 const RECENT_TERMINAL_TASK_RECONCILE_GRACE_MS = 60_000;
+const MAX_NATIVE_CHILDREN_PER_TURN = 64;
+const MAX_NATIVE_CHILD_EVENTS_PER_TURN = 4_096;
+const MAX_NATIVE_CHILD_FINAL_DRAIN_WAIT_MS = 500;
+// At most nine identity fields can coexist in one lifecycle event. Keeping each
+// to 256 UTF-16 code units leaves ample room below the 16 KiB UTF-8 event limit.
+const MAX_NATIVE_CHILD_ID_CHARS = 256;
+const MAX_NATIVE_CHILD_PARTIAL_REASONS = 16;
 // Codex's recorder uses this filename contract; non-canonical names keep the
 // legacy substring fallback for older or test-created transcript files.
 const CODEX_ROLLOUT_FILENAME_RE = /^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-(.+)\.jsonl$/u;
+const PARENT_TRANSCRIPT_TAIL_MAX_BYTES = 512 * 1024;
 
 const defaultRuntime: NativeSubagentMonitorRuntime = {
   createAgentHarnessTaskRuntime,
   deliverAgentHarnessTaskCompletion,
+  emitTrustedDiagnosticEvent,
+  startCodexRolloutTraceMonitor,
 };
 
 const monitors = new WeakMap<CodexAppServerClient, CodexNativeSubagentMonitor>();
@@ -225,6 +290,169 @@ export class CodexNativeSubagentMonitor {
     }
   }
 
+  beginParentTurnDiagnostics(params: {
+    parentThreadId: string;
+    runId: string;
+    parentTurnId: string;
+    sessionKey?: string;
+    sessionId?: string;
+    agentId?: string;
+    traceRoot?: string;
+    baseFields: RolloutTraceModelBaseFields;
+    capture?: RolloutTraceContentCapture;
+  }): void {
+    const state = this.parentStates.get(params.parentThreadId.trim());
+    if (!state) {
+      return;
+    }
+    const runId = boundedDiagnosticId(params.runId);
+    const parentTurnId = boundedDiagnosticId(params.parentTurnId);
+    if (!runId || !parentTurnId) {
+      return;
+    }
+    const sessionKey = boundedOptionalDiagnosticId(params.sessionKey);
+    const sessionId = boundedOptionalDiagnosticId(params.sessionId);
+    const agentId = boundedOptionalDiagnosticId(params.agentId);
+    const previous = state.diagnostics;
+    if (previous && !previous.finalized && previous.parentTurnId !== parentTurnId) {
+      previous.partialReasons.add("parent_turn_replaced_before_finalization");
+      this.stopDiagnosticTurnsForParent(previous.parentTurnId);
+    }
+    state.diagnostics = {
+      runId,
+      parentTurnId,
+      sessionKey,
+      sessionId,
+      agentId,
+      traceRoot: params.traceRoot,
+      baseFields: {
+        ...params.baseFields,
+        runId,
+        sessionKey,
+        sessionId,
+        agentId,
+      },
+      capture: params.capture,
+      sourceEventIds: new Set<string>(),
+      observedChildThreadIds: new Set<string>(),
+      startFactChildThreadIds: new Set<string>(),
+      endedChildThreadIds: new Set<string>(),
+      activeChildThreadIds: new Set<string>(),
+      partialReasons: new Set<string>(),
+      admitted: 0,
+      duplicates: 0,
+      dropped: 0,
+      rolloutTurnsStarted: 0,
+      rolloutTurnsCompleted: 0,
+      drainTimedOut: false,
+      lateEventReported: false,
+      finalizing: false,
+      finalized: false,
+    };
+  }
+
+  async finalizeParentTurnDiagnostics(parentThreadId: string): Promise<void> {
+    const state = this.parentStates.get(parentThreadId.trim());
+    const diagnostics = state?.diagnostics;
+    if (!state || !diagnostics || diagnostics.finalized || diagnostics.finalizing) {
+      return;
+    }
+    diagnostics.finalizing = true;
+    const finalizations: Promise<CodexRolloutTraceFinalDrainResult | undefined>[] = [];
+    for (const childState of this.childStates.values()) {
+      if (childState.parentThreadId !== state.parentThreadId) {
+        continue;
+      }
+      for (const turn of childState.diagnosticTurns.values()) {
+        if (turn.parentTurnId !== diagnostics.parentTurnId) {
+          continue;
+        }
+        if (turn.finalization) {
+          finalizations.push(turn.finalization);
+        }
+      }
+    }
+    let drainDeadline: ReturnType<typeof setTimeout> | undefined;
+    const drainResult = await Promise.race([
+      Promise.all(finalizations).then((drains) => ({ drains, timedOut: false as const })),
+      new Promise<{ drains: []; timedOut: true }>((resolve) => {
+        drainDeadline = setTimeout(
+          () => resolve({ drains: [], timedOut: true }),
+          MAX_NATIVE_CHILD_FINAL_DRAIN_WAIT_MS,
+        );
+        unrefTimer(drainDeadline);
+      }),
+    ]).finally(() => {
+      if (drainDeadline) {
+        clearTimeout(drainDeadline);
+      }
+    });
+    if (drainResult.timedOut) {
+      diagnostics.drainTimedOut = true;
+      diagnostics.partialReasons.add("child_rollout_parent_drain_timeout");
+      // The parent stops waiting after one shared deadline. Terminal drains and
+      // active detached child monitors retain their own lifecycle in background.
+    }
+    diagnostics.finalizing = false;
+    diagnostics.finalized = true;
+    this.deleteCompletedDiagnosticTurnsForParent(diagnostics.parentTurnId);
+    if (drainResult.drains.some((drain) => drain && !drain.complete)) {
+      diagnostics.drainTimedOut = true;
+      diagnostics.partialReasons.add("child_rollout_drain_incomplete");
+    }
+    this.emitParentTurnDiagnosticStatus(state, diagnostics);
+    this.deliverPendingCompletionsForParent(state);
+  }
+
+  private emitParentTurnDiagnosticStatus(
+    state: ParentState,
+    diagnostics: ParentTurnDiagnostics,
+  ): void {
+    const support = diagnostics.admitted > 0 ? "supported" : "unsupported";
+    const activeChildren = diagnostics.activeChildThreadIds.size;
+    const authoritativeStart =
+      diagnostics.observedChildThreadIds.size > 0 &&
+      diagnostics.startFactChildThreadIds.size >= diagnostics.observedChildThreadIds.size;
+    const authoritativeTerminal =
+      diagnostics.observedChildThreadIds.size > 0 &&
+      diagnostics.endedChildThreadIds.size >= diagnostics.observedChildThreadIds.size &&
+      activeChildren === 0;
+    this.emitDiagnostic({
+      type: "codex.native_child.status",
+      version: 1,
+      runId: diagnostics.runId,
+      ...(diagnostics.sessionKey ? { sessionKey: diagnostics.sessionKey } : {}),
+      ...(diagnostics.sessionId ? { sessionId: diagnostics.sessionId } : {}),
+      ...(diagnostics.agentId ? { agentId: diagnostics.agentId } : {}),
+      parentTurnId: diagnostics.parentTurnId,
+      parentThreadId: boundedDiagnosticId(state.parentThreadId),
+      support,
+      drain:
+        support === "unsupported" || diagnostics.rolloutTurnsStarted === 0
+          ? "not_applicable"
+          : diagnostics.drainTimedOut
+            ? "timed_out"
+            : "completed",
+      authoritativeStart,
+      authoritativeTerminal,
+      providerCallOwnership: diagnostics.rolloutTurnsStarted > 0,
+      toolCallOwnership: diagnostics.rolloutTurnsStarted > 0,
+      counts: {
+        admitted: diagnostics.admitted,
+        duplicates: diagnostics.duplicates,
+        dropped: diagnostics.dropped,
+        activeChildren,
+      },
+      ...(diagnostics.partialReasons.size > 0
+        ? {
+            partialReasons: [...diagnostics.partialReasons]
+              .toSorted()
+              .slice(0, MAX_NATIVE_CHILD_PARTIAL_REASONS),
+          }
+        : {}),
+    });
+  }
+
   async handleNotification(notification: CodexServerNotification): Promise<void> {
     const state = this.resolveMirrorState(notification);
     if (state?.mirror) {
@@ -244,6 +472,279 @@ export class CodexNativeSubagentMonitor {
     await this.handleCompletionNotification(notification);
   }
 
+  private emitDiagnostic(event: TrustedDiagnosticEventInput): void {
+    try {
+      (this.runtime.emitTrustedDiagnosticEvent ?? emitTrustedDiagnosticEvent)(event);
+    } catch (error) {
+      embeddedAgentLog.debug("Codex native-child diagnostic emission failed open", {
+        type: event.type,
+        error: formatErrorMessage(error),
+      });
+    }
+  }
+
+  private recordChildLifecycle(params: {
+    state: ParentState;
+    childThreadId: string;
+    sourceEventId: string;
+    lifecycle: "started" | "activity" | "turn_started" | "turn_completed" | "ended";
+    sourceTimestampMs?: number;
+    childTurnId?: string;
+    triggeringToolCallId?: string;
+    outcome?: "completed" | "failed" | "cancelled" | "interrupted" | "timed_out";
+    preferCurrentTurn?: boolean;
+  }): void {
+    const rawChildThreadId = params.childThreadId.trim();
+    const childThreadId = boundedDiagnosticId(rawChildThreadId);
+    const childState = this.childStates.get(rawChildThreadId);
+    const turnDiagnostics = params.childTurnId
+      ? [...(childState?.diagnosticTurns.values() ?? [])].find(
+          (turn) => turn.childTurnId === params.childTurnId,
+        )?.diagnostics
+      : undefined;
+    const retainedDiagnostics = childState?.diagnostics;
+    const retainedOwner =
+      retainedDiagnostics &&
+      (params.lifecycle === "ended" ||
+        (childThreadId !== undefined &&
+          retainedDiagnostics.activeChildThreadIds.has(childThreadId)));
+    const currentOwner =
+      params.preferCurrentTurn &&
+      params.state.diagnostics &&
+      !params.state.diagnostics.finalizing &&
+      !params.state.diagnostics.finalized
+        ? params.state.diagnostics
+        : undefined;
+    // Parent-scoped collaboration activity is the ownership handoff for a reused child.
+    // Child-thread notifications alone may still belong to a detached prior parent turn.
+    const diagnostics =
+      turnDiagnostics ??
+      currentOwner ??
+      (retainedOwner ? retainedDiagnostics : params.state.diagnostics);
+    if (!diagnostics) {
+      return;
+    }
+    const sourceEventId = boundedDiagnosticId(params.sourceEventId);
+    if (!childThreadId || !sourceEventId) {
+      diagnostics.dropped += 1;
+      diagnostics.partialReasons.add("invalid_identity");
+      return;
+    }
+    if (params.lifecycle === "ended" && diagnostics.endedChildThreadIds.has(childThreadId)) {
+      diagnostics.duplicates += 1;
+      return;
+    }
+    const detachedContinuation =
+      diagnostics.finalized &&
+      (turnDiagnostics !== undefined || diagnostics.activeChildThreadIds.has(childThreadId));
+    if (diagnostics.finalized && !detachedContinuation) {
+      diagnostics.dropped += 1;
+      diagnostics.partialReasons.add("post_finalization_event");
+      if (!diagnostics.lateEventReported) {
+        diagnostics.lateEventReported = true;
+        this.emitParentTurnDiagnosticStatus(params.state, diagnostics);
+      }
+      return;
+    }
+    if (diagnostics.sourceEventIds.has(sourceEventId)) {
+      diagnostics.duplicates += 1;
+      return;
+    }
+    if (diagnostics.admitted >= MAX_NATIVE_CHILD_EVENTS_PER_TURN) {
+      diagnostics.dropped += 1;
+      diagnostics.partialReasons.add("event_limit");
+      return;
+    }
+    const alreadyActive = diagnostics.activeChildThreadIds.has(childThreadId);
+    const activatesChild =
+      params.lifecycle === "started" ||
+      params.lifecycle === "activity" ||
+      params.lifecycle === "turn_started";
+    if (!alreadyActive && activatesChild) {
+      if (diagnostics.activeChildThreadIds.size >= MAX_NATIVE_CHILDREN_PER_TURN) {
+        diagnostics.dropped += 1;
+        diagnostics.partialReasons.add("active_child_limit");
+        return;
+      }
+      diagnostics.activeChildThreadIds.add(childThreadId);
+      diagnostics.observedChildThreadIds.add(childThreadId);
+    }
+    if (childState && !diagnostics.finalized) {
+      childState.diagnostics = diagnostics;
+    }
+    if (params.lifecycle === "started") {
+      diagnostics.startFactChildThreadIds.add(childThreadId);
+    }
+    const terminalLifecycle = params.lifecycle === "turn_completed" || params.lifecycle === "ended";
+    if (terminalLifecycle) {
+      if (alreadyActive) {
+        diagnostics.activeChildThreadIds.delete(childThreadId);
+        diagnostics.endedChildThreadIds.add(childThreadId);
+      } else if (!diagnostics.observedChildThreadIds.has(childThreadId)) {
+        diagnostics.partialReasons.add("terminal_without_active_child");
+      }
+    }
+    diagnostics.sourceEventIds.add(sourceEventId);
+    diagnostics.admitted += 1;
+    const triggeringToolCallId = boundedOptionalDiagnosticId(childState?.triggeringToolCallId);
+    const role = boundedOptionalDiagnosticId(childState?.agentRole);
+    this.emitDiagnostic({
+      type: "codex.native_child.lifecycle",
+      version: 1,
+      runId: diagnostics.runId,
+      ...(diagnostics.sessionKey ? { sessionKey: diagnostics.sessionKey } : {}),
+      ...(diagnostics.sessionId ? { sessionId: diagnostics.sessionId } : {}),
+      ...(diagnostics.agentId ? { agentId: diagnostics.agentId } : {}),
+      parentTurnId: diagnostics.parentTurnId,
+      parentThreadId: boundedDiagnosticId(params.state.parentThreadId),
+      sourceEventId,
+      childThreadId,
+      ...(triggeringToolCallId ? { triggeringToolCallId } : {}),
+      ...(params.childTurnId ? { childTurnId: boundedDiagnosticId(params.childTurnId) } : {}),
+      ...(role ? { role } : {}),
+      lifecycle: params.lifecycle,
+      sourceTimestampMs: params.sourceTimestampMs ?? Date.now(),
+      ...(params.outcome ? { outcome: params.outcome } : {}),
+    });
+    if (childState && params.lifecycle === "ended") {
+      childState.diagnostics = undefined;
+    }
+  }
+
+  private startChildTurnDiagnostics(childState: ChildState, childTurnId: string): void {
+    const state = this.parentStates.get(childState.parentThreadId);
+    const currentDiagnostics = state?.diagnostics;
+    const retainedDiagnostics = childState.diagnostics;
+    const diagnostics = retainedDiagnostics?.activeChildThreadIds.has(childState.childThreadId)
+      ? retainedDiagnostics
+      : currentDiagnostics;
+    if (
+      !state ||
+      !diagnostics ||
+      (diagnostics.finalized && !diagnostics.activeChildThreadIds.has(childState.childThreadId))
+    ) {
+      return;
+    }
+    childState.diagnostics = diagnostics;
+    const key = diagnosticTurnKey(diagnostics.parentTurnId, childTurnId);
+    if (childState.diagnosticTurns.has(key)) {
+      return;
+    }
+    const startMonitor =
+      this.runtime.startCodexRolloutTraceMonitor ?? startCodexRolloutTraceMonitor;
+    let monitor: CodexRolloutTraceMonitor | undefined;
+    if (diagnostics.traceRoot) {
+      try {
+        monitor = startMonitor({
+          traceRoot: diagnostics.traceRoot,
+          threadId: childState.childThreadId,
+          turnId: childTurnId,
+          baseFields: {
+            ...diagnostics.baseFields,
+            nativeChildThreadId: boundedDiagnosticId(childState.childThreadId),
+            nativeChildTurnId: boundedDiagnosticId(childTurnId),
+            parentTurnId: diagnostics.parentTurnId,
+          },
+          capture: diagnostics.capture,
+          log: embeddedAgentLog,
+        });
+      } catch (error) {
+        diagnostics.partialReasons.add("child_rollout_monitor_start_error");
+        embeddedAgentLog.debug("Codex child rollout monitor start failed open", {
+          childThreadId: childState.childThreadId,
+          childTurnId,
+          error: formatErrorMessage(error),
+        });
+      }
+    }
+    if (monitor) {
+      diagnostics.rolloutTurnsStarted += 1;
+    } else {
+      diagnostics.partialReasons.add("child_rollout_trace_unavailable");
+    }
+    childState.diagnosticTurns.set(key, {
+      parentTurnId: diagnostics.parentTurnId,
+      childTurnId,
+      diagnostics,
+      monitor,
+    });
+  }
+
+  private finalizeChildTurnDiagnostics(
+    childState: ChildState,
+    turn: ChildTurnDiagnostics,
+  ): Promise<CodexRolloutTraceFinalDrainResult | undefined> {
+    if (turn.finalization) {
+      return turn.finalization;
+    }
+    const diagnostics = turn.diagnostics;
+    turn.finalization = turn.monitor
+      ? Promise.resolve()
+          .then(() => turn.monitor?.finalDrain())
+          .finally(() => this.stopChildTurnDiagnosticMonitor(childState, turn))
+          .then((drain) => {
+            if (!drain) {
+              return undefined;
+            }
+            if (!turn.completed) {
+              turn.completed = true;
+              diagnostics.rolloutTurnsCompleted += 1;
+              if (!drain.complete) {
+                diagnostics.drainTimedOut = true;
+                diagnostics.partialReasons.add(`child_rollout_${drain.reason ?? "incomplete"}`);
+              }
+            }
+            return drain;
+          })
+          .catch((error: unknown) => {
+            diagnostics.drainTimedOut = true;
+            diagnostics.partialReasons.add("child_rollout_finalization_error");
+            embeddedAgentLog.debug("Codex child rollout finalization failed open", {
+              childThreadId: childState.childThreadId,
+              childTurnId: turn.childTurnId,
+              error: formatErrorMessage(error),
+            });
+            return undefined;
+          })
+      : Promise.resolve(undefined);
+    return turn.finalization;
+  }
+
+  private stopChildTurnDiagnosticMonitor(childState: ChildState, turn: ChildTurnDiagnostics): void {
+    try {
+      turn.monitor?.stop();
+    } catch (error) {
+      turn.diagnostics.partialReasons.add("child_rollout_monitor_stop_error");
+      embeddedAgentLog.debug("Codex child rollout monitor stop failed open", {
+        childThreadId: childState.childThreadId,
+        childTurnId: turn.childTurnId,
+        error: formatErrorMessage(error),
+      });
+    }
+  }
+
+  private stopDiagnosticTurnsForParent(parentTurnId: string): void {
+    for (const childState of this.childStates.values()) {
+      for (const [key, turn] of childState.diagnosticTurns) {
+        if (turn.parentTurnId !== parentTurnId) {
+          continue;
+        }
+        this.stopChildTurnDiagnosticMonitor(childState, turn);
+        childState.diagnosticTurns.delete(key);
+      }
+    }
+  }
+
+  private deleteCompletedDiagnosticTurnsForParent(parentTurnId: string): void {
+    for (const childState of this.childStates.values()) {
+      for (const [key, turn] of childState.diagnosticTurns) {
+        if (turn.parentTurnId === parentTurnId && turn.completed) {
+          childState.diagnosticTurns.delete(key);
+        }
+      }
+    }
+  }
+
   private markChildTurnStarted(notification: CodexServerNotification): void {
     if (notification.method !== "turn/started") {
       return;
@@ -253,6 +754,22 @@ export class CodexNativeSubagentMonitor {
     const childState = childThreadId ? this.childStates.get(childThreadId) : undefined;
     if (childState) {
       childState.settledWithoutCompletion = false;
+      childState.transcriptTerminal = false;
+      childState.completionObservedInParentMailbox = false;
+      const turn = isJsonObject(params?.turn) ? params.turn : undefined;
+      const childTurnId = readString(turn, "id")?.trim();
+      const state = this.parentStates.get(childState.parentThreadId);
+      if (state && childTurnId) {
+        this.recordChildLifecycle({
+          state,
+          childThreadId: childState.childThreadId,
+          childTurnId,
+          sourceEventId: `turn-started:${childState.childThreadId}:${childTurnId}`,
+          lifecycle: "turn_started",
+          sourceTimestampMs: readEventTimestampMs(params, turn),
+        });
+        this.startChildTurnDiagnostics(childState, childTurnId);
+      }
     }
   }
 
@@ -269,6 +786,22 @@ export class CodexNativeSubagentMonitor {
     const childState = childThreadId ? this.childStates.get(childThreadId) : undefined;
     if (childState) {
       childState.settledWithoutCompletion = true;
+      await Promise.all(
+        [...childState.diagnosticTurns.values()]
+          .filter((turn) => !turn.completed)
+          .map((turn) => this.finalizeChildTurnDiagnostics(childState, turn)),
+      );
+      const state = this.parentStates.get(childState.parentThreadId);
+      if (state) {
+        this.recordChildLifecycle({
+          state,
+          childThreadId: childState.childThreadId,
+          sourceEventId: `thread-system-error:${childState.childThreadId}:${readEventTimestampMs(params)}`,
+          lifecycle: "ended",
+          outcome: "failed",
+          sourceTimestampMs: readEventTimestampMs(params),
+        });
+      }
       await this.flushDeferredParentSettlements(childState.parentThreadId);
     }
   }
@@ -303,9 +836,17 @@ export class CodexNativeSubagentMonitor {
       const parentThreadId = readSpawnParentThreadId(thread);
       const childThreadId = thread ? readString(thread, "id")?.trim() : undefined;
       const agentPath = readSpawnAgentPath(thread);
+      const agentRole = readSpawnAgentRole(thread);
       const state = parentThreadId ? this.parentStates.get(parentThreadId) : undefined;
       if (state && childThreadId && parentThreadId) {
-        this.registerChildThread(parentThreadId, childThreadId, { agentPath });
+        this.registerChildThread(parentThreadId, childThreadId, { agentPath, agentRole });
+        this.recordChildLifecycle({
+          state,
+          childThreadId,
+          sourceEventId: `thread-started:${childThreadId}`,
+          lifecycle: "started",
+          sourceTimestampMs: readEventTimestampMs(params, thread),
+        });
       }
       return state;
     }
@@ -324,13 +865,26 @@ export class CodexNativeSubagentMonitor {
         // Codex multi-agent V2 exposes the child only through this parent-scoped
         // activity item; its later wait item has no receiver thread ids.
         if (
-          notification.method === "item/completed" &&
+          (notification.method === "item/started" || notification.method === "item/completed") &&
           readString(item, "type") === "subAgentActivity"
         ) {
           const childThreadId = readString(item, "agentThreadId")?.trim();
           if (childThreadId) {
+            // MultiAgentV2 uses the current collaboration call id for each activity.
+            // Persistent children must bind a later turn to that turn's send/assign tool.
+            const isSpawnActivity = normalizeToolName(readString(item, "kind")) === "started";
             this.registerChildThread(parentThreadId, childThreadId, {
               agentPath: readString(item, "agentPath"),
+              triggeringToolCallId: readString(item, "id"),
+            });
+            this.recordChildLifecycle({
+              state,
+              childThreadId,
+              sourceEventId:
+                readString(item, "id") ?? `subagent-activity:${parentThreadId}:${childThreadId}`,
+              lifecycle: isSpawnActivity ? "started" : "activity",
+              sourceTimestampMs: readEventTimestampMs(params, item),
+              preferCurrentTurn: true,
             });
           }
           return state;
@@ -343,7 +897,19 @@ export class CodexNativeSubagentMonitor {
             ])
           : new Set(readStringArray(item?.receiverThreadIds));
         for (const childThreadId of childThreadIds) {
-          this.registerChildThread(parentThreadId, childThreadId);
+          this.registerChildThread(
+            parentThreadId,
+            childThreadId,
+            isSpawnAgentTool ? { triggeringToolCallId: readString(item, "id") } : {},
+          );
+          this.recordChildLifecycle({
+            state,
+            childThreadId,
+            sourceEventId: `${readString(item, "id") ?? "collab-agent"}:${childThreadId}`,
+            lifecycle: "activity",
+            sourceTimestampMs: readEventTimestampMs(params, item),
+            preferCurrentTurn: true,
+          });
         }
       }
       return state;
@@ -364,12 +930,16 @@ export class CodexNativeSubagentMonitor {
         state.parentThreadId,
         nativeCompletion.agentPath,
       );
+      if (childThreadId) {
+        // V2 completion notifications are the last authoritative source for
+        // the path. Refresh state before emitting the terminal diagnostic so
+        // Langfuse can retain the role even when the activity item was raced.
+        this.registerChildThread(state.parentThreadId, childThreadId, {
+          agentPath: nativeCompletion.agentPath,
+        });
+      }
       const childState = childThreadId ? this.childStates.get(childThreadId) : undefined;
-      if (
-        !childState ||
-        childState.parentThreadId !== state.parentThreadId ||
-        childState.transcriptTerminal
-      ) {
+      if (!childState || childState.parentThreadId !== state.parentThreadId) {
         embeddedAgentLog.warn(
           "Ignoring Codex native subagent completion for unknown child thread",
           {
@@ -380,6 +950,14 @@ export class CodexNativeSubagentMonitor {
         continue;
       }
       const completion = toThreadCompletion(nativeCompletion, childState.childThreadId);
+      // Upstream emits this item only after get_pending_input drains the mailbox into this
+      // parent turn, via wait_agent or the next automatic model step. Enqueue alone emits none.
+      if (state.diagnostics) {
+        // Codex emits this trusted item only after the parent drains the child result from its
+        // mailbox. Preserve that fact across the parent final-drain race so OpenClaw does not
+        // enqueue a second requester-agent announce for a result the parent already consumed.
+        childState.completionObservedInParentMailbox = true;
+      }
       await this.processChildCompletion(state, childState, completion);
     }
   }
@@ -489,8 +1067,42 @@ export class CodexNativeSubagentMonitor {
     const childState = childThreadId ? this.childStates.get(childThreadId) : undefined;
     const state = childState ? this.parentStates.get(childState.parentThreadId) : undefined;
     const turn = isJsonObject(params?.turn) ? params.turn : undefined;
+    const childTurnId = turn ? readString(turn, "id")?.trim() : undefined;
+    if (state && childState && turn && childTurnId) {
+      const status = readString(turn, "status");
+      const recordTurnCompleted = () =>
+        this.recordChildLifecycle({
+          state,
+          childThreadId: childState.childThreadId,
+          childTurnId,
+          sourceEventId: `turn-completed:${childState.childThreadId}:${childTurnId}:${status ?? "unknown"}`,
+          lifecycle: "turn_completed",
+          sourceTimestampMs: readEventTimestampMs(params, turn),
+          outcome: childTurnOutcome(status),
+        });
+      this.startChildTurnDiagnostics(childState, childTurnId);
+      const diagnosticTurn = [...childState.diagnosticTurns.values()].find(
+        (candidate) => candidate.childTurnId === childTurnId,
+      );
+      if (diagnosticTurn) {
+        diagnosticTurn.finalization = this.finalizeChildTurnDiagnostics(
+          childState,
+          diagnosticTurn,
+        ).finally(recordTurnCompleted);
+        void diagnosticTurn.finalization.catch((error: unknown) => {
+          diagnosticTurn.diagnostics.partialReasons.add("child_rollout_finalization_error");
+          embeddedAgentLog.debug("Codex child rollout finalization failed open", {
+            childThreadId: childState.childThreadId,
+            childTurnId,
+            error: formatErrorMessage(error),
+          });
+        });
+      } else {
+        recordTurnCompleted();
+      }
+    }
     if (childState && turn && readString(turn, "status") === "interrupted") {
-      const turnId = readString(turn, "id");
+      const turnId = childTurnId;
       if (turnId) {
         childState.assistantMessagesByTurn.delete(turnId);
       }
@@ -566,6 +1178,21 @@ export class CodexNativeSubagentMonitor {
     completion: CodexNativeSubagentCompletion,
     eventAt: number = Date.now(),
   ): Promise<void> {
+    this.recordChildLifecycle({
+      state,
+      childThreadId: completion.childThreadId,
+      sourceEventId: `child-completion:${createHash("sha256")
+        .update(buildCompletionDedupeKey(state.parentThreadId, completion))
+        .digest("hex")}`,
+      lifecycle: "ended",
+      sourceTimestampMs: eventAt,
+      outcome:
+        completion.status === "succeeded"
+          ? "completed"
+          : completion.status === "cancelled"
+            ? "cancelled"
+            : "failed",
+    });
     this.finalizeCompletionTask(completion, eventAt);
     const childState = this.childStates.get(completion.childThreadId);
     if (childState) {
@@ -587,12 +1214,32 @@ export class CodexNativeSubagentMonitor {
     if (state.deliveredCompletionKeys.has(completionKey)) {
       return;
     }
+    if (childState?.completionObservedInParentMailbox) {
+      this.markMailboxCompletionDelivered(state, childState, completion, completionKey);
+      await this.flushDeferredParentSettlements(state.parentThreadId);
+      return;
+    }
     const deliveryState =
       childState ?? this.ensureChildState(state.parentThreadId, completion.childThreadId);
     deliveryState.pendingCompletion = completion;
     deliveryState.pendingCompletionEventAt = eventAt;
     this.markCompletionDeliveryPending(completion);
+    const activeParentTurn = state.diagnostics;
+    if (activeParentTurn && !activeParentTurn.finalizing && !activeParentTurn.finalized) {
+      // A child terminal event can race the parent's final model step. Hold it until the
+      // parent mailbox proves consumption or root finalization starts detached delivery.
+      return;
+    }
     await this.deliverPendingCompletion(state, deliveryState);
+  }
+
+  private deliverPendingCompletionsForParent(state: ParentState): void {
+    for (const childState of this.childStates.values()) {
+      if (childState.parentThreadId !== state.parentThreadId || !childState.pendingCompletion) {
+        continue;
+      }
+      void this.deliverPendingCompletion(state, childState);
+    }
   }
 
   private async deliverPendingCompletion(
@@ -612,6 +1259,10 @@ export class CodexNativeSubagentMonitor {
     }
     childState.deliveringCompletionKey = completionKey;
     try {
+      if (await this.observeMailboxCompletionInParentTranscript(state, childState, completion)) {
+        this.markMailboxCompletionDelivered(state, childState, completion, completionKey);
+        return;
+      }
       const delivery = await this.runtime.deliverAgentHarnessTaskCompletion({
         scope: state.taskRuntimeScope,
         childSessionKey: codexNativeSubagentRunId(completion.childThreadId),
@@ -652,6 +1303,56 @@ export class CodexNativeSubagentMonitor {
       childState.deliveringCompletionKey = undefined;
       await this.flushDeferredParentSettlements(state.parentThreadId);
     }
+  }
+
+  private markMailboxCompletionDelivered(
+    state: ParentState,
+    childState: ChildState,
+    completion: CodexNativeSubagentCompletion,
+    completionKey: string,
+  ): void {
+    if (childState.pendingCompletion) {
+      state.deliveredCompletionKeys.add(
+        buildCompletionDedupeKey(state.parentThreadId, childState.pendingCompletion),
+      );
+    }
+    state.deliveredCompletionKeys.add(completionKey);
+    childState.pendingCompletion = undefined;
+    childState.pendingCompletionEventAt = undefined;
+    if (childState.completionDeliveryTimer) {
+      clearTimeout(childState.completionDeliveryTimer);
+      childState.completionDeliveryTimer = undefined;
+    }
+    this.markCompletionDeliveryDelivered(completion);
+  }
+
+  private async observeMailboxCompletionInParentTranscript(
+    state: ParentState,
+    childState: ChildState,
+    completion: CodexNativeSubagentCompletion,
+  ): Promise<boolean> {
+    const codexHome = this.codexHome;
+    const agentPath = childState.agentPath;
+    if (!codexHome || !agentPath) {
+      return false;
+    }
+    const transcriptPath =
+      state.transcriptPath ??
+      (await findTranscriptPath({ codexHome, childThreadId: state.parentThreadId }));
+    if (!transcriptPath) {
+      return false;
+    }
+    state.transcriptPath = transcriptPath;
+    const observed = await transcriptHasMailboxCompletion({
+      transcriptPath,
+      agentPath,
+      completion,
+      observedAfter: childState.pendingCompletionEventAt,
+    });
+    if (observed) {
+      childState.completionObservedInParentMailbox = true;
+    }
+    return observed;
   }
 
   private markCompletionDeliveryPending(
@@ -776,7 +1477,12 @@ export class CodexNativeSubagentMonitor {
   private registerChildThread(
     parentThreadId: string,
     childThreadId: string,
-    options: { agentPath?: string; scheduleTranscriptPoll?: boolean } = {},
+    options: {
+      agentPath?: string;
+      agentRole?: string;
+      scheduleTranscriptPoll?: boolean;
+      triggeringToolCallId?: string;
+    } = {},
   ): void {
     const normalizedParentThreadId = parentThreadId.trim();
     const normalizedChildThreadId = childThreadId.trim();
@@ -789,6 +1495,7 @@ export class CodexNativeSubagentMonitor {
       normalizedChildThreadId,
     );
     const agentPath = normalizeOptionalString(options.agentPath);
+    const agentRole = normalizeOptionalString(options.agentRole);
     const state = this.parentStates.get(normalizedParentThreadId);
     if (state?.mirror && (this.codexHome || agentPath)) {
       state.mirror.markAuthoritativeCompletionExpected(normalizedChildThreadId);
@@ -804,13 +1511,29 @@ export class CodexNativeSubagentMonitor {
       childState = {
         childThreadId: normalizedChildThreadId,
         parentThreadId: normalizedParentThreadId,
+        ...(agentPath ? { agentPath } : {}),
+        ...(agentRole ? { agentRole } : {}),
+        ...(options.triggeringToolCallId
+          ? { triggeringToolCallId: options.triggeringToolCallId }
+          : {}),
         assistantMessagesByTurn: new Map<string, ChildAssistantMessages>(),
         transcriptPollAttempt: 0,
         transcriptTerminal: false,
         completionDeliveryAttempt: 0,
         settledWithoutCompletion: false,
+        completionObservedInParentMailbox: false,
+        diagnosticTurns: new Map<string, ChildTurnDiagnostics>(),
       };
       this.childStates.set(normalizedChildThreadId, childState);
+    }
+    if (agentPath) {
+      childState.agentPath = agentPath;
+    }
+    if (agentRole) {
+      childState.agentRole = agentRole;
+    }
+    if (options.triggeringToolCallId) {
+      childState.triggeringToolCallId = options.triggeringToolCallId;
     }
     if (options.scheduleTranscriptPoll !== false) {
       this.scheduleTranscriptPoll(childState);
@@ -906,6 +1629,10 @@ export class CodexNativeSubagentMonitor {
       this.taskRowReconcileTimer = undefined;
     }
     for (const childState of this.childStates.values()) {
+      for (const turn of childState.diagnosticTurns.values()) {
+        this.stopChildTurnDiagnosticMonitor(childState, turn);
+      }
+      childState.diagnosticTurns.clear();
       if (childState.transcriptPollTimer) {
         clearTimeout(childState.transcriptPollTimer);
         childState.transcriptPollTimer = undefined;
@@ -1243,6 +1970,13 @@ function readSpawnAgentPath(thread: JsonObject | undefined): string | undefined 
   return readString(spawn, "agent_path")?.trim();
 }
 
+function readSpawnAgentRole(thread: JsonObject | undefined): string | undefined {
+  const source = isJsonObject(thread?.source) ? thread.source : undefined;
+  const subAgent = isJsonObject(source?.subAgent) ? source.subAgent : undefined;
+  const spawn = isJsonObject(subAgent?.thread_spawn) ? subAgent.thread_spawn : undefined;
+  return readString(spawn, "agent_role")?.trim() || readString(thread, "agentRole")?.trim();
+}
+
 function readString(record: JsonObject | undefined, key: string): string | undefined {
   const value = record?.[key];
   return typeof value === "string" ? value : undefined;
@@ -1441,6 +2175,68 @@ async function readTranscriptCompletion(
   return completion;
 }
 
+async function transcriptHasMailboxCompletion(params: {
+  transcriptPath: string;
+  agentPath: string;
+  completion: CodexNativeSubagentCompletion;
+  observedAfter?: number;
+}): Promise<boolean> {
+  let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
+  let contents: string;
+  try {
+    handle = await fs.open(params.transcriptPath, "r");
+    const stat = await handle.stat();
+    const length = Math.min(stat.size, PARENT_TRANSCRIPT_TAIL_MAX_BYTES);
+    const buffer = Buffer.alloc(length);
+    await handle.read(buffer, 0, length, stat.size - length);
+    contents = buffer.toString("utf8");
+  } catch {
+    return false;
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+  for (const line of contents.split(/\r?\n/u)) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      continue;
+    }
+    let entry: JsonValue;
+    try {
+      entry = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    if (!isJsonObject(entry) || readString(entry, "type") !== "response_item") {
+      continue;
+    }
+    const observedAt = readTimestamp(entry);
+    if (params.observedAfter !== undefined && observedAt !== undefined) {
+      if (observedAt < params.observedAfter) {
+        continue;
+      }
+    }
+    const item = isJsonObject(entry.payload) ? entry.payload : undefined;
+    if (!item) {
+      continue;
+    }
+    const completions = extractCodexNativeSubagentCompletions({
+      method: "rawResponseItem/completed",
+      params: { item },
+    });
+    if (
+      completions.some(
+        (candidate) =>
+          candidate.agentPath === params.agentPath &&
+          candidate.status === params.completion.status &&
+          candidate.result === params.completion.result,
+      )
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function readTranscriptParentThreadId(payload: JsonObject): string | undefined {
   const source = isJsonObject(payload.source) ? payload.source : undefined;
   const subagent =
@@ -1465,6 +2261,58 @@ function readTimestamp(entry: JsonObject): number | undefined {
   }
   const parsed = Date.parse(timestamp);
   return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function boundedDiagnosticId(value: string): string {
+  const normalized = value.trim();
+  if (normalized.length <= MAX_NATIVE_CHILD_ID_CHARS) {
+    return normalized;
+  }
+  return `${normalized.slice(0, 128)}:${createHash("sha256").update(normalized).digest("hex")}`;
+}
+
+function boundedOptionalDiagnosticId(value: string | undefined): string | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  return boundedDiagnosticId(value) || undefined;
+}
+
+function diagnosticTurnKey(parentTurnId: string, childTurnId: string): string {
+  return `${parentTurnId}\u0000${childTurnId}`;
+}
+
+function readEventTimestampMs(...records: Array<JsonObject | undefined>): number {
+  for (const record of records) {
+    if (!record) {
+      continue;
+    }
+    for (const key of ["completedAtMs", "startedAtMs", "occurredAtMs", "createdAtMs"] as const) {
+      const value = readNumber(record, key);
+      if (value !== undefined) {
+        return value;
+      }
+    }
+  }
+  return Date.now();
+}
+
+function childTurnOutcome(
+  status: string | undefined,
+): "completed" | "failed" | "cancelled" | "interrupted" | "timed_out" | undefined {
+  if (status === "completed") {
+    return "completed";
+  }
+  if (status === "failed") {
+    return "failed";
+  }
+  if (status === "cancelled") {
+    return "cancelled";
+  }
+  if (status === "interrupted") {
+    return "interrupted";
+  }
+  return status === "timedOut" || status === "timed_out" ? "timed_out" : undefined;
 }
 
 function unrefTimer(timer: ReturnType<typeof setTimeout>): void {

@@ -266,7 +266,7 @@ describe("SdkDeliveryTracker", () => {
     await expect(tracker.awaitTrace("trace-1", watermark, 20)).resolves.toEqual({ ok: true });
   });
 
-  it("does not infer the private processed subset from a multi-item callback", async () => {
+  it("settles every attributable item in one successful SDK batch", async () => {
     const tracker = new SdkDeliveryTracker();
     tracker.begin("trace-1", "observation-1");
     tracker.begin("trace-1", "observation-2");
@@ -277,9 +277,23 @@ describe("SdkDeliveryTracker", () => {
       flushItem("trace-1", "observation-2"),
     ]);
 
+    await expect(tracker.awaitTrace("trace-1", watermark, 20)).resolves.toEqual({ ok: true });
+  });
+
+  it("fails every attributable item in one failed SDK batch", async () => {
+    const tracker = new SdkDeliveryTracker();
+    tracker.begin("trace-1", "observation-1");
+    tracker.begin("trace-1", "observation-2");
+    const watermark = tracker.watermark("trace-1");
+
+    tracker.noteFlush(
+      [flushItem("trace-1", "observation-1"), flushItem("trace-1", "observation-2")],
+      new Error("batch failed"),
+    );
+
     await expect(tracker.awaitTrace("trace-1", watermark, 20)).resolves.toEqual({
       ok: false,
-      reason: "delivery timeout",
+      reason: "delivery failed",
     });
   });
 
@@ -403,13 +417,13 @@ describe("SdkDeliveryTracker", () => {
     }
   });
 
-  it("waits for every one-event automatic flush plus the explicit final flush", async () => {
+  it("drains a high-observation turn through attributable five-event batches", async () => {
     const langfuse = new Langfuse({
       publicKey: "pk-test",
       secretKey: "sk-test",
       baseUrl: "http://langfuse.invalid",
       fetchRetryCount: 0,
-      flushAt: 1,
+      flushAt: 5,
       flushInterval: 0,
     });
     const fetchMock = vi.fn(async () => ({
@@ -421,7 +435,7 @@ describe("SdkDeliveryTracker", () => {
     (langfuse as unknown as { fetch: typeof fetchMock }).fetch = fetchMock;
     const tracker = new SdkDeliveryTracker();
     const cleanups = bindSdkDeliveryTracker(langfuse, tracker);
-    for (let index = 0; index < 5; index += 1) {
+    for (let index = 0; index < 12; index += 1) {
       const observationId = `observation-${index}`;
       expect(tracker.begin("trace-count-batch", observationId)).toBe(true);
       langfuse.generation({
@@ -435,8 +449,78 @@ describe("SdkDeliveryTracker", () => {
     await expect(
       flushSdkDeliveryThroughWatermark(langfuse, tracker, "trace-count-batch", watermark, 500),
     ).resolves.toEqual({ ok: true });
-    expect(fetchMock).toHaveBeenCalledTimes(5);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    for (const call of fetchMock.mock.calls) {
+      const payload = JSON.parse(String((call[1] as { body?: string } | undefined)?.body)) as {
+        batch?: unknown[];
+      };
+      expect(payload.batch?.length).toBeGreaterThan(0);
+      expect(payload.batch?.length).toBeLessThanOrEqual(5);
+    }
 
+    for (const cleanup of cleanups) {
+      cleanup();
+    }
+  });
+
+  it("keeps at most one five-event ingestion request active", async () => {
+    const langfuse = new Langfuse({
+      publicKey: "pk-test",
+      secretKey: "sk-test",
+      baseUrl: "http://langfuse.invalid",
+      fetchRetryCount: 0,
+      flushAt: 5,
+      flushInterval: 0,
+    });
+    const fetchResolvers: Array<() => void> = [];
+    let activeFetches = 0;
+    let maxActiveFetches = 0;
+    const fetchMock = vi.fn(
+      async () =>
+        await new Promise<{
+          status: number;
+          json: () => Promise<Record<string, never>>;
+          text: () => Promise<string>;
+          arrayBuffer: () => Promise<ArrayBuffer>;
+        }>((resolve) => {
+          activeFetches += 1;
+          maxActiveFetches = Math.max(maxActiveFetches, activeFetches);
+          fetchResolvers.push(() => {
+            activeFetches -= 1;
+            resolve({
+              status: 200,
+              json: async () => ({}),
+              text: async () => "",
+              arrayBuffer: async () => new ArrayBuffer(0),
+            });
+          });
+        }),
+    );
+    (langfuse as unknown as { fetch: typeof fetchMock }).fetch = fetchMock;
+    const tracker = new SdkDeliveryTracker();
+    const cleanups = bindSdkDeliveryTracker(langfuse, tracker);
+    for (let index = 0; index < 10; index += 1) {
+      const observationId = `serialized-observation-${index}`;
+      tracker.begin("trace-serialized", observationId);
+      langfuse.generation({
+        id: observationId,
+        traceId: "trace-serialized",
+        name: `llm-call-${index + 1}`,
+      });
+    }
+    const watermark = tracker.watermark("trace-serialized");
+
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect(maxActiveFetches).toBe(1);
+    fetchResolvers.shift()?.();
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    expect(maxActiveFetches).toBe(1);
+    fetchResolvers.shift()?.();
+
+    await expect(
+      flushSdkDeliveryThroughWatermark(langfuse, tracker, "trace-serialized", watermark, 500),
+    ).resolves.toEqual({ ok: true });
+    expect(maxActiveFetches).toBe(1);
     for (const cleanup of cleanups) {
       cleanup();
     }
@@ -496,7 +580,7 @@ describe("SdkDeliveryTracker", () => {
     });
   });
 
-  it("keeps a retry failed when its failed callback arrives before the old success", async () => {
+  it("keeps a serialized retry failed after the old delivery settles", async () => {
     const tracker = new SdkDeliveryTracker();
     const callbacks: Array<(error?: unknown, items?: unknown) => void> = [];
     const originalFlush = vi.fn((callback?: (error?: unknown, items?: unknown) => void) => {
@@ -514,10 +598,10 @@ describe("SdkDeliveryTracker", () => {
     expect(tracker.begin("trace-1", "observation-1")).toBe(true);
     const retryWatermark = tracker.watermark("trace-1");
     langfuse.flush();
-    expect(callbacks).toHaveLength(2);
-
-    callbacks[1]?.(new Error("retry failed"), [flushItem("trace-1", "observation-1")]);
+    expect(callbacks).toHaveLength(1);
     callbacks[0]?.(undefined, [flushItem("trace-1", "observation-1")]);
+    expect(callbacks).toHaveLength(2);
+    callbacks[1]?.(new Error("retry failed"), [flushItem("trace-1", "observation-1")]);
 
     await expect(tracker.awaitTrace("trace-1", retryWatermark, 20)).resolves.toEqual({
       ok: false,
@@ -528,7 +612,7 @@ describe("SdkDeliveryTracker", () => {
     }
   });
 
-  it("keeps a retry successful when its success callback arrives before the old failure", async () => {
+  it("keeps a serialized retry successful after the old delivery fails", async () => {
     const tracker = new SdkDeliveryTracker();
     const callbacks: Array<(error?: unknown, items?: unknown) => void> = [];
     const originalFlush = vi.fn((callback?: (error?: unknown, items?: unknown) => void) => {
@@ -546,10 +630,10 @@ describe("SdkDeliveryTracker", () => {
     expect(tracker.begin("trace-1", "observation-1")).toBe(true);
     const retryWatermark = tracker.watermark("trace-1");
     langfuse.flush();
-    expect(callbacks).toHaveLength(2);
-
-    callbacks[1]?.(undefined, [flushItem("trace-1", "observation-1")]);
+    expect(callbacks).toHaveLength(1);
     callbacks[0]?.(new Error("old request failed"), [flushItem("trace-1", "observation-1")]);
+    expect(callbacks).toHaveLength(2);
+    callbacks[1]?.(undefined, [flushItem("trace-1", "observation-1")]);
 
     await expect(tracker.awaitTrace("trace-1", retryWatermark, 20)).resolves.toEqual({
       ok: true,
@@ -672,9 +756,10 @@ describe("SdkDeliveryTracker", () => {
       expect(tracker.begin("trace-1", "observation-1")).toBe(true);
       const retryWatermark = tracker.watermark("trace-1");
       langfuse.flush();
-      expect(callbacks).toHaveLength(2);
+      expect(callbacks).toHaveLength(1);
 
       callbacks[0]?.(undefined, [flushItem("trace-1", "observation-1")]);
+      expect(callbacks).toHaveLength(2);
       vi.useRealTimers();
       await expect(tracker.awaitTrace("trace-1", retryWatermark, 20)).resolves.toEqual({
         ok: false,
@@ -747,7 +832,7 @@ describe("SdkDeliveryTracker", () => {
     }
   });
 
-  it("settles overlapping flushes for one observation when the second callback wins the race", async () => {
+  it("serializes overlapping automatic flush triggers", async () => {
     const tracker = new SdkDeliveryTracker();
     const callbacks: Array<(error?: unknown, items?: unknown) => void> = [];
     const originalFlush = vi.fn((callback?: (error?: unknown, items?: unknown) => void) => {
@@ -764,10 +849,11 @@ describe("SdkDeliveryTracker", () => {
     tracker.begin("trace-1", "observation-1");
     const secondWatermark = tracker.watermark("trace-1");
     langfuse.flush();
-    expect(callbacks).toHaveLength(2);
+    expect(callbacks).toHaveLength(1);
 
-    callbacks[1]?.(undefined, [flushItem("trace-1", "observation-1")]);
     callbacks[0]?.(undefined, [flushItem("trace-1", "observation-1")]);
+    await vi.waitFor(() => expect(callbacks).toHaveLength(2));
+    callbacks[1]?.(undefined, [flushItem("trace-1", "observation-1")]);
 
     await expect(tracker.awaitTrace("trace-1", firstWatermark, 20)).resolves.toEqual({
       ok: true,
@@ -780,7 +866,7 @@ describe("SdkDeliveryTracker", () => {
     }
   });
 
-  it("keeps overlapping flush failure assigned to the second ticket", async () => {
+  it("keeps a serialized second flush failure assigned to the second ticket", async () => {
     const tracker = new SdkDeliveryTracker();
     const callbacks: Array<(error?: unknown, items?: unknown) => void> = [];
     const originalFlush = vi.fn((callback?: (error?: unknown, items?: unknown) => void) => {
@@ -797,10 +883,11 @@ describe("SdkDeliveryTracker", () => {
     tracker.begin("trace-1", "observation-1");
     const secondWatermark = tracker.watermark("trace-1");
     langfuse.flush();
-    expect(callbacks).toHaveLength(2);
+    expect(callbacks).toHaveLength(1);
 
-    callbacks[1]?.(new Error("second flush failed"), [flushItem("trace-1", "observation-1")]);
     callbacks[0]?.(undefined, [flushItem("trace-1", "observation-1")]);
+    await vi.waitFor(() => expect(callbacks).toHaveLength(2));
+    callbacks[1]?.(new Error("second flush failed"), [flushItem("trace-1", "observation-1")]);
 
     await expect(tracker.awaitTrace("trace-1", firstWatermark, 20)).resolves.toEqual({
       ok: true,
@@ -833,10 +920,17 @@ describe("SdkDeliveryTracker", () => {
     const tracker = new SdkDeliveryTracker();
     const cleanups = bindSdkDeliveryTracker(langfuse, tracker);
     tracker.begin("trace-207", "observation-207");
+    tracker.begin("trace-207", "observation-207-b");
     langfuse.generation({
       id: "observation-207",
       traceId: "trace-207",
       name: "llm-call-1",
+      model: "test-model",
+    });
+    langfuse.generation({
+      id: "observation-207-b",
+      traceId: "trace-207",
+      name: "llm-call-2",
       model: "test-model",
     });
     const watermark = tracker.watermark("trace-207");

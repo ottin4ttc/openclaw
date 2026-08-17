@@ -42,21 +42,27 @@ export function generateTraceId(sessionKey: string, timestamp: number): string {
 }
 
 /**
- * Generate a deterministic observation ID for a generation or span.
+ * Generate a deterministic observation ID for a generation, tool span, or native child.
  * - Generations: `${traceId}-gen-${N}` where N is 1-based call index
  * - Spans: `${traceId}-span-${toolCallId}`
+ * - Native children: `${traceId}-native-child-${childThreadId}`
  */
 export function generateObservationId(traceId: string, type: "gen", index: number): string;
 export function generateObservationId(traceId: string, type: "span", toolCallId: string): string;
 export function generateObservationId(
   traceId: string,
-  type: "gen" | "span",
+  type: "native-child",
+  childThreadId: string,
+): string;
+export function generateObservationId(
+  traceId: string,
+  type: "gen" | "span" | "native-child",
   indexOrToolCallId: number | string,
 ): string {
   if (type === "gen") {
     return `${traceId}-gen-${indexOrToolCallId}`;
   }
-  return `${traceId}-span-${indexOrToolCallId}`;
+  return `${traceId}-${type}-${indexOrToolCallId}`;
 }
 
 /**

@@ -1,12 +1,16 @@
-/**
- * Extracts native Codex subagent completion notifications from trusted
- * inter-agent commentary messages emitted by the app-server.
- */
-import type { CodexServerNotification, JsonObject, JsonValue } from "./protocol.js";
+/** Extracts native Codex subagent completions from trusted agent messages. */
+import type { CodexServerNotification, JsonObject } from "./protocol.js";
 import { isJsonObject } from "./protocol.js";
 
-const CODEX_SUBAGENT_NOTIFICATION_START = "<subagent_notification>";
-const CODEX_SUBAGENT_NOTIFICATION_END = "</subagent_notification>";
+const FINAL_ANSWER_HEADER = "Message Type: FINAL_ANSWER";
+const TASK_NAME_PREFIX = "Task name: ";
+const SENDER_PREFIX = "Sender: ";
+const PAYLOAD_HEADER = "Payload:";
+const ERROR_PREFIX = "Agent errored: ";
+const ERROR_NEXT_ACTION =
+  "This agent's turn failed. If you still need this agent, use the available collaboration tools to give it another task.";
+const SHUTDOWN_PAYLOAD = "Agent shut down.";
+const NOT_FOUND_PAYLOAD = "Agent was not found.";
 
 /** Terminal status values OpenClaw accepts for Codex native subagent completion. */
 export type CodexNativeSubagentCompletionStatus = "succeeded" | "failed" | "cancelled";
@@ -31,218 +35,78 @@ export type CodexNativeSubagentNotificationCompletion = CodexNativeSubagentCompl
 export function extractCodexNativeSubagentCompletions(
   notification: CodexServerNotification,
 ): CodexNativeSubagentNotificationCompletion[] {
+  if (notification.method !== "rawResponseItem/completed") {
+    return [];
+  }
   const params = isJsonObject(notification.params) ? notification.params : undefined;
-  if (!params) {
+  const item = params && isJsonObject(params.item) ? params.item : undefined;
+  if (!item || readString(item, "type") !== "agent_message") {
     return [];
   }
-  const item = isJsonObject(params.item) ? params.item : undefined;
-  if (!item) {
+  const author = readString(item, "author")?.trim();
+  const recipient = readString(item, "recipient")?.trim();
+  const text = extractSingleInputTextPart(item);
+  if (!author || !recipient || !text) {
     return [];
   }
-  const text = readTrustedInterAgentCommunicationContent(item);
-  if (!text) {
+  const envelope = parseFinalAnswerEnvelope(text);
+  if (!envelope || envelope.sender !== author || envelope.taskName !== recipient) {
     return [];
   }
-  const author = readTrustedInterAgentCommunicationAuthor(item);
-  return extractCodexNativeSubagentCompletionsFromText(text).filter(
-    (completion) => completion.agentPath === author,
-  );
+  return [{ agentPath: author, ...completionDetailsFromPayload(envelope.payload) }];
 }
 
-/** Parses one or more tagged subagent completion payloads from commentary text. */
-export function extractCodexNativeSubagentCompletionsFromText(
+function parseFinalAnswerEnvelope(
   text: string,
-): CodexNativeSubagentNotificationCompletion[] {
-  const completions: CodexNativeSubagentNotificationCompletion[] = [];
-  let cursor = 0;
-  while (cursor < text.length) {
-    const start = text.indexOf(CODEX_SUBAGENT_NOTIFICATION_START, cursor);
-    if (start < 0) {
-      break;
-    }
-    const bodyStart = start + CODEX_SUBAGENT_NOTIFICATION_START.length;
-    const end = text.indexOf(CODEX_SUBAGENT_NOTIFICATION_END, bodyStart);
-    if (end < 0) {
-      break;
-    }
-    const parsed = parseCodexNativeSubagentNotificationBody(text.slice(bodyStart, end));
-    if (parsed) {
-      completions.push(parsed);
-    }
-    cursor = end + CODEX_SUBAGENT_NOTIFICATION_END.length;
+): { taskName: string; sender: string; payload: string } | undefined {
+  const lines = text.replace(/\r\n/gu, "\n").split("\n");
+  if (
+    lines[0] !== FINAL_ANSWER_HEADER ||
+    !lines[1]?.startsWith(TASK_NAME_PREFIX) ||
+    !lines[2]?.startsWith(SENDER_PREFIX) ||
+    lines[3] !== PAYLOAD_HEADER
+  ) {
+    return undefined;
   }
-  return completions;
+  const taskName = lines[1].slice(TASK_NAME_PREFIX.length).trim();
+  const sender = lines[2].slice(SENDER_PREFIX.length).trim();
+  if (!taskName || !sender) {
+    return undefined;
+  }
+  return { taskName, sender, payload: lines.slice(4).join("\n").trim() };
 }
 
-function parseCodexNativeSubagentNotificationBody(
-  body: string,
-): CodexNativeSubagentNotificationCompletion | undefined {
-  let payload: JsonValue;
-  try {
-    payload = JSON.parse(body.trim());
-  } catch {
-    return undefined;
+function completionDetailsFromPayload(payload: string): CodexNativeSubagentCompletionDetails {
+  if (payload === SHUTDOWN_PAYLOAD) {
+    return { status: "cancelled", statusLabel: "shutdown", result: SHUTDOWN_PAYLOAD };
   }
-  if (!isJsonObject(payload)) {
-    return undefined;
+  if (payload === NOT_FOUND_PAYLOAD) {
+    return { status: "failed", statusLabel: "not_found", result: NOT_FOUND_PAYLOAD };
   }
-  const agentPath = readString(payload, "agent_path")?.trim();
-  const status = isJsonObject(payload.status) ? payload.status : undefined;
-  if (!agentPath || !status) {
-    return undefined;
+  if (payload.startsWith(ERROR_PREFIX)) {
+    const suffix = `\n\n${ERROR_NEXT_ACTION}`;
+    const error = payload
+      .slice(ERROR_PREFIX.length, payload.endsWith(suffix) ? -suffix.length : undefined)
+      .trim();
+    return { status: "failed", statusLabel: "errored", result: error || "(no output)" };
   }
-  const statusEntry = readCompletionStatus(status);
-  if (!statusEntry) {
-    return undefined;
-  }
-  return {
-    agentPath,
-    status: statusEntry.status,
-    statusLabel: statusEntry.label,
-    result: statusEntry.result,
-  };
-}
-
-function readCompletionStatus(status: JsonObject):
-  | {
-      status: CodexNativeSubagentCompletionStatus;
-      label: string;
-      result: string;
-    }
-  | undefined {
-  for (const [rawKey, value] of Object.entries(status)) {
-    const normalized = normalizeStatusKey(rawKey);
-    const mappedStatus = mapCompletionStatus(normalized);
-    if (!mappedStatus) {
-      continue;
-    }
-    const result = stringifyResult(value, mappedStatus);
-    const noFinalAssistantMessage =
-      mappedStatus === "succeeded" && result.kind === "no_final_assistant_message";
+  if (!payload) {
     return {
-      status: mappedStatus,
-      label: noFinalAssistantMessage ? "completed_without_final_message" : rawKey,
-      result: result.text,
+      status: "succeeded",
+      statusLabel: "completed_without_final_message",
+      result: "Codex native subagent completed without a final assistant message.",
     };
   }
-  return undefined;
+  return { status: "succeeded", statusLabel: "completed", result: payload };
 }
 
-function mapCompletionStatus(value: string): CodexNativeSubagentCompletionStatus | undefined {
-  if (value === "completed" || value === "succeeded" || value === "success") {
-    return "succeeded";
-  }
-  if (
-    value === "cancelled" ||
-    value === "canceled" ||
-    value === "interrupted" ||
-    value === "shutdown"
-  ) {
-    return "cancelled";
-  }
-  if (
-    value === "failed" ||
-    value === "error" ||
-    value === "errored" ||
-    value === "systemerror" ||
-    value === "notfound"
-  ) {
-    return "failed";
-  }
-  return undefined;
-}
-
-function stringifyResult(
-  value: JsonValue | undefined,
-  status: CodexNativeSubagentCompletionStatus,
-): {
-  text: string;
-  kind?: "no_final_assistant_message";
-} {
-  if (typeof value === "string") {
-    const text = value.trim();
-    if (text) {
-      return { text };
-    }
-    return status === "succeeded"
-      ? completedWithoutFinalAssistantMessage()
-      : { text: "(no output)" };
-  }
-  if (value === null || value === undefined) {
-    return status === "succeeded"
-      ? completedWithoutFinalAssistantMessage()
-      : { text: "(no output)" };
-  }
-  try {
-    return { text: JSON.stringify(value) };
-  } catch {
-    return { text: "(unserializable output)" };
-  }
-}
-
-function completedWithoutFinalAssistantMessage(): {
-  text: string;
-  kind: "no_final_assistant_message";
-} {
-  return {
-    text: "Codex native subagent completed without a final assistant message.",
-    kind: "no_final_assistant_message",
-  };
-}
-
-function readTrustedInterAgentCommunicationContent(item: JsonObject): string | undefined {
-  const communication = readTrustedInterAgentCommunication(item);
-  return typeof communication?.content === "string" ? communication.content : undefined;
-}
-
-function readTrustedInterAgentCommunicationAuthor(item: JsonObject): string | undefined {
-  const communication = readTrustedInterAgentCommunication(item);
-  return typeof communication?.author === "string" ? communication.author : undefined;
-}
-
-function readTrustedInterAgentCommunication(item: JsonObject): JsonObject | undefined {
-  if (
-    readString(item, "type") !== "message" ||
-    readString(item, "role") !== "assistant" ||
-    readString(item, "phase") !== "commentary"
-  ) {
-    return undefined;
-  }
-  const text = extractSingleTextPart(item);
-  if (!text) {
-    return undefined;
-  }
-  let parsed: JsonValue;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    return undefined;
-  }
-  if (!isJsonObject(parsed)) {
-    return undefined;
-  }
-  if (
-    typeof parsed.author !== "string" ||
-    typeof parsed.recipient !== "string" ||
-    typeof parsed.content !== "string" ||
-    parsed.trigger_turn !== false
-  ) {
-    return undefined;
-  }
-  return parsed;
-}
-
-function extractSingleTextPart(item: JsonObject): string | undefined {
+function extractSingleInputTextPart(item: JsonObject): string | undefined {
   const content = item.content;
   if (!Array.isArray(content) || content.length !== 1) {
     return undefined;
   }
   const [entry] = content;
-  if (!isJsonObject(entry)) {
-    return undefined;
-  }
-  const type = readString(entry, "type");
-  if (type !== "output_text" && type !== "text") {
+  if (!isJsonObject(entry) || readString(entry, "type") !== "input_text") {
     return undefined;
   }
   return readString(entry, "text")?.trim();
@@ -251,8 +115,4 @@ function extractSingleTextPart(item: JsonObject): string | undefined {
 function readString(record: JsonObject, key: string): string | undefined {
   const value = record[key];
   return typeof value === "string" ? value : undefined;
-}
-
-function normalizeStatusKey(value: string): string {
-  return value.replace(/[^a-z0-9]/giu, "").toLowerCase();
 }

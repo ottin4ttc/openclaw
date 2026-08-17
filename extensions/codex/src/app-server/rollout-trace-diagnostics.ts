@@ -9,7 +9,8 @@ import type { CodexAppServerClient } from "./client.js";
 
 type TrustedDiagnosticEventInput = Parameters<typeof emitTrustedDiagnosticEventWithPrivateData>[0];
 type ModelCallStartedInput = Extract<TrustedDiagnosticEventInput, { type: "model.call.started" }>;
-type RolloutTraceModelBaseFields = Omit<
+type ModelCallPromptStats = NonNullable<ModelCallStartedInput["promptStats"]>;
+export type RolloutTraceModelBaseFields = Omit<
   ModelCallStartedInput,
   "callId" | "scope" | "startTimeMs" | "type"
 >;
@@ -18,7 +19,7 @@ type RolloutTraceLog = {
   debug(message: string, data?: Record<string, unknown>): void;
 };
 
-type RolloutTraceContentCapture = {
+export type RolloutTraceContentCapture = {
   inputMessages?: boolean;
   outputMessages?: boolean;
   systemPrompt?: boolean;
@@ -62,6 +63,7 @@ type RawTracePayload = {
   error?: unknown;
   reason?: unknown;
   tool_call_id?: unknown;
+  model_visible_call_id?: unknown;
   invocation_payload?: unknown;
   result_payload?: unknown;
   status?: unknown;
@@ -97,6 +99,7 @@ type InferenceTerminal = {
 type ToolStarted = {
   event: RawTraceEvent;
   callId: string;
+  modelVisibleCallId?: string;
   invocationPayloadRef?: RawPayloadRef;
 };
 
@@ -178,7 +181,7 @@ const rolloutTraceClientBundles = new WeakMap<
 >();
 export const CODEX_ROLLOUT_TRACE_ROOT_ENV_VAR = "CODEX_ROLLOUT_TRACE_ROOT";
 
-type RolloutTraceDiagnosticsParams = {
+export type RolloutTraceDiagnosticsParams = {
   traceRoot?: string;
   threadId: string;
   turnId: string;
@@ -1115,6 +1118,7 @@ async function emitTraceBundleDiagnostics(params: {
         toolStartedByCallId.set(toolCallId, {
           event,
           callId: toolCallId,
+          modelVisibleCallId: stringValue(payload.model_visible_call_id),
           invocationPayloadRef: asPayloadRef(payload.invocation_payload),
         });
       }
@@ -1187,9 +1191,38 @@ async function emitTraceBundleDiagnostics(params: {
       })
       .map((callId, index) => [callId, index + 1]),
   );
+  const responsePayloadsByInferenceCallId = new Map<string, unknown>();
+  const inferenceCallIdByModelVisibleCallId = new Map<string, string>();
+  const ambiguousModelVisibleCallIds = new Set<string>();
+  for (const terminal of terminalByCallId.values()) {
+    const responsePayload = await readPayloadJson(params.bundleDir, terminal.responsePayloadRef);
+    responsePayloadsByInferenceCallId.set(terminal.callId, responsePayload);
+    for (const modelVisibleCallId of responseToolCallIds(responsePayload)) {
+      const existing = inferenceCallIdByModelVisibleCallId.get(modelVisibleCallId);
+      if (existing && existing !== terminal.callId) {
+        ambiguousModelVisibleCallIds.add(modelVisibleCallId);
+        inferenceCallIdByModelVisibleCallId.delete(modelVisibleCallId);
+        continue;
+      }
+      if (!ambiguousModelVisibleCallIds.has(modelVisibleCallId)) {
+        inferenceCallIdByModelVisibleCallId.set(modelVisibleCallId, terminal.callId);
+      }
+    }
+  }
+  const triggeringProviderCallIdsByToolCallId = new Map<string, string>();
+  for (const toolStarted of toolStartedByCallId.values()) {
+    const modelVisibleCallId = toolStarted.modelVisibleCallId;
+    const inferenceCallId = modelVisibleCallId
+      ? inferenceCallIdByModelVisibleCallId.get(modelVisibleCallId)
+      : undefined;
+    if (inferenceCallId) {
+      triggeringProviderCallIdsByToolCallId.set(toolStarted.callId, inferenceCallId);
+    }
+  }
 
   let emitted = 0;
   const bundleKey = path.resolve(params.bundleDir);
+  const promptStatsByCallId = new Map<string, ModelCallPromptStats | undefined>();
   for (const event of events.toSorted((left, right) => eventSeq(left) - eventSeq(right))) {
     const payload = asObject(event.payload) as RawTracePayload | undefined;
     if (!payload || !matchesTraceTurn(event, payload, params.threadId, params.turnId)) {
@@ -1210,6 +1243,8 @@ async function emitTraceBundleDiagnostics(params: {
       // Request form is lifecycle provenance, not optional content capture. Read the
       // bounded local payload for classification, then export content only per capture.
       const requestPayload = await readPayloadJson(params.bundleDir, started.requestPayloadRef);
+      const promptStats = modelRequestPromptStats(requestPayload);
+      promptStatsByCallId.set(callId, promptStats);
       const startedContent = buildTraceModelContent({
         capture: params.capture,
         requestPayload,
@@ -1227,6 +1262,7 @@ async function emitTraceBundleDiagnostics(params: {
           ...baseFields,
           startTimeMs: eventWallTimeMs(started.event),
           providerRequestIndex: providerRequestIndexes.get(callId),
+          ...(promptStats ? { promptStats } : {}),
           ...requestEvidence,
           rolloutSourceOrder: rolloutTraceSourceOrder(started.event),
         } as TrustedDiagnosticEventInput,
@@ -1248,6 +1284,12 @@ async function emitTraceBundleDiagnostics(params: {
         continue;
       }
       const started = startedByCallId.get(terminal.callId);
+      let promptStats = promptStatsByCallId.get(terminal.callId);
+      if (promptStats === undefined && started) {
+        const requestPayload = await readPayloadJson(params.bundleDir, started.requestPayloadRef);
+        promptStats = modelRequestPromptStats(requestPayload);
+        promptStatsByCallId.set(terminal.callId, promptStats);
+      }
       const terminalStart = resolveTerminalOnlyStart(terminal.event, terminal.payload);
       const startEvent = started?.event;
       const syntheticStartEventKey = `${bundleKey}:inference-started:${terminal.callId}`;
@@ -1265,12 +1307,13 @@ async function emitTraceBundleDiagnostics(params: {
           syntheticStart: true,
           startTimeSource: terminalStart.startTimeSource,
           providerRequestIndex: providerRequestIndexes.get(terminal.callId),
+          ...(promptStats ? { promptStats } : {}),
           rolloutSourceOrder: rolloutTraceSourceOrder(terminal.event),
         } as TrustedDiagnosticEventInput);
         params.emittedEventKeys.add(syntheticStartEventKey);
         emitted += 1;
       }
-      const responsePayload = await readPayloadJson(params.bundleDir, terminal.responsePayloadRef);
+      const responsePayload = responsePayloadsByInferenceCallId.get(terminal.callId);
       const usage = extractTraceTokenUsage(responsePayload);
       const completedContent = buildTraceModelContent({
         capture: params.capture,
@@ -1294,6 +1337,7 @@ async function emitTraceBundleDiagnostics(params: {
             : terminalStart.durationMs,
           usageSource: usage ? "provider" : "unknown",
           providerRequestIndex: providerRequestIndexes.get(terminal.callId),
+          ...(promptStats ? { promptStats } : {}),
           ...(terminal.responseId
             ? {
                 responseIdHash: fingerprintCodexLogValue(
@@ -1346,6 +1390,7 @@ async function emitTraceBundleDiagnostics(params: {
             tool,
             toolCallId,
             event: toolStarted.event,
+            triggeringProviderCallId: triggeringProviderCallIdsByToolCallId.get(toolCallId),
           }),
           rolloutSourceOrder: rolloutTraceSourceOrder(toolStarted.event),
         } as TrustedDiagnosticEventInput,
@@ -1385,6 +1430,7 @@ async function emitTraceBundleDiagnostics(params: {
             tool,
             toolCallId,
             event: startEvent,
+            triggeringProviderCallId: triggeringProviderCallIdsByToolCallId.get(toolCallId),
           }),
           syntheticStart: !toolStarted,
           startTimeSource: toolStarted ? "source" : terminalStart.startTimeSource,
@@ -1423,6 +1469,11 @@ async function emitTraceBundleDiagnostics(params: {
       sourceTimestampMs: eventWallTimeMs(toolTerminal.event),
       durationMs,
       rolloutSourceOrder: rolloutTraceSourceOrder(toolTerminal.event),
+      ...(triggeringProviderCallIdsByToolCallId.get(toolCallId)
+        ? {
+            triggeringProviderCallId: triggeringProviderCallIdsByToolCallId.get(toolCallId),
+          }
+        : {}),
     };
     if (toolTerminal.status === "completed") {
       emitTrustedDiagnosticEventWithPrivateData(
@@ -1493,6 +1544,11 @@ async function emitTraceBundleDiagnostics(params: {
           errorCategory: "codex_native_tool_missing_terminal",
           errorCode: "tool_terminal_missing",
           terminalReason: "failed",
+          ...(triggeringProviderCallIdsByToolCallId.get(toolCallId)
+            ? {
+                triggeringProviderCallId: triggeringProviderCallIdsByToolCallId.get(toolCallId),
+              }
+            : {}),
         } as TrustedDiagnosticEventInput,
         Object.keys(toolContent).length > 0 ? { toolContent } : undefined,
       );
@@ -1687,10 +1743,18 @@ function toolDiagnosticBaseFields(baseFields: RolloutTraceModelBaseFields) {
   const runId = stringValue(baseFields.runId);
   const sessionKey = stringValue(baseFields.sessionKey);
   const sessionId = stringValue(baseFields.sessionId);
+  const agentId = stringValue(baseFields.agentId);
+  const nativeChildThreadId = stringValue(baseFields.nativeChildThreadId);
+  const nativeChildTurnId = stringValue(baseFields.nativeChildTurnId);
+  const parentTurnId = stringValue(baseFields.parentTurnId);
   return {
     ...(runId ? { runId } : {}),
     ...(sessionKey ? { sessionKey } : {}),
     ...(sessionId ? { sessionId } : {}),
+    ...(agentId ? { agentId } : {}),
+    ...(nativeChildThreadId ? { nativeChildThreadId } : {}),
+    ...(nativeChildTurnId ? { nativeChildTurnId } : {}),
+    ...(parentTurnId ? { parentTurnId } : {}),
   };
 }
 
@@ -1699,6 +1763,7 @@ function toolStartedDiagnosticFields(params: {
   tool: { name: string; input: unknown };
   toolCallId: string;
   event?: RawTraceEvent;
+  triggeringProviderCallId?: string;
 }) {
   const startTimeMs = params.event ? eventWallTimeMs(params.event) : undefined;
   return {
@@ -1709,8 +1774,29 @@ function toolStartedDiagnosticFields(params: {
     toolOwner: "codex-rollout-trace",
     toolCallId: params.toolCallId,
     paramsSummary: summarizeToolInput(params.tool.input),
+    ...(params.triggeringProviderCallId
+      ? { triggeringProviderCallId: params.triggeringProviderCallId }
+      : {}),
     ...(startTimeMs !== undefined ? { startTimeMs, sourceTimestampMs: startTimeMs } : {}),
   };
+}
+
+function responseToolCallIds(responsePayload: unknown): Set<string> {
+  const response = asObject(responsePayload);
+  const outputItems = Array.isArray(response?.output_items) ? response.output_items : [];
+  const callIds = new Set<string>();
+  for (const value of outputItems) {
+    const item = asObject(value);
+    const type = stringValue(item?.type);
+    if (type !== "function_call" && type !== "custom_tool_call") {
+      continue;
+    }
+    const callId = stringValue(item?.call_id);
+    if (callId) {
+      callIds.add(callId);
+    }
+  }
+  return callIds;
 }
 
 function toolStartedPrivateData(
@@ -2451,6 +2537,115 @@ function buildTraceModelContent(params: {
       : {}),
   };
   return Object.keys(content).length > 0 ? content : undefined;
+}
+
+function jsonCharacterLength(value: unknown): number | undefined {
+  try {
+    const serialized = JSON.stringify(value);
+    return serialized === undefined ? undefined : serialized.length;
+  } catch {
+    return undefined;
+  }
+}
+
+function inputInstructionText(message: unknown): string | undefined {
+  const record = asObject(message);
+  const role = stringValue(record?.role)?.trim().toLowerCase();
+  if (role !== "system" && role !== "developer") {
+    return undefined;
+  }
+  if (typeof record?.content === "string") {
+    return record.content;
+  }
+  if (!Array.isArray(record?.content)) {
+    return undefined;
+  }
+  const parts = record.content.flatMap((part) => {
+    if (typeof part === "string") {
+      return [part];
+    }
+    const text = stringValue(asObject(part)?.text);
+    return text === undefined ? [] : [text];
+  });
+  return parts.length > 0 ? parts.join("") : undefined;
+}
+
+function modelRequestSystemPrompt(
+  request: Record<string, unknown>,
+): { source: "instructions" | "input_messages"; text: string } | undefined {
+  const instructions = typeof request.instructions === "string" ? request.instructions : undefined;
+  if (instructions?.trim()) {
+    return { source: "instructions", text: instructions };
+  }
+  const inputInstructions = Array.isArray(request.input)
+    ? request.input.flatMap((message) => {
+        const text = inputInstructionText(message);
+        return text === undefined ? [] : [text];
+      })
+    : [];
+  return inputInstructions.length > 0
+    ? { source: "input_messages", text: inputInstructions.join("\n") }
+    : undefined;
+}
+
+function modelRequestPromptStats(requestPayload: unknown): ModelCallPromptStats | undefined {
+  const request = asObject(requestPayload);
+  if (!request) {
+    return undefined;
+  }
+  const messages = Array.isArray(request.input) ? request.input : undefined;
+  const tools = Array.isArray(request.tools) ? request.tools : undefined;
+  const systemPrompt = modelRequestSystemPrompt(request);
+  const inputMessagesChars = jsonCharacterLength(messages);
+  const toolDefinitionsChars = jsonCharacterLength(tools);
+  const systemPromptChars = systemPrompt?.text.length;
+  if (
+    messages === undefined &&
+    tools === undefined &&
+    systemPromptChars === undefined &&
+    inputMessagesChars === undefined &&
+    toolDefinitionsChars === undefined
+  ) {
+    return undefined;
+  }
+  const totalChars =
+    (inputMessagesChars ?? 0) +
+    (systemPrompt?.source === "instructions" ? (systemPromptChars ?? 0) : 0) +
+    (toolDefinitionsChars ?? 0);
+  return {
+    ...(messages ? { inputMessagesCount: messages.length } : {}),
+    ...(inputMessagesChars !== undefined ? { inputMessagesChars } : {}),
+    ...(messages
+      ? {
+          inputMessagesHash: fingerprintCodexLogValue(
+            "openclaw:codex:child-input:v1",
+            JSON.stringify(messages) ?? "",
+          ),
+        }
+      : {}),
+    ...(systemPrompt
+      ? { systemPromptSource: systemPrompt.source, systemPromptChars: systemPrompt.text.length }
+      : {}),
+    ...(systemPrompt !== undefined
+      ? {
+          systemPromptHash: fingerprintCodexLogValue(
+            "openclaw:codex:child-system-prompt:v1",
+            systemPrompt.text,
+          ),
+        }
+      : {}),
+    ...(tools ? { toolDefinitionsCount: tools.length } : {}),
+    ...(toolDefinitionsChars !== undefined ? { toolDefinitionsChars } : {}),
+    ...(tools
+      ? {
+          toolDefinitionsHash: fingerprintCodexLogValue(
+            "openclaw:codex:child-tools:v1",
+            JSON.stringify(tools) ?? "",
+          ),
+        }
+      : {}),
+    totalChars,
+  };
 }
 
 function providerRequestEvidence(requestPayload: unknown): {

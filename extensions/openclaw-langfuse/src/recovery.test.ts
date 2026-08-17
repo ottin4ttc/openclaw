@@ -180,6 +180,75 @@ describe("recoverTrace", () => {
     return dir;
   }
 
+  it("recovers an independent child trace as explicitly partial without using root transcript", async () => {
+    const stateDir = makeStateDir();
+    const agentId = "agent-child-recovery";
+    const sessionId = "session-child-recovery";
+    const traceId = "child-trace-recovery";
+    expect(
+      writeTraceMarker(stateDir, agentId, sessionId, "start", traceId, undefined, {
+        startedAt: Date.parse("2026-08-15T01:00:00.000Z"),
+        traceKind: "native-child",
+        sessionKey: "agent:agent-child-recovery:conversation-1",
+        parentTraceId: "root-trace-recovery",
+        spawnObservationId: "root-spawn-recovery",
+        childThreadId: "child-thread-recovery",
+        childTurnId: "child-turn-recovery",
+      }),
+    ).toBe(true);
+    const lf = createLangfuseMock();
+
+    await expect(
+      recoverTrace(
+        lf.lf as never,
+        {
+          agentId,
+          sessionId,
+          traceId,
+          jsonlPath: path.join(stateDir, "agents", agentId, "sessions", `${sessionId}.jsonl`),
+        },
+        { redactEnabled: false, baseUrl: "http://localhost:3000/" },
+        stateDir,
+      ),
+    ).resolves.toBe(0);
+
+    expect(resolveTranscriptSessionKeyBySessionId).not.toHaveBeenCalled();
+    expect(lf.trace).toHaveBeenCalledWith({
+      id: traceId,
+      name: "agent-child-recovery:native-child:recovered",
+      sessionId: "agent:agent-child-recovery:conversation-1",
+      input: {
+        actorKind: "native-child",
+        agentId: "agent-child-recovery",
+        childThreadId: "child-thread-recovery",
+        childTurnId: "child-turn-recovery",
+        recoveryStatus: "partial",
+      },
+      output: {
+        outcome: "partial",
+        reason: "child_observation_payload_unavailable",
+      },
+      metadata: {
+        actorKind: "native-child",
+        source: "startup-recovery",
+        recoveryStatus: "partial",
+        recoveryReason: "child_observation_payload_unavailable",
+        parentTraceId: "root-trace-recovery",
+        parentTraceUrl: "http://localhost:3000/trace/root-trace-recovery",
+        spawnObservationId: "root-spawn-recovery",
+        childTraceId: traceId,
+        childThreadId: "child-thread-recovery",
+        childTurnId: "child-turn-recovery",
+      },
+    });
+    expect(readTraceLedgerTrace(stateDir, traceId)).toMatchObject({
+      traceKind: "native-child",
+      status: "ended",
+      parentTraceId: "root-trace-recovery",
+      childTurnId: "child-turn-recovery",
+    });
+  });
+
   it("finds an incomplete trace whose start marker is older than the ledger tail", () => {
     const stateDir = makeStateDir();
     const agentId = "agent-1";

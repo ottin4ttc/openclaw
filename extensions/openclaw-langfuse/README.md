@@ -16,6 +16,9 @@ Captures LLM call chains as structured Langfuse traces and optionally injects pr
 - **Codex provider diagnostics** -- When explicitly enabled by the host
   diagnostics content policy, Codex rollout traces can add provider-request
   input/output evidence to the same Langfuse generation.
+- **Optional native-child lineage** -- Bundled Codex app-server diagnostics can
+  add one correlated trace per native-child turn, with proven model/tool
+  ownership, without adding a public plugin hook.
 
 ## Installation
 
@@ -150,16 +153,85 @@ Prompts fetched from Langfuse can include template variables:
 
 ## Trace Structure
 
-Each agent turn produces a trace like:
+One conversation uses one Langfuse session. Root and native-child actor turns
+use independent traces:
 
 ```
-Trace (agent turn)
- +-- Generation (llm-call-1: model, input/output, tokens, prompt link)
- +-- Span (tool:read_file, params, result, duration)
- +-- Generation (llm-call-2: model, input/output, tokens, prompt link)
- +-- Span (tool:web_search, params, result, duration)
- +-- Generation (llm-call-3: final answer)
+Langfuse session (OpenClaw conversation)
+ +-- Root trace (one user-message-to-final-response turn)
+ |    +-- Generation (llm-call-1)
+ |    +-- Span (tool:collaboration.spawn_agent)
+ |         metadata.childTraceId -> child trace
+ +-- Child trace A (one child thread + turn)
+ |    +-- Generation (llm-call-1)
+ |    +-- Span (child tool call)
+ +-- Child trace B (one child thread + turn)
+      +-- Generation (llm-call-1)
 ```
+
+The root spawn observation and child trace carry reciprocal `parentTraceId`,
+`spawnObservationId`, `childTraceId`, `childThreadId`, and `childTurnId`
+metadata. `parentObservationId` is used only within one trace. Reusing a
+persistent child thread for a later child turn creates a new child trace.
+Joined and detached children use the same topology; a detached child trace may
+finalize after its root trace without reopening the root.
+
+### Native-child lineage states
+
+Native-child enrichment requires no plugin config key. OpenClaw 2026.7.1's
+bundled Codex app-server monitor emits versioned internal lifecycle/status
+diagnostics and drains exact child `threadId + turnId` rollout evidence. No
+ACP/ACPX transport or public `native_child_event` hook is involved. If those
+internal diagnostics are absent, the plugin keeps parent-only tracing and
+records `unsupported`. The plugin never infers a child from event order, role,
+model, nickname, prompt, or task text.
+
+Trace metadata reports `nativeChildLineage` with one of these states:
+
+| State         | Meaning                                                                                                                                            |
+| ------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `complete`    | The producer proved start/terminal and call ownership, the final drain completed, and no admitted event or relationship was dropped or unresolved. |
+| `partial`     | Some child evidence is usable, but terminal coverage, ownership, delivery, bounds, drain, or producer health is incomplete.                        |
+| `unsupported` | No compatible Codex native-child diagnostics were observed; the parent-only trace remains authoritative.                                           |
+
+Root metadata also includes child, admitted, duplicate, dropped, observation
+mutation, and pending-ownership counters plus bounded partial reasons. A tool
+with a proven triggering provider call is parented beneath that generation. If
+only the child owner is proven, the tool is attached directly to the child
+trace and marked `partial_parenting = true`. No cross-trace parent or
+event-order parent is invented.
+
+Each materialized child trace summarizes its exact provider requests as
+`requestCount`, `firstRequest`, and `latestRequest`. Prompt statistics identify
+whether the effective child system instructions came from top-level Responses
+`instructions` or Responses Lite `system`/`developer` input messages, and expose
+only `systemPromptSource`, character count, and a namespaced hash. Raw child
+system prompts and conversation history are not copied into observation
+metadata.
+
+Child history follows Codex `spawn_agent` semantics. `fork_turns = "none"`
+creates a fresh child with its task and role instructions, omitted or `"all"`
+inherits the full parent history, and a positive integer string inherits the
+most recent parent turns. Langfuse records the spawn arguments and exact child
+request summaries; it does not infer inherited history from prompt size or
+message order.
+
+Native-child telemetry is bounded per turn to 64 active children, 4,096
+lifecycle/call mutations, 16,384 UTF-8 metadata bytes per event, and 512
+pending ownership joins. The runtime performs one final drain of at most 500
+milliseconds. Excess or incomplete evidence degrades lineage to `partial`
+without changing the OpenClaw reply, Codex result, child result, or tool
+outcome.
+
+A child fact received after that child trace finalizes does not reopen the
+trace or create a replacement trace. A detached-child fact received after only
+the root finalized remains admissible to the still-active child trace.
+Langfuse delivery failures, missing credentials, shutdown, and plugin unload
+remain fail-open for Agent execution.
+
+To roll back enrichment, disable its internal diagnostic consumption or disable
+the Langfuse plugin. Existing parent traces, generations, and tool spans
+continue to work in parent-only mode.
 
 ## Acceptance testing
 
@@ -171,15 +243,17 @@ same trace ID.
 
 For every live acceptance run:
 
-1. Fetch `/api/public/traces/<trace-id>` and verify the trace input, final
-   output, session identity, and top-level metadata expected by the scenario.
-2. Fetch `/api/public/observations?traceId=<trace-id>&limit=100` and verify the
-   expected generation and tool-span counts.
+1. Fetch `/api/public/traces/<root-trace-id>` and its linked child trace IDs;
+   verify all traces use the same session identity and reciprocal correlation
+   metadata.
+2. Fetch `/api/public/observations?traceId=<trace-id>&limit=100` for the root
+   and every child trace; verify trace-local `llm-call-N` and tool counts.
 3. Require every completed observation to have `input`, `output` or a
    classified terminal error, and `endTime`. Require generations to retain the
    available model and usage fields.
-4. Require every tool span's `parentObservationId` to resolve to the provider
-   generation that triggered it, with no orphan or duplicate observations.
+4. Require every `parentObservationId` to resolve inside the same trace. A
+   child tool without proven provider ownership must have no parent and must
+   carry `partial_parenting = true`.
 5. For real-time behavior, query the observations API while the turn is still
    running and confirm started generations appear before `agent_end`.
 

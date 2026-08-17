@@ -23,6 +23,12 @@ export type TraceLedgerTraceRecord = {
   sessionId: string;
   startedAt: number;
   status: "open" | "ended" | "abandoned";
+  traceKind?: "root" | "native-child";
+  sessionKey?: string;
+  parentTraceId?: string;
+  spawnObservationId?: string;
+  childThreadId?: string;
+  childTurnId?: string;
   correlationKey?: string;
   recoveryAttempts?: number;
   recoveryOutcome?: TraceRecoveryOutcome;
@@ -207,7 +213,16 @@ export function writeTraceMarker(
   type: "start" | "end",
   traceId: string,
   logger?: MinimalLogger | null,
-  options?: { correlationKey?: string; startedAt?: number },
+  options?: {
+    correlationKey?: string;
+    startedAt?: number;
+    traceKind?: "root" | "native-child";
+    sessionKey?: string;
+    parentTraceId?: string;
+    spawnObservationId?: string;
+    childThreadId?: string;
+    childTurnId?: string;
+  },
 ): boolean {
   if (!sessionId) {
     return true;
@@ -225,6 +240,24 @@ export function writeTraceMarker(
       sessionId,
       startedAt,
       status,
+      ...(options?.traceKind || existing?.traceKind
+        ? { traceKind: options?.traceKind ?? existing?.traceKind }
+        : {}),
+      ...(options?.sessionKey || existing?.sessionKey
+        ? { sessionKey: options?.sessionKey ?? existing?.sessionKey }
+        : {}),
+      ...(options?.parentTraceId || existing?.parentTraceId
+        ? { parentTraceId: options?.parentTraceId ?? existing?.parentTraceId }
+        : {}),
+      ...(options?.spawnObservationId || existing?.spawnObservationId
+        ? { spawnObservationId: options?.spawnObservationId ?? existing?.spawnObservationId }
+        : {}),
+      ...(options?.childThreadId || existing?.childThreadId
+        ? { childThreadId: options?.childThreadId ?? existing?.childThreadId }
+        : {}),
+      ...(options?.childTurnId || existing?.childTurnId
+        ? { childTurnId: options?.childTurnId ?? existing?.childTurnId }
+        : {}),
       ...(options?.correlationKey || existing?.correlationKey
         ? { correlationKey: options?.correlationKey ?? existing?.correlationKey }
         : {}),
@@ -267,6 +300,12 @@ export function writeTraceRecoveryMarker(
       sessionId,
       startedAt: existing?.startedAt ?? Date.now(),
       status: outcome === "abandoned" ? "abandoned" : (existing?.status ?? "open"),
+      ...(existing?.traceKind ? { traceKind: existing.traceKind } : {}),
+      ...(existing?.sessionKey ? { sessionKey: existing.sessionKey } : {}),
+      ...(existing?.parentTraceId ? { parentTraceId: existing.parentTraceId } : {}),
+      ...(existing?.spawnObservationId ? { spawnObservationId: existing.spawnObservationId } : {}),
+      ...(existing?.childThreadId ? { childThreadId: existing.childThreadId } : {}),
+      ...(existing?.childTurnId ? { childTurnId: existing.childTurnId } : {}),
       ...(existing?.correlationKey ? { correlationKey: existing.correlationKey } : {}),
       recoveryAttempts: Math.max(attempt, existing?.recoveryAttempts ?? 0),
       recoveryOutcome: outcome,

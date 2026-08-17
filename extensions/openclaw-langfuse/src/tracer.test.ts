@@ -38,62 +38,148 @@ const {
   sessionTranscriptRuntime,
   sessionStoreRuntime,
 } = vi.hoisted(() => {
-  let activeTraceId: string | undefined;
-  let activeGenerationId: string | undefined;
-  let activeSpanId: string | undefined;
+  let invocationTraceId: string | undefined;
+  let invocationGenerationId: string | undefined;
+  let invocationSpanId: string | undefined;
   let nextFlushError: unknown;
   const queue: Array<{ type: string; body: Record<string, unknown> }> = [];
   const pendingFlushCallbacks: Array<() => void> = [];
   let pausedFlushCount = 0;
   let pauseAllFlushes = false;
+  let configuredFlushAt = 1;
   const enqueue = (type: string, body: Record<string, unknown>): void => {
     queue.push({ type, body });
     mockLangfuseInstance.flush();
+  };
+  const withObservationContext = <T>(
+    context: { traceId?: string; generationId?: string; spanId?: string },
+    action: () => T,
+  ): T => {
+    const previous = {
+      traceId: invocationTraceId,
+      generationId: invocationGenerationId,
+      spanId: invocationSpanId,
+    };
+    invocationTraceId = context.traceId;
+    invocationGenerationId = context.generationId;
+    invocationSpanId = context.spanId;
+    try {
+      return action();
+    } finally {
+      invocationTraceId = previous.traceId;
+      invocationGenerationId = previous.generationId;
+      invocationSpanId = previous.spanId;
+    }
   };
   const mockSpan = {
     update: vi.fn((body?: Record<string, unknown>) => {
       enqueue("span-update", {
         ...body,
-        ...(activeSpanId ? { id: activeSpanId } : {}),
-        ...(activeTraceId ? { traceId: activeTraceId } : {}),
+        ...(invocationSpanId ? { id: invocationSpanId } : {}),
+        ...(invocationTraceId ? { traceId: invocationTraceId } : {}),
       });
     }),
     end: vi.fn(),
+    generation: vi.fn((body?: Record<string, unknown>) => {
+      const generationId = typeof body?.id === "string" ? body.id : undefined;
+      enqueue("generation-create", {
+        ...(body ?? {}),
+        ...(invocationSpanId ? { parentObservationId: invocationSpanId } : {}),
+        ...(invocationTraceId ? { traceId: invocationTraceId } : {}),
+      });
+      return generationClient(invocationTraceId, generationId);
+    }),
+    span: vi.fn((body?: Record<string, unknown>) => {
+      const spanId = typeof body?.id === "string" ? body.id : undefined;
+      enqueue("span-create", {
+        ...(body ?? {}),
+        ...(invocationSpanId ? { parentObservationId: invocationSpanId } : {}),
+        ...(invocationTraceId ? { traceId: invocationTraceId } : {}),
+      });
+      return spanClient(invocationTraceId, spanId);
+    }),
   };
   const mockGeneration = {
     update: vi.fn((body?: Record<string, unknown>) => {
       enqueue("generation-update", {
         ...body,
-        ...(activeGenerationId ? { id: activeGenerationId } : {}),
-        ...(activeTraceId ? { traceId: activeTraceId } : {}),
+        ...(invocationGenerationId ? { id: invocationGenerationId } : {}),
+        ...(invocationTraceId ? { traceId: invocationTraceId } : {}),
       });
     }),
     end: vi.fn(),
-    span: vi.fn().mockReturnValue(mockSpan),
+    span: vi.fn((body?: Record<string, unknown>) => {
+      const spanId = typeof body?.id === "string" ? body.id : undefined;
+      enqueue("span-create", {
+        ...(body ?? {}),
+        ...(invocationGenerationId ? { parentObservationId: invocationGenerationId } : {}),
+        ...(invocationTraceId ? { traceId: invocationTraceId } : {}),
+      });
+      return spanClient(invocationTraceId, spanId);
+    }),
   };
   const mockTrace = {
     generation: vi.fn((body?: Record<string, unknown>) => {
-      activeGenerationId = typeof body?.id === "string" ? body.id : activeGenerationId;
+      const generationId = typeof body?.id === "string" ? body.id : undefined;
       enqueue("generation-create", {
         ...(body ?? {}),
-        ...(activeTraceId ? { traceId: activeTraceId } : {}),
+        ...(invocationTraceId ? { traceId: invocationTraceId } : {}),
       });
-      return mockGeneration;
+      return generationClient(invocationTraceId, generationId);
     }),
     span: vi.fn((body?: Record<string, unknown>) => {
-      activeSpanId = typeof body?.id === "string" ? body.id : activeSpanId;
+      const spanId = typeof body?.id === "string" ? body.id : undefined;
       enqueue("span-create", {
         ...(body ?? {}),
-        ...(activeTraceId ? { traceId: activeTraceId } : {}),
+        ...(invocationTraceId ? { traceId: invocationTraceId } : {}),
       });
-      return mockSpan;
+      return spanClient(invocationTraceId, spanId);
     }),
     update: vi.fn((body?: Record<string, unknown>) => {
-      enqueue("trace-create", { ...body, ...(activeTraceId ? { id: activeTraceId } : {}) });
+      enqueue("trace-create", {
+        ...body,
+        ...(invocationTraceId ? { id: invocationTraceId } : {}),
+      });
     }),
   };
+  function generationClient(traceId?: string, generationId?: string) {
+    return {
+      update: vi.fn((body?: Record<string, unknown>) =>
+        withObservationContext({ traceId, generationId }, () => mockGeneration.update(body)),
+      ),
+      end: mockGeneration.end,
+      span: vi.fn((body?: Record<string, unknown>) =>
+        withObservationContext({ traceId, generationId }, () => mockGeneration.span(body)),
+      ),
+    };
+  }
+  function spanClient(traceId?: string, spanId?: string) {
+    return {
+      update: vi.fn((body?: Record<string, unknown>) =>
+        withObservationContext({ traceId, spanId }, () => mockSpan.update(body)),
+      ),
+      end: mockSpan.end,
+      generation: vi.fn((body?: Record<string, unknown>) =>
+        withObservationContext({ traceId, spanId }, () => mockSpan.generation(body)),
+      ),
+      span: vi.fn((body?: Record<string, unknown>) =>
+        withObservationContext({ traceId, spanId }, () => mockSpan.span(body)),
+      ),
+    };
+  }
+  function traceClient(traceId?: string) {
+    return {
+      generation: (body?: Record<string, unknown>) =>
+        withObservationContext({ traceId }, () => mockTrace.generation(body)),
+      span: (body?: Record<string, unknown>) =>
+        withObservationContext({ traceId }, () => mockTrace.span(body)),
+      update: (body?: Record<string, unknown>) =>
+        withObservationContext({ traceId }, () => mockTrace.update(body)),
+    };
+  }
   const sdkEvents = {
     listeners: new Map<string, Array<(payload: unknown) => void>>(),
+    delivered: [] as Array<{ type: string; body: Record<string, unknown> }>,
     on: vi.fn((event: string, listener: (payload: unknown) => void) => {
       const listeners = sdkEvents.listeners.get(event) ?? [];
       listeners.push(listener);
@@ -131,8 +217,8 @@ const {
       pendingFlushCallbacks.shift()?.();
     },
     releaseAllFlushes(): void {
-      for (const callback of pendingFlushCallbacks.splice(0)) {
-        callback();
+      while (pendingFlushCallbacks.length > 0) {
+        pendingFlushCallbacks.shift()?.();
       }
     },
     failNextFlush(error: unknown): void {
@@ -141,9 +227,10 @@ const {
     clear(): void {
       sdkEvents.listeners.clear();
       queue.length = 0;
-      activeTraceId = undefined;
-      activeGenerationId = undefined;
-      activeSpanId = undefined;
+      sdkEvents.delivered.length = 0;
+      invocationTraceId = undefined;
+      invocationGenerationId = undefined;
+      invocationSpanId = undefined;
       nextFlushError = undefined;
       pendingFlushCallbacks.length = 0;
       pausedFlushCount = 0;
@@ -152,13 +239,13 @@ const {
   };
   const mockLangfuseInstance = {
     trace: vi.fn((body?: Record<string, unknown>) => {
-      activeTraceId = typeof body?.id === "string" ? body.id : activeTraceId;
+      const traceId = typeof body?.id === "string" ? body.id : undefined;
       enqueue("trace-create", body ?? {});
-      return mockTrace;
+      return traceClient(traceId);
     }),
     shutdownAsync: vi.fn().mockResolvedValue(undefined),
     flush: vi.fn((callback?: (error?: unknown, items?: unknown) => void) => {
-      const items = queue.splice(0, 1);
+      const items = queue.splice(0, configuredFlushAt);
       if (items.length === 0) {
         callback?.();
         return;
@@ -170,6 +257,9 @@ const {
           sdkEvents.emit("warning", error);
         }
         callback?.(error, items);
+        if (error == null) {
+          sdkEvents.delivered.push(...items);
+        }
         sdkEvents.emit("flush", items);
       };
       if (pauseAllFlushes || pausedFlushCount > 0) {
@@ -190,7 +280,8 @@ const {
     getPrompt: vi.fn(),
     on: sdkEvents.on,
   };
-  const mockLangfuseConstructor = vi.fn(function () {
+  const mockLangfuseConstructor = vi.fn(function (params?: { flushAt?: number }) {
+    configuredFlushAt = params?.flushAt ?? 1;
     return mockLangfuseInstance;
   });
   const diagnosticRuntime: {
@@ -797,11 +888,11 @@ describe("LangfuseService tracer", () => {
     }
   });
 
-  it("flushes each bounded event separately for the self-hosted proxy", async () => {
+  it("uses bounded batches for the self-hosted proxy", async () => {
     const service = await startService();
 
     expect(mockLangfuseConstructor).toHaveBeenCalledWith(
-      expect.objectContaining({ flushAt: 1, flushInterval: 1000 }),
+      expect.objectContaining({ flushAt: 5, flushInterval: 1000 }),
     );
     await service.stop?.(makeServiceCtx());
   });
@@ -7521,5 +7612,1787 @@ describe("LangfuseService tracer", () => {
     const spanArgs = mockTrace.span.mock.calls.at(-1)?.[0] as Record<string, unknown>;
     expect((spanArgs.startTime as Date).getTime()).toBe(5_000);
     await service.stop?.(makeServiceCtx());
+  });
+
+  it("keeps concurrent native child turns in independent traces with same-trace parenting", async () => {
+    const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "langfuse-native-children-"));
+    const service = await startService(config, undefined, { stateDir });
+    const handlers = service.getHookHandlers();
+    const ctx = { ...agentCtx, runId: "native-run-1" };
+    handlers.beforeAgentRun({ prompt: "delegate", messages: [] }, ctx);
+
+    for (const [index, childThreadId] of ["child-a", "child-b"].entries()) {
+      const childTurnId = `${childThreadId}-turn-1`;
+      diagnosticRuntime.listener?.({
+        type: "model.call.started",
+        runId: ctx.runId,
+        callId: `root-spawn-call-${index + 1}`,
+        providerRequestIndex: index + 1,
+        sessionKey: ctx.sessionKey,
+        sessionId: ctx.sessionId,
+        agentId: ctx.agentId,
+        provider: "openai",
+        model: "gpt-5.6-sol",
+        runtime: "codex",
+        startTimeMs: 900 + index * 10,
+      });
+      diagnosticRuntime.listener?.({
+        type: "tool.execution.started",
+        runId: ctx.runId,
+        sessionKey: ctx.sessionKey,
+        sessionId: ctx.sessionId,
+        agentId: ctx.agentId,
+        toolCallId: `spawn-tool-${index + 1}`,
+        toolName: "collaboration.spawn_agent",
+        toolOwner: "codex-rollout-trace",
+        startTimeMs: 950 + index * 10,
+        triggeringProviderCallId: `root-spawn-call-${index + 1}`,
+      });
+      diagnosticRuntime.listener?.({
+        type: "codex.native_child.lifecycle",
+        version: 1,
+        runId: ctx.runId,
+        sessionKey: ctx.sessionKey,
+        sessionId: ctx.sessionId,
+        agentId: ctx.agentId,
+        parentTurnId: ctx.runId,
+        parentThreadId: "parent-thread",
+        sourceEventId: `${childThreadId}-started-without-turn`,
+        childThreadId,
+        lifecycle: "started",
+        sourceTimestampMs: 990,
+        triggeringToolCallId: `spawn-tool-${index + 1}`,
+      });
+      diagnosticRuntime.listener?.({
+        type: "codex.native_child.lifecycle",
+        version: 1,
+        runId: ctx.runId,
+        sessionKey: ctx.sessionKey,
+        sessionId: ctx.sessionId,
+        agentId: ctx.agentId,
+        parentTurnId: ctx.runId,
+        parentThreadId: "parent-thread",
+        sourceEventId: `${childThreadId}-start`,
+        childThreadId,
+        childTurnId,
+        lifecycle: "turn_started",
+        sourceTimestampMs: 1_000,
+        triggeringToolCallId: `spawn-tool-${index + 1}`,
+        role: childThreadId === "child-a" ? "talent_analyst" : "draft_writer",
+      });
+      diagnosticRuntime.listener?.({
+        type: "model.call.started",
+        runId: ctx.runId,
+        callId: `${childThreadId}-call`,
+        providerRequestIndex: 1,
+        sessionKey: ctx.sessionKey,
+        sessionId: ctx.sessionId,
+        agentId: ctx.agentId,
+        provider: "openai",
+        model: "gpt-5.6-sol",
+        runtime: "codex",
+        startTimeMs: 1_100,
+        ...(childThreadId === "child-a"
+          ? {
+              promptStats: {
+                inputMessagesCount: 2,
+                inputMessagesChars: 128,
+                inputMessagesHash: "sha256:child-input",
+                systemPromptSource: "input_messages",
+                systemPromptChars: 64,
+                systemPromptHash: "sha256:child-system",
+                toolDefinitionsCount: 3,
+                toolDefinitionsChars: 96,
+                toolDefinitionsHash: "sha256:child-tools",
+                totalChars: 288,
+              },
+            }
+          : {}),
+        nativeChildThreadId: childThreadId,
+        nativeChildTurnId: childTurnId,
+        parentTurnId: ctx.runId,
+      });
+      diagnosticRuntime.listener?.(
+        {
+          type: "model.call.completed",
+          runId: ctx.runId,
+          callId: `${childThreadId}-call`,
+          providerRequestIndex: 1,
+          sessionKey: ctx.sessionKey,
+          sessionId: ctx.sessionId,
+          agentId: ctx.agentId,
+          provider: "openai",
+          model: "gpt-5.6-sol",
+          runtime: "codex",
+          startTimeMs: 1_100,
+          endTimeMs: 1_200,
+          durationMs: 100,
+          ...(childThreadId === "child-a"
+            ? {
+                promptStats: {
+                  inputMessagesCount: 2,
+                  inputMessagesChars: 128,
+                  inputMessagesHash: "sha256:child-input",
+                  systemPromptSource: "input_messages",
+                  systemPromptChars: 64,
+                  systemPromptHash: "sha256:child-system",
+                  toolDefinitionsCount: 3,
+                  toolDefinitionsChars: 96,
+                  toolDefinitionsHash: "sha256:child-tools",
+                  totalChars: 288,
+                },
+              }
+            : {}),
+          nativeChildThreadId: childThreadId,
+          nativeChildTurnId: childTurnId,
+          parentTurnId: ctx.runId,
+          usage: { input: 10, output: 5, total: 15 },
+        },
+        childThreadId === "child-a"
+          ? {
+              modelContent: {
+                outputMessages: [{ role: "assistant", content: "CHILD_A_RESULT" }],
+              },
+            }
+          : undefined,
+      );
+    }
+
+    for (const type of ["model.call.started", "model.call.completed"] as const) {
+      diagnosticRuntime.listener?.({
+        type,
+        runId: ctx.runId,
+        callId: "child-a-call-2",
+        providerRequestIndex: 2,
+        sessionKey: ctx.sessionKey,
+        sessionId: ctx.sessionId,
+        agentId: ctx.agentId,
+        provider: "openai",
+        model: "gpt-5.6-sol",
+        runtime: "codex",
+        startTimeMs: 1_205,
+        ...(type === "model.call.completed"
+          ? {
+              endTimeMs: 1_225,
+              durationMs: 20,
+              usage: { input: 4, output: 2, total: 6 },
+            }
+          : {}),
+        promptStats: {
+          inputMessagesCount: 1,
+          inputMessagesChars: 80,
+          inputMessagesHash: "sha256:child-input-next",
+          systemPromptSource: "instructions",
+          systemPromptChars: 72,
+          systemPromptHash: "sha256:child-system-next",
+          toolDefinitionsCount: 2,
+          toolDefinitionsChars: 64,
+          toolDefinitionsHash: "sha256:child-tools-next",
+          totalChars: 216,
+        },
+        nativeChildThreadId: "child-a",
+        nativeChildTurnId: "child-a-turn-1",
+        parentTurnId: ctx.runId,
+      });
+    }
+
+    diagnosticRuntime.listener?.({
+      type: "model.call.started",
+      runId: ctx.runId,
+      callId: "root-call",
+      providerRequestIndex: 3,
+      sessionKey: ctx.sessionKey,
+      sessionId: ctx.sessionId,
+      agentId: ctx.agentId,
+      provider: "openai",
+      model: "gpt-5.6-sol",
+      runtime: "codex",
+      startTimeMs: 1_125,
+    });
+    diagnosticRuntime.listener?.({
+      type: "model.call.completed",
+      runId: ctx.runId,
+      callId: "root-call",
+      providerRequestIndex: 3,
+      sessionKey: ctx.sessionKey,
+      sessionId: ctx.sessionId,
+      agentId: ctx.agentId,
+      provider: "openai",
+      model: "gpt-5.6-sol",
+      runtime: "codex",
+      startTimeMs: 1_125,
+      endTimeMs: 1_140,
+      durationMs: 15,
+    });
+
+    diagnosticRuntime.listener?.({
+      type: "tool.execution.started",
+      runId: ctx.runId,
+      sessionKey: ctx.sessionKey,
+      sessionId: ctx.sessionId,
+      agentId: ctx.agentId,
+      toolCallId: "child-a-tool",
+      toolName: "read",
+      toolOwner: "codex-rollout-trace",
+      startTimeMs: 1_150,
+      nativeChildThreadId: "child-a",
+      nativeChildTurnId: "child-a-turn-1",
+      parentTurnId: ctx.runId,
+      triggeringProviderCallId: "child-a-call",
+    });
+    diagnosticRuntime.listener?.({
+      type: "tool.execution.completed",
+      runId: ctx.runId,
+      sessionKey: ctx.sessionKey,
+      sessionId: ctx.sessionId,
+      agentId: ctx.agentId,
+      toolCallId: "child-a-tool",
+      toolName: "read",
+      toolOwner: "codex-rollout-trace",
+      startTimeMs: 1_150,
+      endTimeMs: 1_175,
+      durationMs: 25,
+      nativeChildThreadId: "child-a",
+      nativeChildTurnId: "child-a-turn-1",
+      parentTurnId: ctx.runId,
+      triggeringProviderCallId: "child-a-call",
+    });
+    diagnosticRuntime.listener?.({
+      type: "tool.execution.started",
+      runId: ctx.runId,
+      sessionKey: ctx.sessionKey,
+      sessionId: ctx.sessionId,
+      agentId: ctx.agentId,
+      toolCallId: "child-b-tool-without-provider",
+      toolName: "read",
+      toolOwner: "codex-rollout-trace",
+      startTimeMs: 1_180,
+      nativeChildThreadId: "child-b",
+      nativeChildTurnId: "child-b-turn-1",
+      parentTurnId: ctx.runId,
+    });
+    diagnosticRuntime.listener?.({
+      type: "tool.execution.completed",
+      runId: ctx.runId,
+      sessionKey: ctx.sessionKey,
+      sessionId: ctx.sessionId,
+      agentId: ctx.agentId,
+      toolCallId: "child-b-tool-without-provider",
+      toolName: "read",
+      toolOwner: "codex-rollout-trace",
+      startTimeMs: 1_180,
+      endTimeMs: 1_190,
+      durationMs: 10,
+      nativeChildThreadId: "child-b",
+      nativeChildTurnId: "child-b-turn-1",
+      parentTurnId: ctx.runId,
+    });
+    diagnosticRuntime.listener?.({
+      type: "tool.execution.started",
+      runId: ctx.runId,
+      sessionKey: ctx.sessionKey,
+      sessionId: ctx.sessionId,
+      agentId: ctx.agentId,
+      toolCallId: "child-b-tool-with-root-provider",
+      toolName: "read",
+      toolOwner: "codex-rollout-trace",
+      startTimeMs: 1_192,
+      nativeChildThreadId: "child-b",
+      nativeChildTurnId: "child-b-turn-1",
+      parentTurnId: ctx.runId,
+      triggeringProviderCallId: "root-call",
+    });
+    diagnosticRuntime.listener?.({
+      type: "tool.execution.completed",
+      runId: ctx.runId,
+      sessionKey: ctx.sessionKey,
+      sessionId: ctx.sessionId,
+      agentId: ctx.agentId,
+      toolCallId: "child-b-tool-with-root-provider",
+      toolName: "read",
+      toolOwner: "codex-rollout-trace",
+      startTimeMs: 1_192,
+      endTimeMs: 1_198,
+      durationMs: 6,
+      nativeChildThreadId: "child-b",
+      nativeChildTurnId: "child-b-turn-1",
+      parentTurnId: ctx.runId,
+      triggeringProviderCallId: "root-call",
+    });
+    await vi.waitFor(() =>
+      expect(
+        sdkEvents.delivered.filter(
+          (event) => event.type === "generation-create" && event.body.metadata?.nativeChildThreadId,
+        ),
+      ).toHaveLength(3),
+    );
+    await vi.waitFor(() => expect(mockGeneration.span).toHaveBeenCalled());
+    expect(mockGeneration.span).toHaveBeenCalled();
+    expect(
+      mockGeneration.span.mock.calls.some(([args]) => {
+        const metadata = (args as { metadata?: Record<string, unknown> } | undefined)?.metadata;
+        return (
+          metadata?.nativeChildThreadId === "child-a" &&
+          metadata.triggeringProviderCallId === "child-a-call"
+        );
+      }),
+    ).toBe(true);
+    const ownerlessChildTool = sdkEvents.delivered.find(
+      (event) => event.body.metadata?.toolCallId === "child-b-tool-without-provider",
+    );
+    expect(ownerlessChildTool?.body).toMatchObject({
+      metadata: { partial_parenting: true },
+    });
+    expect(ownerlessChildTool?.body.parentObservationId).toBeUndefined();
+    const mismatchedChildTool = sdkEvents.delivered.find(
+      (event) => event.body.metadata?.toolCallId === "child-b-tool-with-root-provider",
+    );
+    expect(mismatchedChildTool?.body).toMatchObject({
+      metadata: { partial_parenting: true },
+    });
+    expect(mismatchedChildTool?.body.parentObservationId).toBeUndefined();
+
+    for (const [childThreadId, outcome] of [
+      ["child-a", "completed"],
+      ["child-b", "failed"],
+    ] as const) {
+      diagnosticRuntime.listener?.({
+        type: "codex.native_child.lifecycle",
+        version: 1,
+        runId: ctx.runId,
+        sessionKey: ctx.sessionKey,
+        sessionId: ctx.sessionId,
+        agentId: ctx.agentId,
+        parentTurnId: ctx.runId,
+        parentThreadId: "parent-thread",
+        sourceEventId: `${childThreadId}-end`,
+        childThreadId,
+        childTurnId: `${childThreadId}-turn-1`,
+        lifecycle: outcome === "completed" ? "turn_completed" : "ended",
+        sourceTimestampMs: 1_300,
+        outcome,
+      });
+    }
+    diagnosticRuntime.listener?.({
+      type: "codex.native_child.status",
+      version: 1,
+      runId: ctx.runId,
+      sessionKey: ctx.sessionKey,
+      sessionId: ctx.sessionId,
+      agentId: ctx.agentId,
+      parentTurnId: ctx.runId,
+      parentThreadId: "parent-thread",
+      support: "supported",
+      authoritativeStart: true,
+      authoritativeTerminal: true,
+      providerCallOwnership: true,
+      toolCallOwnership: true,
+      drain: "completed",
+      counts: { admitted: 4, duplicates: 0, dropped: 0, activeChildren: 0 },
+    });
+    await handlers.agentEnd(
+      {
+        success: true,
+        durationMs: 500,
+        messages: [
+          { role: "user", content: "delegate" },
+          { role: "assistant", content: "done" },
+        ],
+      },
+      ctx,
+    );
+
+    const childTraces = sdkEvents.delivered
+      .filter((event) => event.type === "trace-create")
+      .map((event) => event.body)
+      .filter((call) => String(call.name).includes(":native-child"));
+    expect(childTraces).toHaveLength(2);
+    expect(new Set(childTraces.map((call) => call.id)).size).toBe(2);
+    expect(childTraces.map((call) => call.sessionId)).toEqual([ctx.sessionKey, ctx.sessionKey]);
+    expect(childTraces.map((call) => call.name)).toEqual([
+      "agent-1:native-child:talent_analyst",
+      "agent-1:native-child:draft_writer",
+    ]);
+    const childA = childTraces.find((trace) => trace.metadata?.childThreadId === "child-a");
+    const childB = childTraces.find((trace) => trace.metadata?.childThreadId === "child-b");
+    expect(childA?.metadata).toMatchObject({
+      parentTraceId: expect.any(String),
+      parentTraceUrl: expect.stringMatching(/^http:\/\/localhost:3000\/trace\//u),
+      spawnObservationId: expect.stringMatching(/-span-spawn-tool-1$/u),
+      childTraceId: childA?.id,
+      childTurnId: "child-a-turn-1",
+    });
+    expect(childB?.metadata).toMatchObject({
+      parentTraceId: childA?.metadata?.parentTraceId,
+      parentTraceUrl: childA?.metadata?.parentTraceUrl,
+      spawnObservationId: expect.stringMatching(/-span-spawn-tool-2$/u),
+      childTraceId: childB?.id,
+      childTurnId: "child-b-turn-1",
+    });
+    expect(childA?.input).toEqual({
+      actorKind: "native-child",
+      agentId: "agent-1",
+      role: "talent_analyst",
+      childThreadId: "child-a",
+      childTurnId: "child-a-turn-1",
+    });
+    const childAGenerations = sdkEvents.delivered
+      .filter((event) => event.type === "generation-create" && event.body.traceId === childA?.id)
+      .map((event) => event.body);
+    const childBGenerations = sdkEvents.delivered
+      .filter((event) => event.type === "generation-create" && event.body.traceId === childB?.id)
+      .map((event) => event.body);
+    expect(childAGenerations.map((generation) => generation.name)).toEqual([
+      "llm-call-1",
+      "llm-call-2",
+    ]);
+    expect(childBGenerations.map((generation) => generation.name)).toEqual(["llm-call-1"]);
+    const childATool = sdkEvents.delivered.find(
+      (event) => event.body.metadata?.toolCallId === "child-a-tool",
+    )?.body;
+    expect(childATool).toMatchObject({
+      traceId: childA?.id,
+      parentObservationId: childAGenerations[0]?.id,
+    });
+    const spawnLinks = sdkEvents.delivered.filter(
+      (event) => event.type === "span-update" && event.body.metadata?.childTraceId,
+    );
+    expect(spawnLinks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          body: expect.objectContaining({
+            id: childA?.metadata?.spawnObservationId,
+            metadata: expect.objectContaining({
+              childTraceId: childA?.id,
+              childTraceUrl: `http://localhost:3000/trace/${String(childA?.id)}`,
+            }),
+          }),
+        }),
+        expect.objectContaining({
+          body: expect.objectContaining({
+            id: childB?.metadata?.spawnObservationId,
+            metadata: expect.objectContaining({
+              childTraceId: childB?.id,
+              childTraceUrl: `http://localhost:3000/trace/${String(childB?.id)}`,
+            }),
+          }),
+        }),
+      ]),
+    );
+    for (const event of sdkEvents.delivered.filter(
+      (candidate) => candidate.body.parentObservationId,
+    )) {
+      const parent = sdkEvents.delivered.find(
+        (candidate) =>
+          candidate.body.id === event.body.parentObservationId &&
+          candidate.body.traceId === event.body.traceId,
+      );
+      expect(parent, `${event.type}:${String(event.body.id)}`).toBeDefined();
+    }
+    const childAContextUpdate = sdkEvents.delivered.findLast(
+      (event) =>
+        event.type === "trace-create" &&
+        event.body.id === childA?.id &&
+        event.body.input !== undefined &&
+        (event.body.metadata as Record<string, unknown> | undefined)?.executionContextSummary,
+    )?.body;
+    expect(childAContextUpdate).toMatchObject({
+      input: {
+        source: "codex-rollout-request",
+        requestCount: 2,
+        firstRequest: {
+          model: "gpt-5.6-sol",
+          promptStats: {
+            systemPromptSource: "input_messages",
+            systemPromptHash: "sha256:child-system",
+            toolDefinitionsHash: "sha256:child-tools",
+          },
+        },
+        latestRequest: {
+          model: "gpt-5.6-sol",
+          promptStats: {
+            systemPromptSource: "instructions",
+            systemPromptHash: "sha256:child-system-next",
+            toolDefinitionsHash: "sha256:child-tools-next",
+          },
+        },
+      },
+      metadata: {
+        executionContextSummary: expect.any(Object),
+      },
+    });
+    expect(
+      sdkEvents.delivered.findLast(
+        (event) =>
+          event.type === "trace-create" && event.body.id === childA?.id && event.body.output,
+      )?.body.output,
+    ).toEqual([{ role: "assistant", content: "CHILD_A_RESULT" }]);
+    expect(
+      sdkEvents.delivered.findLast(
+        (event) =>
+          event.type === "trace-create" && event.body.id === childB?.id && event.body.output,
+      )?.body.output,
+    ).toEqual({ outcome: "failed" });
+    const finalMetadata = mockTrace.update.mock.calls
+      .map((call) => (call[0] as { metadata?: Record<string, unknown> }).metadata)
+      .findLast((metadata) => metadata?.nativeChildLineage);
+    expect(finalMetadata?.nativeChildLineage).toMatchObject({
+      status: "partial",
+      childCount: 2,
+      drain: "completed",
+      partialReasons: expect.arrayContaining(["child_context_unavailable", "partial_parenting"]),
+      childContext: {
+        availableChildren: 1,
+        unavailableChildren: 1,
+        requestCount: 2,
+        roles: ["draft_writer", "talent_analyst"],
+        models: ["gpt-5.6-sol"],
+      },
+    });
+    expect(
+      (finalMetadata?.nativeChildLineage as { partialReasons?: string[] } | undefined)
+        ?.partialReasons,
+    ).not.toContain("child_turn_identity_unavailable");
+    const childRecords = readTraceLedgerRecordsForTest(stateDir).filter(
+      (record) => record.kind === "trace" && record.traceKind === "native-child",
+    );
+    expect(childRecords).toHaveLength(2);
+    expect(childRecords).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          traceKind: "native-child",
+          parentTraceId: childA?.metadata?.parentTraceId,
+          status: "ended",
+        }),
+      ]),
+    );
+    await service.stop?.(makeServiceCtx({ stateDir }));
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  });
+
+  it("keeps joined and detached children in the same independent-trace topology", async () => {
+    const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "langfuse-native-mixed-mode-"));
+    const service = await startService(config, undefined, { stateDir });
+    const handlers = service.getHookHandlers();
+    const ctx = { ...agentCtx, runId: "native-mixed-mode" };
+    handlers.beforeAgentRun({ prompt: "delegate mixed work", messages: [] }, ctx);
+
+    const children = [
+      { threadId: "joined-child", turnId: "joined-turn", role: "talent_analyst" },
+      { threadId: "detached-child", turnId: "detached-turn", role: "result_verifier" },
+    ] as const;
+    for (const [index, child] of children.entries()) {
+      const rootCallId = `mixed-root-call-${index + 1}`;
+      const spawnToolId = `mixed-spawn-${index + 1}`;
+      diagnosticRuntime.listener?.({
+        type: "model.call.started",
+        runId: ctx.runId,
+        callId: rootCallId,
+        providerRequestIndex: index + 1,
+        sessionKey: ctx.sessionKey,
+        sessionId: ctx.sessionId,
+        agentId: ctx.agentId,
+        provider: "openai",
+        model: "gpt-5.6-sol",
+        runtime: "codex",
+        startTimeMs: 10_000 + index * 100,
+      });
+      diagnosticRuntime.listener?.({
+        type: "tool.execution.started",
+        runId: ctx.runId,
+        sessionKey: ctx.sessionKey,
+        sessionId: ctx.sessionId,
+        agentId: ctx.agentId,
+        toolCallId: spawnToolId,
+        toolName: "collaboration.spawn_agent",
+        toolOwner: "codex-rollout-trace",
+        startTimeMs: 10_010 + index * 100,
+        triggeringProviderCallId: rootCallId,
+      });
+      diagnosticRuntime.listener?.({
+        type: "codex.native_child.lifecycle",
+        version: 1,
+        runId: ctx.runId,
+        sessionKey: ctx.sessionKey,
+        sessionId: ctx.sessionId,
+        agentId: ctx.agentId,
+        parentTurnId: ctx.runId,
+        parentThreadId: "mixed-parent-thread",
+        sourceEventId: `${child.turnId}-start`,
+        childThreadId: child.threadId,
+        childTurnId: child.turnId,
+        lifecycle: "turn_started",
+        sourceTimestampMs: 10_020 + index * 100,
+        triggeringToolCallId: spawnToolId,
+        role: child.role,
+      });
+    }
+
+    const emitChildCall = (child: (typeof children)[number], timestamp: number) => {
+      for (const type of ["model.call.started", "model.call.completed"] as const) {
+        diagnosticRuntime.listener?.({
+          type,
+          runId: ctx.runId,
+          callId: `${child.threadId}-call`,
+          providerRequestIndex: 1,
+          sessionKey: ctx.sessionKey,
+          sessionId: ctx.sessionId,
+          agentId: ctx.agentId,
+          provider: "openai",
+          model: child.threadId === "joined-child" ? "gpt-5.6-terra" : "gpt-5.6-sol",
+          runtime: "codex",
+          startTimeMs: timestamp,
+          ...(type === "model.call.completed"
+            ? {
+                endTimeMs: timestamp + 20,
+                durationMs: 20,
+                usage: { input: 3, output: 2, total: 5 },
+              }
+            : {}),
+          promptStats: {
+            systemPromptSource: "instructions",
+            systemPromptChars: 42,
+            systemPromptHash: `sha256:${child.turnId}`,
+            inputMessagesCount: 1,
+            inputMessagesChars: 24,
+            totalChars: 66,
+          },
+          nativeChildThreadId: child.threadId,
+          nativeChildTurnId: child.turnId,
+          parentTurnId: ctx.runId,
+        });
+      }
+    };
+    const completeChild = (child: (typeof children)[number], timestamp: number) => {
+      diagnosticRuntime.listener?.({
+        type: "codex.native_child.lifecycle",
+        version: 1,
+        runId: ctx.runId,
+        sessionKey: ctx.sessionKey,
+        sessionId: ctx.sessionId,
+        agentId: ctx.agentId,
+        parentTurnId: ctx.runId,
+        parentThreadId: "mixed-parent-thread",
+        sourceEventId: `${child.turnId}-complete`,
+        childThreadId: child.threadId,
+        childTurnId: child.turnId,
+        lifecycle: "turn_completed",
+        sourceTimestampMs: timestamp,
+        outcome: "completed",
+      });
+    };
+
+    emitChildCall(children[0], 10_300);
+    completeChild(children[0], 10_350);
+    for (const type of ["tool.execution.started", "tool.execution.completed"] as const) {
+      diagnosticRuntime.listener?.({
+        type,
+        runId: ctx.runId,
+        sessionKey: ctx.sessionKey,
+        sessionId: ctx.sessionId,
+        agentId: ctx.agentId,
+        toolCallId: "mixed-wait",
+        toolName: "collaboration.wait_agent",
+        toolOwner: "codex-rollout-trace",
+        startTimeMs: 10_360,
+        ...(type === "tool.execution.completed" ? { endTimeMs: 10_370, durationMs: 10 } : {}),
+        triggeringProviderCallId: "mixed-root-call-1",
+      });
+    }
+    diagnosticRuntime.listener?.({
+      type: "codex.native_child.status",
+      version: 1,
+      runId: ctx.runId,
+      sessionKey: ctx.sessionKey,
+      sessionId: ctx.sessionId,
+      agentId: ctx.agentId,
+      parentTurnId: ctx.runId,
+      parentThreadId: "mixed-parent-thread",
+      support: "supported",
+      authoritativeStart: true,
+      authoritativeTerminal: false,
+      providerCallOwnership: true,
+      toolCallOwnership: true,
+      drain: "completed",
+      counts: { admitted: 3, duplicates: 0, dropped: 0, activeChildren: 1 },
+    });
+    await handlers.agentEnd(
+      {
+        success: true,
+        messages: [
+          { role: "user", content: "delegate mixed work" },
+          { role: "assistant", content: "root final after joined result" },
+        ],
+      },
+      ctx,
+    );
+    const rootTraceId = mockLangfuseInstance.trace.mock.calls[0]?.[0].id as string;
+    const rootUpdatesAfterFinal = sdkEvents.delivered.filter(
+      (event) => event.type === "trace-create" && event.body.id === rootTraceId,
+    ).length;
+    const rootLineageAfterFinal = mockTrace.update.mock.calls
+      .map((call) => (call[0] as { metadata?: Record<string, unknown> }).metadata)
+      .findLast((metadata) => metadata?.nativeChildLineage)?.nativeChildLineage;
+    expect(rootLineageAfterFinal).toMatchObject({
+      status: "complete",
+      childCount: 2,
+      activeChildrenAtRootFinalization: 1,
+      partialReasons: [],
+    });
+
+    emitChildCall(children[1], 10_500);
+    completeChild(children[1], 10_550);
+    await vi.waitFor(() =>
+      expect(
+        readTraceLedgerRecordsForTest(stateDir).filter(
+          (record) =>
+            record.kind === "trace" &&
+            record.traceKind === "native-child" &&
+            record.status === "ended",
+        ),
+      ).toHaveLength(2),
+    );
+
+    const childTraces = sdkEvents.delivered
+      .filter(
+        (event) =>
+          event.type === "trace-create" && String(event.body.name).includes(":native-child:"),
+      )
+      .map((event) => event.body);
+    expect(childTraces).toHaveLength(2);
+    expect(new Set(childTraces.map((trace) => trace.sessionId))).toEqual(new Set([ctx.sessionKey]));
+    for (const childTrace of childTraces) {
+      const generations = sdkEvents.delivered.filter(
+        (event) => event.type === "generation-create" && event.body.traceId === childTrace.id,
+      );
+      expect(generations.map((event) => event.body.name)).toEqual(["llm-call-1"]);
+      expect(generations[0]?.body.parentObservationId).toBeUndefined();
+    }
+    expect(
+      sdkEvents.delivered.filter(
+        (event) => event.type === "trace-create" && event.body.id === rootTraceId,
+      ),
+    ).toHaveLength(rootUpdatesAfterFinal);
+    expect(
+      sdkEvents.delivered.filter(
+        (event) =>
+          event.type === "trace-create" && event.body.output === "root final after joined result",
+      ),
+    ).toHaveLength(1);
+
+    await service.stop?.(makeServiceCtx({ stateDir }));
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  });
+
+  it("materializes a pending detached child after root finalization", async () => {
+    const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "langfuse-native-late-detached-"));
+    const service = await startService(config, undefined, { stateDir });
+    const handlers = service.getHookHandlers();
+    const ctx = { ...agentCtx, runId: "native-late-detached" };
+    handlers.beforeAgentRun({ prompt: "start detached child", messages: [] }, ctx);
+
+    diagnosticRuntime.listener?.({
+      type: "tool.execution.started",
+      runId: ctx.runId,
+      sessionKey: ctx.sessionKey,
+      sessionId: ctx.sessionId,
+      agentId: ctx.agentId,
+      toolCallId: "late-detached-spawn",
+      toolName: "collaboration.spawn_agent",
+      toolOwner: "codex-rollout-trace",
+      startTimeMs: 20_000,
+    });
+    diagnosticRuntime.listener?.({
+      type: "tool.execution.completed",
+      runId: ctx.runId,
+      sessionKey: ctx.sessionKey,
+      sessionId: ctx.sessionId,
+      agentId: ctx.agentId,
+      toolCallId: "late-detached-spawn",
+      toolName: "collaboration.spawn_agent",
+      toolOwner: "codex-rollout-trace",
+      startTimeMs: 20_000,
+      endTimeMs: 20_010,
+      durationMs: 10,
+    });
+    diagnosticRuntime.listener?.({
+      type: "codex.native_child.lifecycle",
+      version: 1,
+      runId: ctx.runId,
+      sessionKey: ctx.sessionKey,
+      sessionId: ctx.sessionId,
+      agentId: ctx.agentId,
+      parentTurnId: ctx.runId,
+      parentThreadId: "late-detached-parent",
+      sourceEventId: "late-detached-start",
+      childThreadId: "late-detached-child",
+      lifecycle: "started",
+      sourceTimestampMs: 20_020,
+      triggeringToolCallId: "late-detached-spawn",
+      role: "draft_writer",
+    });
+    diagnosticRuntime.listener?.({
+      type: "codex.native_child.status",
+      version: 1,
+      runId: ctx.runId,
+      sessionKey: ctx.sessionKey,
+      sessionId: ctx.sessionId,
+      agentId: ctx.agentId,
+      parentTurnId: ctx.runId,
+      parentThreadId: "late-detached-parent",
+      support: "supported",
+      authoritativeStart: true,
+      authoritativeTerminal: false,
+      providerCallOwnership: true,
+      toolCallOwnership: true,
+      drain: "completed",
+      counts: { admitted: 1, duplicates: 0, dropped: 0, activeChildren: 1 },
+    });
+    await handlers.agentEnd(
+      {
+        success: true,
+        messages: [
+          { role: "user", content: "start detached child" },
+          { role: "assistant", content: "detached root done" },
+        ],
+      },
+      ctx,
+    );
+
+    const rootTraceId = mockLangfuseInstance.trace.mock.calls[0]?.[0].id as string;
+    const rootUpdateCount = sdkEvents.delivered.filter(
+      (event) => event.type === "trace-create" && event.body.id === rootTraceId,
+    ).length;
+    diagnosticRuntime.listener?.({
+      type: "codex.native_child.lifecycle",
+      version: 1,
+      runId: ctx.runId,
+      sessionKey: ctx.sessionKey,
+      sessionId: ctx.sessionId,
+      agentId: ctx.agentId,
+      parentTurnId: ctx.runId,
+      parentThreadId: "late-detached-parent",
+      sourceEventId: "late-detached-turn-start",
+      childThreadId: "late-detached-child",
+      childTurnId: "late-detached-turn",
+      lifecycle: "turn_started",
+      sourceTimestampMs: 20_100,
+      triggeringToolCallId: "late-detached-spawn",
+      role: "draft_writer",
+    });
+    for (const type of ["model.call.started", "model.call.completed"] as const) {
+      diagnosticRuntime.listener?.({
+        type,
+        runId: ctx.runId,
+        callId: "late-detached-call",
+        providerRequestIndex: 1,
+        sessionKey: ctx.sessionKey,
+        sessionId: ctx.sessionId,
+        agentId: ctx.agentId,
+        provider: "openai",
+        model: "gpt-5.6-luna",
+        runtime: "codex",
+        startTimeMs: 20_110,
+        ...(type === "model.call.completed"
+          ? {
+              endTimeMs: 20_130,
+              durationMs: 20,
+              usage: { input: 3, output: 2, total: 5 },
+            }
+          : {}),
+        nativeChildThreadId: "late-detached-child",
+        nativeChildTurnId: "late-detached-turn",
+        parentTurnId: ctx.runId,
+      });
+    }
+    diagnosticRuntime.listener?.({
+      type: "codex.native_child.lifecycle",
+      version: 1,
+      runId: ctx.runId,
+      sessionKey: ctx.sessionKey,
+      sessionId: ctx.sessionId,
+      agentId: ctx.agentId,
+      parentTurnId: ctx.runId,
+      parentThreadId: "late-detached-parent",
+      sourceEventId: "late-detached-ended",
+      childThreadId: "late-detached-child",
+      childTurnId: "late-detached-turn",
+      lifecycle: "ended",
+      sourceTimestampMs: 20_140,
+      triggeringToolCallId: "late-detached-spawn",
+      role: "draft_writer",
+      outcome: "completed",
+    });
+
+    await vi.waitFor(() =>
+      expect(
+        readTraceLedgerRecordsForTest(stateDir).filter(
+          (record) => record.kind === "trace" && record.traceKind === "native-child",
+        ),
+      ).toEqual(expect.arrayContaining([expect.objectContaining({ status: "ended" })])),
+    );
+    const childTraceCreate = sdkEvents.delivered.find(
+      (event) =>
+        event.type === "trace-create" && event.body.name === "agent-1:native-child:draft_writer",
+    )?.body;
+    const childTraceUpdate = sdkEvents.delivered.findLast(
+      (event) => event.type === "trace-create" && event.body.id === childTraceCreate?.id,
+    )?.body;
+    expect(childTraceCreate).toMatchObject({ sessionId: ctx.sessionKey });
+    expect(childTraceUpdate).toMatchObject({
+      metadata: expect.objectContaining({
+        parentTraceId: rootTraceId,
+        childThreadId: "late-detached-child",
+        childTurnId: "late-detached-turn",
+        outcome: "completed",
+      }),
+    });
+    expect(
+      sdkEvents.delivered.filter(
+        (event) =>
+          event.type === "generation-create" && event.body.traceId === childTraceCreate?.id,
+      ),
+    ).toHaveLength(1);
+    expect(
+      sdkEvents.delivered.filter(
+        (event) => event.type === "trace-create" && event.body.id === rootTraceId,
+      ),
+    ).toHaveLength(rootUpdateCount);
+
+    await service.stop?.(makeServiceCtx({ stateDir }));
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  });
+
+  it("drains deferred child calls before finalizing a newly materialized terminal child", async () => {
+    const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "langfuse-native-terminal-drain-"));
+    const service = await startService(config, undefined, { stateDir });
+    const handlers = service.getHookHandlers();
+    const ctx = { ...agentCtx, runId: "native-terminal-drain" };
+    handlers.beforeAgentRun({ prompt: "delegate", messages: [] }, ctx);
+
+    for (const lifecycle of ["turn_started", "turn_completed"] as const) {
+      diagnosticRuntime.listener?.({
+        type: "codex.native_child.lifecycle",
+        version: 1,
+        runId: ctx.runId,
+        sessionKey: ctx.sessionKey,
+        sessionId: ctx.sessionId,
+        agentId: ctx.agentId,
+        parentTurnId: ctx.runId,
+        parentThreadId: "terminal-drain-parent",
+        sourceEventId: `terminal-drain-${lifecycle}`,
+        childThreadId: "terminal-drain-child",
+        childTurnId: "terminal-drain-child-turn",
+        lifecycle,
+        sourceTimestampMs: lifecycle === "turn_started" ? 30_000 : 30_030,
+        triggeringToolCallId: "terminal-drain-spawn",
+        ...(lifecycle === "turn_completed" ? { outcome: "completed" as const } : {}),
+      });
+    }
+    for (const type of ["model.call.started", "model.call.completed"] as const) {
+      diagnosticRuntime.listener?.({
+        type,
+        runId: ctx.runId,
+        callId: "terminal-drain-child-call",
+        providerRequestIndex: 1,
+        sessionKey: ctx.sessionKey,
+        sessionId: ctx.sessionId,
+        agentId: ctx.agentId,
+        provider: "openai",
+        model: "gpt-5.6-luna",
+        runtime: "codex",
+        startTimeMs: 30_010,
+        ...(type === "model.call.completed"
+          ? {
+              endTimeMs: 30_020,
+              durationMs: 10,
+              usage: { input: 3, output: 2, total: 5 },
+            }
+          : {}),
+        nativeChildThreadId: "terminal-drain-child",
+        nativeChildTurnId: "terminal-drain-child-turn",
+        parentTurnId: ctx.runId,
+      });
+    }
+
+    diagnosticRuntime.listener?.({
+      type: "tool.execution.completed",
+      runId: ctx.runId,
+      sessionKey: ctx.sessionKey,
+      sessionId: ctx.sessionId,
+      agentId: ctx.agentId,
+      toolCallId: "terminal-drain-spawn",
+      toolName: "collaboration.spawn_agent",
+      toolOwner: "codex-rollout-trace",
+      startTimeMs: 29_990,
+      endTimeMs: 30_040,
+      durationMs: 50,
+    });
+
+    await vi.waitFor(() => {
+      const childTrace = sdkEvents.delivered.find((event) => {
+        const metadata = event.body.metadata as Record<string, unknown> | undefined;
+        return event.type === "trace-create" && metadata?.childThreadId === "terminal-drain-child";
+      })?.body;
+      expect(childTrace).toBeDefined();
+      const childTraceId = typeof childTrace?.id === "string" ? childTrace.id : "";
+      expect(childTraceId).not.toBe("");
+      expect(
+        sdkEvents.delivered.filter(
+          (event) => event.type === "generation-create" && event.body.traceId === childTraceId,
+        ),
+      ).toHaveLength(1);
+      expect(
+        readTraceLedgerRecordsForTest(stateDir).find(
+          (record) =>
+            record.kind === "trace" && record.traceId === childTraceId && record.status === "ended",
+        ),
+      ).toBeDefined();
+    });
+
+    await service.stop?.(makeServiceCtx({ stateDir }));
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  });
+
+  it("restarts child numbering without changing the spawn tool's root parent", async () => {
+    const service = await startService();
+    const handlers = service.getHookHandlers();
+    const ctx = { ...agentCtx, runId: "native-allocated-parent" };
+    handlers.beforeAgentRun({ prompt: "delegate", messages: [] }, ctx);
+
+    diagnosticRuntime.listener?.({
+      type: "model.call.started",
+      runId: ctx.runId,
+      callId: "existing-root-call",
+      providerRequestIndex: 1,
+      sessionKey: ctx.sessionKey,
+      sessionId: ctx.sessionId,
+      agentId: ctx.agentId,
+      provider: "openai",
+      model: "gpt-5.6-sol",
+      runtime: "codex",
+      startTimeMs: 900,
+    });
+    diagnosticRuntime.listener?.({
+      type: "model.call.completed",
+      runId: ctx.runId,
+      callId: "existing-root-call",
+      providerRequestIndex: 1,
+      sessionKey: ctx.sessionKey,
+      sessionId: ctx.sessionId,
+      agentId: ctx.agentId,
+      provider: "openai",
+      model: "gpt-5.6-sol",
+      runtime: "codex",
+      startTimeMs: 900,
+      endTimeMs: 950,
+      durationMs: 50,
+    });
+    diagnosticRuntime.listener?.({
+      type: "model.call.started",
+      runId: ctx.runId,
+      callId: "allocated-root-call",
+      providerRequestIndex: 1,
+      sessionKey: ctx.sessionKey,
+      sessionId: ctx.sessionId,
+      agentId: ctx.agentId,
+      provider: "openai",
+      model: "gpt-5.6-sol",
+      runtime: "codex",
+      startTimeMs: 1_000,
+    });
+    diagnosticRuntime.listener?.({
+      type: "tool.execution.started",
+      runId: ctx.runId,
+      sessionKey: ctx.sessionKey,
+      sessionId: ctx.sessionId,
+      agentId: ctx.agentId,
+      toolCallId: "allocated-spawn",
+      toolName: "collaboration.spawn_agent",
+      toolOwner: "codex-rollout-trace",
+      startTimeMs: 1_010,
+      triggeringProviderCallId: "allocated-root-call",
+    });
+    diagnosticRuntime.listener?.({
+      type: "codex.native_child.lifecycle",
+      version: 1,
+      runId: ctx.runId,
+      sessionKey: ctx.sessionKey,
+      sessionId: ctx.sessionId,
+      agentId: ctx.agentId,
+      parentTurnId: ctx.runId,
+      parentThreadId: "parent-thread",
+      sourceEventId: "allocated-child-start",
+      childThreadId: "allocated-child",
+      childTurnId: "allocated-child-turn",
+      lifecycle: "turn_started",
+      sourceTimestampMs: 1_020,
+      triggeringToolCallId: "allocated-spawn",
+    });
+    diagnosticRuntime.listener?.({
+      type: "model.call.started",
+      runId: ctx.runId,
+      callId: "allocated-child-call",
+      providerRequestIndex: 1,
+      sessionKey: ctx.sessionKey,
+      sessionId: ctx.sessionId,
+      agentId: ctx.agentId,
+      provider: "openai",
+      model: "gpt-5.6-luna",
+      runtime: "codex",
+      startTimeMs: 1_030,
+      nativeChildThreadId: "allocated-child",
+      nativeChildTurnId: "allocated-child-turn",
+      parentTurnId: ctx.runId,
+    });
+
+    await vi.waitFor(() =>
+      expect(
+        sdkEvents.delivered.filter(
+          (event) =>
+            event.body.name === "llm-call-1" &&
+            event.body.metadata?.nativeChildThreadId === "allocated-child",
+        ),
+      ).toHaveLength(1),
+    );
+    const rootGeneration = sdkEvents.delivered.find(
+      (event) => event.body.name === "llm-call-2",
+    )?.body;
+    const spawnCreate = sdkEvents.delivered.find(
+      (event) => event.body.name === "tool:collaboration.spawn_agent",
+    )?.body;
+    expect(spawnCreate?.parentObservationId).toBe(rootGeneration?.id);
+    await service.stop?.(makeServiceCtx());
+  });
+
+  it("waits for spawn ownership before creating an out-of-order child tree", async () => {
+    const service = await startService();
+    const handlers = service.getHookHandlers();
+    const ctx = { ...agentCtx, runId: "native-out-of-order" };
+    handlers.beforeAgentRun({ prompt: "delegate", messages: [] }, ctx);
+
+    diagnosticRuntime.listener?.({
+      type: "model.call.started",
+      runId: ctx.runId,
+      callId: "root-spawn-provider",
+      providerRequestIndex: 1,
+      sessionKey: ctx.sessionKey,
+      sessionId: ctx.sessionId,
+      agentId: ctx.agentId,
+      provider: "openai",
+      model: "gpt-5.6-sol",
+      runtime: "codex",
+      startTimeMs: 1_000,
+    });
+    diagnosticRuntime.listener?.({
+      type: "tool.execution.started",
+      runId: ctx.runId,
+      sessionKey: ctx.sessionKey,
+      sessionId: ctx.sessionId,
+      agentId: ctx.agentId,
+      toolCallId: "spawn-tool-call",
+      toolName: "collaboration.spawn_agent",
+      toolOwner: "codex-rollout-trace",
+      startTimeMs: 1_005,
+      triggeringProviderCallId: "root-spawn-provider",
+    });
+    diagnosticRuntime.listener?.({
+      type: "codex.native_child.lifecycle",
+      version: 1,
+      runId: ctx.runId,
+      sessionKey: ctx.sessionKey,
+      sessionId: ctx.sessionId,
+      agentId: ctx.agentId,
+      parentTurnId: ctx.runId,
+      parentThreadId: "parent-thread",
+      sourceEventId: "child-start-before-spawn-owner",
+      childThreadId: "child-out-of-order",
+      childTurnId: "child-out-of-order-turn",
+      lifecycle: "turn_started",
+      sourceTimestampMs: 1_010,
+      role: "draft_writer",
+    });
+    diagnosticRuntime.listener?.({
+      type: "model.call.started",
+      runId: ctx.runId,
+      callId: "child-provider",
+      providerRequestIndex: 1,
+      sessionKey: ctx.sessionKey,
+      sessionId: ctx.sessionId,
+      agentId: ctx.agentId,
+      provider: "openai",
+      model: "gpt-5.6-luna",
+      runtime: "codex",
+      startTimeMs: 1_020,
+      nativeChildThreadId: "child-out-of-order",
+      nativeChildTurnId: "child-out-of-order-turn",
+      parentTurnId: ctx.runId,
+    });
+
+    expect(
+      sdkEvents.delivered.filter(
+        (event) => event.body.name === "agent-1:native-child:draft_writer",
+      ),
+    ).toHaveLength(0);
+
+    diagnosticRuntime.listener?.({
+      type: "codex.native_child.lifecycle",
+      version: 1,
+      runId: ctx.runId,
+      sessionKey: ctx.sessionKey,
+      sessionId: ctx.sessionId,
+      agentId: ctx.agentId,
+      parentTurnId: ctx.runId,
+      parentThreadId: "parent-thread",
+      sourceEventId: "spawn-tool-call:child-out-of-order",
+      childThreadId: "child-out-of-order",
+      childTurnId: "child-out-of-order-turn",
+      lifecycle: "activity",
+      sourceTimestampMs: 1_015,
+      triggeringToolCallId: "spawn-tool-call",
+      role: "draft_writer",
+    });
+
+    diagnosticRuntime.listener?.({
+      type: "model.call.started",
+      runId: ctx.runId,
+      callId: "child-provider-2",
+      providerRequestIndex: 2,
+      sessionKey: ctx.sessionKey,
+      sessionId: ctx.sessionId,
+      agentId: ctx.agentId,
+      provider: "openai",
+      model: "gpt-5.6-luna",
+      runtime: "codex",
+      startTimeMs: 1_030,
+      nativeChildThreadId: "child-out-of-order",
+      nativeChildTurnId: "child-out-of-order-turn",
+      parentTurnId: ctx.runId,
+    });
+
+    await vi.waitFor(() =>
+      expect(
+        sdkEvents.delivered.filter(
+          (event) =>
+            event.body.name === "llm-call-1" &&
+            event.body.metadata?.nativeChildThreadId === "child-out-of-order",
+        ),
+      ).toHaveLength(1),
+    );
+    await vi.waitFor(() =>
+      expect(
+        sdkEvents.delivered.filter(
+          (event) =>
+            event.body.name === "llm-call-2" &&
+            event.body.metadata?.nativeChildThreadId === "child-out-of-order",
+        ),
+      ).toHaveLength(1),
+    );
+    const spawnCreate = sdkEvents.delivered.find(
+      (event) => event.body.name === "tool:collaboration.spawn_agent",
+    )?.body;
+    const spawn = sdkEvents.delivered.find(
+      (event) => event.type === "span-update" && event.body.id === spawnCreate?.id,
+    )?.body;
+    const child = sdkEvents.delivered.find(
+      (event) => event.body.name === "agent-1:native-child:draft_writer",
+    )?.body;
+    const generation = sdkEvents.delivered.find(
+      (event) =>
+        event.body.name === "llm-call-1" &&
+        event.body.metadata?.nativeChildThreadId === "child-out-of-order",
+    )?.body;
+
+    expect(String(spawnCreate?.parentObservationId)).toMatch(/-gen-1$/u);
+    expect(spawn?.metadata).toMatchObject({ childTraceId: child?.id });
+    expect(child?.metadata).toMatchObject({ spawnObservationId: spawnCreate?.id });
+    expect(generation?.traceId).toBe(child?.id);
+    expect(generation?.parentObservationId).toBeUndefined();
+    await service.stop?.(makeServiceCtx());
+  });
+
+  it("enriches a materialized v2 child from the exact spawn agent_type", async () => {
+    const service = await startService();
+    const handlers = service.getHookHandlers();
+    const ctx = { ...agentCtx, runId: "native-late-spawn-role" };
+    handlers.beforeAgentRun({ prompt: "delegate", messages: [] }, ctx);
+
+    diagnosticRuntime.listener?.({
+      type: "model.call.started",
+      runId: ctx.runId,
+      callId: "late-role-root-call",
+      providerRequestIndex: 1,
+      sessionKey: ctx.sessionKey,
+      sessionId: ctx.sessionId,
+      agentId: ctx.agentId,
+      provider: "openai",
+      model: "gpt-5.6-sol",
+      runtime: "codex",
+      startTimeMs: 1_000,
+    });
+    diagnosticRuntime.listener?.({
+      type: "tool.execution.started",
+      runId: ctx.runId,
+      sessionKey: ctx.sessionKey,
+      sessionId: ctx.sessionId,
+      agentId: ctx.agentId,
+      toolCallId: "late-role-spawn",
+      toolName: "collaboration.spawn_agent",
+      toolOwner: "codex-rollout-trace",
+      startTimeMs: 1_010,
+      triggeringProviderCallId: "late-role-root-call",
+    });
+    diagnosticRuntime.listener?.({
+      type: "codex.native_child.lifecycle",
+      version: 1,
+      runId: ctx.runId,
+      sessionKey: ctx.sessionKey,
+      sessionId: ctx.sessionId,
+      agentId: ctx.agentId,
+      parentTurnId: ctx.runId,
+      parentThreadId: "parent-thread",
+      sourceEventId: "late-role-child-start",
+      childThreadId: "late-role-child",
+      childTurnId: "late-role-child-turn",
+      lifecycle: "turn_started",
+      sourceTimestampMs: 1_020,
+      triggeringToolCallId: "late-role-spawn",
+    });
+
+    await vi.waitFor(() =>
+      expect(
+        sdkEvents.delivered.filter(
+          (event) => event.type === "trace-create" && event.body.name === "agent-1:native-child",
+        ),
+      ).toHaveLength(1),
+    );
+    const childId = sdkEvents.delivered.find(
+      (event) => event.type === "trace-create" && event.body.name === "agent-1:native-child",
+    )?.body.id;
+
+    diagnosticRuntime.listener?.(
+      {
+        type: "tool.execution.completed",
+        runId: ctx.runId,
+        sessionKey: ctx.sessionKey,
+        sessionId: ctx.sessionId,
+        agentId: ctx.agentId,
+        toolCallId: "late-role-spawn",
+        toolName: "collaboration.spawn_agent",
+        toolOwner: "codex-rollout-trace",
+        startTimeMs: 1_010,
+        endTimeMs: 1_030,
+        durationMs: 20,
+        triggeringProviderCallId: "late-role-root-call",
+      },
+      {
+        toolContent: {
+          toolInput: {
+            agent_type: "draft_writer",
+            fork_turns: "none",
+            message: "write the conclusion",
+            task_name: "candidate_conclusion",
+          },
+          toolOutput: { task_name: "/root/candidate_conclusion" },
+        },
+      },
+    );
+
+    await vi.waitFor(() =>
+      expect(
+        sdkEvents.delivered.filter(
+          (event) =>
+            event.type === "trace-create" &&
+            event.body.name === "agent-1:native-child:draft_writer",
+        ),
+      ).toHaveLength(1),
+    );
+    const roleUpdate = sdkEvents.delivered.find(
+      (event) =>
+        event.type === "trace-create" && event.body.name === "agent-1:native-child:draft_writer",
+    )?.body;
+    expect(roleUpdate).toMatchObject({ id: childId, metadata: { role: "draft_writer" } });
+
+    diagnosticRuntime.listener?.({
+      type: "codex.native_child.lifecycle",
+      version: 1,
+      runId: ctx.runId,
+      sessionKey: ctx.sessionKey,
+      sessionId: ctx.sessionId,
+      agentId: ctx.agentId,
+      parentTurnId: ctx.runId,
+      parentThreadId: "parent-thread",
+      sourceEventId: "late-role-child-end",
+      childThreadId: "late-role-child",
+      childTurnId: "late-role-child-turn",
+      lifecycle: "turn_completed",
+      sourceTimestampMs: 1_100,
+      triggeringToolCallId: "late-role-spawn",
+      outcome: "completed",
+    });
+    diagnosticRuntime.listener?.({
+      type: "codex.native_child.status",
+      version: 1,
+      runId: ctx.runId,
+      sessionKey: ctx.sessionKey,
+      sessionId: ctx.sessionId,
+      agentId: ctx.agentId,
+      parentTurnId: ctx.runId,
+      parentThreadId: "parent-thread",
+      support: "supported",
+      authoritativeStart: true,
+      authoritativeTerminal: true,
+      providerCallOwnership: true,
+      toolCallOwnership: true,
+      drain: "completed",
+      counts: { admitted: 2, duplicates: 0, dropped: 0, activeChildren: 0 },
+    });
+    await handlers.agentEnd(
+      {
+        success: true,
+        messages: [
+          { role: "user", content: "delegate" },
+          { role: "assistant", content: "done" },
+        ],
+      },
+      ctx,
+    );
+
+    const finalMetadata = mockTrace.update.mock.calls
+      .map((call) => (call[0] as { metadata?: Record<string, unknown> }).metadata)
+      .findLast((metadata) => metadata?.nativeChildLineage);
+    expect(finalMetadata?.nativeChildLineage).toMatchObject({
+      childContext: { roles: ["draft_writer"] },
+    });
+    await service.stop?.(makeServiceCtx());
+  });
+
+  it("scopes a reused native child thread to each turn trace", async () => {
+    const service = await startService();
+    const handlers = service.getHookHandlers();
+    const childObservationIds: string[] = [];
+
+    for (const turn of [1, 2]) {
+      const ctx = {
+        ...agentCtx,
+        runId: `reused-child-run-${turn}`,
+      };
+      handlers.beforeAgentRun({ prompt: `turn ${turn}`, messages: [] }, ctx);
+      const interactionToolCallId = turn === 1 ? "reused-child-spawn-1" : "reused-child-send-2";
+      diagnosticRuntime.listener?.({
+        type: "model.call.started",
+        runId: ctx.runId,
+        callId: `reused-root-${turn}`,
+        providerRequestIndex: 1,
+        sessionKey: ctx.sessionKey,
+        sessionId: ctx.sessionId,
+        agentId: ctx.agentId,
+        provider: "openai",
+        model: "gpt-5.6-sol",
+        runtime: "codex",
+        startTimeMs: 1_900 + turn,
+      });
+      diagnosticRuntime.listener?.({
+        type: "tool.execution.started",
+        runId: ctx.runId,
+        sessionKey: ctx.sessionKey,
+        sessionId: ctx.sessionId,
+        agentId: ctx.agentId,
+        toolCallId: interactionToolCallId,
+        toolName: turn === 1 ? "collaboration.spawn_agent" : "collaboration.send_message",
+        toolOwner: "codex-rollout-trace",
+        startTimeMs: 1_950 + turn,
+        triggeringProviderCallId: `reused-root-${turn}`,
+      });
+      const childTraceCountBefore = sdkEvents.delivered.filter(
+        (event) =>
+          event.type === "trace-create" && String(event.body.name).includes(":native-child"),
+      ).length;
+      diagnosticRuntime.listener?.({
+        type: "codex.native_child.lifecycle",
+        version: 1,
+        runId: ctx.runId,
+        sessionKey: ctx.sessionKey,
+        sessionId: ctx.sessionId,
+        agentId: ctx.agentId,
+        parentTurnId: ctx.runId,
+        parentThreadId: "parent-thread",
+        sourceEventId: `reused-child-start-${turn}`,
+        childThreadId: "persistent-child",
+        childTurnId: `persistent-child-turn-${turn}`,
+        lifecycle: "turn_started",
+        sourceTimestampMs: 2_000 + turn,
+        triggeringToolCallId: interactionToolCallId,
+      });
+      await vi.waitFor(() =>
+        expect(
+          sdkEvents.delivered.filter((event) => String(event.body.name).includes(":native-child")),
+        ).toHaveLength(childTraceCountBefore + 1),
+      );
+      const childTrace = sdkEvents.delivered.findLast(
+        (event) =>
+          event.type === "trace-create" && String(event.body.name).includes(":native-child"),
+      )?.body;
+      const childTraceId = typeof childTrace?.id === "string" ? childTrace.id : "";
+      expect(childTraceId).not.toBe("");
+      childObservationIds.push(childTraceId);
+      const interactionSpan = sdkEvents.delivered.find((event) => {
+        const metadata = event.body.metadata as Record<string, unknown> | undefined;
+        return event.type === "span-create" && metadata?.toolCallId === interactionToolCallId;
+      })?.body;
+      expect(childTrace?.metadata).toMatchObject({
+        spawnObservationId: interactionSpan?.id,
+      });
+      diagnosticRuntime.listener?.({
+        type: "codex.native_child.lifecycle",
+        version: 1,
+        runId: ctx.runId,
+        sessionKey: ctx.sessionKey,
+        sessionId: ctx.sessionId,
+        agentId: ctx.agentId,
+        parentTurnId: ctx.runId,
+        parentThreadId: "parent-thread",
+        sourceEventId: `reused-child-end-${turn}`,
+        childThreadId: "persistent-child",
+        childTurnId: `persistent-child-turn-${turn}`,
+        lifecycle: "turn_completed",
+        sourceTimestampMs: 2_100 + turn,
+        outcome: "completed",
+      });
+      diagnosticRuntime.listener?.({
+        type: "codex.native_child.status",
+        version: 1,
+        runId: ctx.runId,
+        sessionKey: ctx.sessionKey,
+        sessionId: ctx.sessionId,
+        agentId: ctx.agentId,
+        parentTurnId: ctx.runId,
+        parentThreadId: "parent-thread",
+        support: "supported",
+        authoritativeStart: true,
+        authoritativeTerminal: true,
+        providerCallOwnership: true,
+        toolCallOwnership: true,
+        drain: "completed",
+        counts: { admitted: 2, duplicates: 0, dropped: 0, activeChildren: 0 },
+      });
+      await handlers.agentEnd(
+        {
+          success: true,
+          messages: [
+            { role: "user", content: `turn ${turn}` },
+            { role: "assistant", content: `done ${turn}` },
+          ],
+        },
+        ctx,
+      );
+    }
+
+    expect(childObservationIds[0]).not.toBe(childObservationIds[1]);
+    const traceCalls = mockLangfuseInstance.trace.mock.calls.map(
+      (call) => call[0] as Record<string, unknown>,
+    );
+    expect(traceCalls).toHaveLength(4);
+    expect(new Set(traceCalls.map((call) => call.id)).size).toBe(4);
+    expect(new Set(traceCalls.map((call) => call.sessionId))).toEqual(
+      new Set([agentCtx.sessionKey]),
+    );
+  });
+
+  it("keeps parent-only tracing unsupported and rejects unknown child diagnostic versions", async () => {
+    const service = await startService();
+    const handlers = service.getHookHandlers();
+    const parentOnlyCtx = { ...agentCtx, runId: "parent-only-run" };
+    handlers.beforeAgentRun({ prompt: "parent only", messages: [] }, parentOnlyCtx);
+    await handlers.agentEnd(
+      {
+        success: true,
+        messages: [
+          { role: "user", content: "parent only" },
+          { role: "assistant", content: "done" },
+        ],
+      },
+      parentOnlyCtx,
+    );
+
+    const unknownVersionCtx = { ...agentCtx, runId: "unknown-native-child-version" };
+    handlers.beforeAgentRun({ prompt: "unknown version", messages: [] }, unknownVersionCtx);
+    const childSpanCount = mockTrace.span.mock.calls.length;
+    diagnosticRuntime.listener?.({
+      type: "codex.native_child.lifecycle",
+      version: 2,
+      runId: unknownVersionCtx.runId,
+      sessionKey: unknownVersionCtx.sessionKey,
+      sessionId: unknownVersionCtx.sessionId,
+      agentId: unknownVersionCtx.agentId,
+      parentTurnId: unknownVersionCtx.runId,
+      parentThreadId: "parent-thread",
+      sourceEventId: "unknown-version-start",
+      childThreadId: "unknown-version-child",
+      lifecycle: "started",
+      sourceTimestampMs: 2_000,
+    });
+    await handlers.agentEnd(
+      {
+        success: true,
+        messages: [
+          { role: "user", content: "unknown version" },
+          { role: "assistant", content: "done" },
+        ],
+      },
+      unknownVersionCtx,
+    );
+
+    expect(mockTrace.span).toHaveBeenCalledTimes(childSpanCount);
+    const lineageMetadata = mockTrace.update.mock.calls
+      .map((call) => (call[0] as { metadata?: Record<string, unknown> }).metadata)
+      .filter((metadata) => metadata?.nativeChildLineage)
+      .map((metadata) => metadata?.nativeChildLineage as Record<string, unknown>);
+    expect(lineageMetadata.at(-2)).toMatchObject({ status: "unsupported", childCount: 0 });
+    expect(lineageMetadata.at(-1)).toMatchObject({
+      status: "unsupported",
+      childCount: 0,
+      partialReasons: expect.arrayContaining(["unknown_event_version"]),
+    });
+  });
+
+  it("scopes a late producer failure to one turn without poisoning later turns", async () => {
+    const service = await startService();
+    const handlers = service.getHookHandlers();
+
+    async function completeNativeChildTurn(runId: string, childThreadId: string) {
+      const ctx = { ...agentCtx, runId };
+      const childTurnId = `${childThreadId}-turn`;
+      handlers.beforeAgentRun({ prompt: runId, messages: [] }, ctx);
+      diagnosticRuntime.listener?.({
+        type: "model.call.started",
+        runId,
+        callId: `${runId}-root-call`,
+        providerRequestIndex: 1,
+        sessionKey: ctx.sessionKey,
+        sessionId: ctx.sessionId,
+        agentId: ctx.agentId,
+        provider: "openai",
+        model: "gpt-5.6-sol",
+        runtime: "codex",
+        startTimeMs: 2_900,
+      });
+      diagnosticRuntime.listener?.({
+        type: "tool.execution.started",
+        runId,
+        sessionKey: ctx.sessionKey,
+        sessionId: ctx.sessionId,
+        agentId: ctx.agentId,
+        toolCallId: `${runId}-spawn`,
+        toolName: "collaboration.spawn_agent",
+        toolOwner: "codex-rollout-trace",
+        startTimeMs: 2_950,
+        triggeringProviderCallId: `${runId}-root-call`,
+      });
+      diagnosticRuntime.listener?.({
+        type: "codex.native_child.lifecycle",
+        version: 1,
+        runId,
+        sessionKey: ctx.sessionKey,
+        sessionId: ctx.sessionId,
+        agentId: ctx.agentId,
+        parentTurnId: runId,
+        parentThreadId: "parent-thread",
+        sourceEventId: `${runId}-start`,
+        childThreadId,
+        childTurnId,
+        lifecycle: "turn_started",
+        sourceTimestampMs: 3_000,
+        triggeringToolCallId: `${runId}-spawn`,
+      });
+      diagnosticRuntime.listener?.({
+        type: "codex.native_child.lifecycle",
+        version: 1,
+        runId,
+        sessionKey: ctx.sessionKey,
+        sessionId: ctx.sessionId,
+        agentId: ctx.agentId,
+        parentTurnId: runId,
+        parentThreadId: "parent-thread",
+        sourceEventId: `${runId}-end`,
+        childThreadId,
+        childTurnId,
+        lifecycle: "turn_completed",
+        sourceTimestampMs: 3_100,
+        triggeringToolCallId: `${runId}-spawn`,
+        outcome: "completed",
+      });
+      diagnosticRuntime.listener?.({
+        type: "codex.native_child.status",
+        version: 1,
+        runId,
+        sessionKey: ctx.sessionKey,
+        sessionId: ctx.sessionId,
+        agentId: ctx.agentId,
+        parentTurnId: runId,
+        parentThreadId: "parent-thread",
+        support: "supported",
+        authoritativeStart: true,
+        authoritativeTerminal: true,
+        providerCallOwnership: true,
+        toolCallOwnership: true,
+        drain: "completed",
+        counts: { admitted: 2, duplicates: 0, dropped: 0, activeChildren: 0 },
+      });
+      await handlers.agentEnd(
+        {
+          success: true,
+          messages: [
+            { role: "user", content: runId },
+            { role: "assistant", content: "done" },
+          ],
+        },
+        ctx,
+      );
+      return { ctx, childTurnId };
+    }
+
+    const first = await completeNativeChildTurn("native-health-1", "child-health-1");
+    const traceCountBeforeLateEvent = mockLangfuseInstance.trace.mock.calls.length;
+    const childSpanCountBeforeLateEvent = mockTrace.span.mock.calls.length;
+    diagnosticRuntime.listener?.({
+      type: "codex.native_child.lifecycle",
+      version: 1,
+      runId: first.ctx.runId,
+      sessionKey: first.ctx.sessionKey,
+      sessionId: first.ctx.sessionId,
+      agentId: first.ctx.agentId,
+      parentTurnId: first.ctx.runId,
+      parentThreadId: "parent-thread",
+      sourceEventId: "native-health-1-late",
+      childThreadId: "child-health-1",
+      childTurnId: first.childTurnId,
+      lifecycle: "activity",
+      sourceTimestampMs: 3_200,
+    });
+    expect(mockLangfuseInstance.trace).toHaveBeenCalledTimes(traceCountBeforeLateEvent);
+    expect(mockTrace.span).toHaveBeenCalledTimes(childSpanCountBeforeLateEvent);
+
+    await completeNativeChildTurn("native-health-2", "child-health-2");
+    const lineageMetadata = mockTrace.update.mock.calls
+      .map((call) => (call[0] as { metadata?: Record<string, unknown> }).metadata)
+      .filter((metadata) => metadata?.nativeChildLineage)
+      .map((metadata) => metadata?.nativeChildLineage as Record<string, unknown>);
+    expect(lineageMetadata.at(-1)).toMatchObject({
+      status: "partial",
+      partialReasons: ["child_context_unavailable"],
+    });
+
+    await completeNativeChildTurn("native-health-3", "child-health-3");
+    const recoveredMetadata = mockTrace.update.mock.calls
+      .map((call) => (call[0] as { metadata?: Record<string, unknown> }).metadata)
+      .findLast((metadata) => metadata?.nativeChildLineage)?.nativeChildLineage as Record<
+      string,
+      unknown
+    >;
+    expect(recoveredMetadata).toMatchObject({
+      status: "partial",
+      partialReasons: ["child_context_unavailable"],
+    });
   });
 });

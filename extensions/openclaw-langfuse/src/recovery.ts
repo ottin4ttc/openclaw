@@ -1,5 +1,6 @@
 import path from "node:path";
 import type Langfuse from "langfuse";
+import { nativeChildTraceName } from "./native-child.js";
 import { buildObservationsFromEntries } from "./observations.js";
 import { redactText } from "./redact.js";
 import {
@@ -22,11 +23,74 @@ import {
   readNextTraceStartTimestamp,
   readTraceLedgerTrace,
 } from "./trace-ledger.js";
+import type { TraceLedgerTraceRecord } from "./trace-ledger.js";
 import type { IncompleteTraceInfo, MinimalLogger, SessionEntry } from "./types.js";
 import { extractUserMessageText, filterCurrentTurnEntries } from "./utils.js";
 
 export const TRACE_RECOVERY_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 export const TRACE_RECOVERY_MAX_ATTEMPTS = 3;
+
+async function recoverNativeChildTrace(
+  lf: Langfuse,
+  traceRecord: TraceLedgerTraceRecord,
+  baseUrl: string,
+  stateDir: string | null,
+  logger?: MinimalLogger | null,
+  deliveryTracker?: SdkDeliveryTracker,
+): Promise<number> {
+  const { traceId, agentId, sessionId } = traceRecord;
+  const tracker = deliveryTracker ?? new SdkDeliveryTracker();
+  const localTrackerCleanups = deliveryTracker ? [] : bindSdkDeliveryTracker(lf, tracker, logger);
+  try {
+    if (!tracker.begin(traceId, traceId, "trace-create")) {
+      throw new Error(`delivery ticket cap reached for child recovery trace ${traceId}`);
+    }
+    lf.trace({
+      id: traceId,
+      name: nativeChildTraceName(agentId, "recovered"),
+      sessionId: traceRecord.sessionKey ?? sessionId,
+      input: {
+        actorKind: "native-child",
+        agentId,
+        childThreadId: traceRecord.childThreadId,
+        childTurnId: traceRecord.childTurnId,
+        recoveryStatus: "partial",
+      },
+      output: {
+        outcome: "partial",
+        reason: "child_observation_payload_unavailable",
+      },
+      metadata: {
+        actorKind: "native-child",
+        source: "startup-recovery",
+        recoveryStatus: "partial",
+        recoveryReason: "child_observation_payload_unavailable",
+        parentTraceId: traceRecord.parentTraceId,
+        ...(traceRecord.parentTraceId
+          ? { parentTraceUrl: `${baseUrl.replace(/\/+$/, "")}/trace/${traceRecord.parentTraceId}` }
+          : {}),
+        spawnObservationId: traceRecord.spawnObservationId,
+        childTraceId: traceId,
+        childThreadId: traceRecord.childThreadId,
+        childTurnId: traceRecord.childTurnId,
+      },
+    });
+    const watermark = tracker.watermark(traceId);
+    const delivery = await flushSdkDeliveryThroughWatermark(lf, tracker, traceId, watermark);
+    if (!delivery.ok) {
+      throw new Error(`${delivery.reason} for child recovery trace ${traceId}`);
+    }
+    if (!writeTraceMarker(stateDir, agentId, sessionId, "end", traceId, logger)) {
+      throw new Error(`failed to write child recovery end marker for trace ${traceId}`);
+    }
+    return 0;
+  } finally {
+    tracker.completeTrace(traceId, { preservePending: true });
+    for (const cleanup of localTrackerCleanups) {
+      cleanup();
+    }
+  }
+}
 
 function recoveryEnv(stateDir: string | null): NodeJS.ProcessEnv {
   return stateDir ? { ...process.env, OPENCLAW_STATE_DIR: stateDir } : process.env;
@@ -114,7 +178,7 @@ export function scanIncompleteTraces(
 export async function recoverTrace(
   lf: Langfuse,
   traceInfo: IncompleteTraceInfo,
-  config: { redactEnabled: boolean },
+  config: { redactEnabled: boolean; baseUrl?: string },
   stateDir: string | null,
   logger?: MinimalLogger | null,
   deliveryTracker?: SdkDeliveryTracker,
@@ -124,6 +188,16 @@ export async function recoverTrace(
   if (!traceRecord || traceRecord.status !== "open") {
     logger?.debug?.(`Langfuse: skip recovery for trace ${traceId}; trace is not open`);
     return 0;
+  }
+  if (traceRecord.traceKind === "native-child") {
+    return recoverNativeChildTrace(
+      lf,
+      traceRecord,
+      config.baseUrl ?? "https://cloud.langfuse.com",
+      stateDir,
+      logger,
+      deliveryTracker,
+    );
   }
 
   const { entries: allEntries, sessionKey } = await readRecoverySessionMessages(

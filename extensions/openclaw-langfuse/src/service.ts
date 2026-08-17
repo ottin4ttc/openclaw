@@ -1,4 +1,4 @@
-/* eslint-disable @typescript-eslint/no-base-to-string, @typescript-eslint/restrict-template-expressions, @typescript-eslint/no-redundant-type-constituents */
+/* eslint-disable @typescript-eslint/no-base-to-string, @typescript-eslint/restrict-template-expressions */
 import path from "node:path";
 import Langfuse from "langfuse";
 import type { LangfuseGenerationClient } from "langfuse";
@@ -15,6 +15,27 @@ import type { LangfusePluginConfig } from "./config.js";
 import { retryPendingProviderRequestTerminals, subscribeDiagnosticEvents } from "./diagnostics.js";
 import { finalizeIncrementalObservations } from "./finalize.js";
 import { findMatchingRule } from "./matcher.js";
+import {
+  admitNativeChildLifecycle,
+  applyNativeChildTurnStatus,
+  ensureNativeChildObservationState,
+  findNativeChildObservation,
+  finalizeNativeChildLineage,
+  isSupportedNativeChildDiagnosticVersion,
+  nativeChildLifecycleMetadata,
+  clearNativeChildPending,
+  markNativeChildPending,
+  rememberNativeChildTriggeringTool,
+  nativeChildLineage,
+  nativeChildLineageMetadata,
+  nativeChildTraceName,
+  nativeChildTraceId,
+  noteNativeChildPartial,
+  noteNativeChildProducerUnhealthy,
+  noteNativeChildPostFinalization,
+  type CodexNativeChildLifecycleDiagnostic,
+  type CodexNativeChildStatusDiagnostic,
+} from "./native-child.js";
 import { buildObservationsFromEntries } from "./observations.js";
 import { PromptManager } from "./prompt-manager.js";
 import type { PromptResolveResult } from "./prompt-manager.js";
@@ -24,6 +45,7 @@ import {
   bindSdkDeliveryTracker,
   flushSdkDeliveryForBackpressure,
   flushSdkDeliveryThroughWatermark,
+  SDK_DELIVERY_BATCH_SIZE,
   SDK_DELIVERY_TIMEOUT_MS,
   SdkDeliveryTracker,
 } from "./sdk-delivery.js";
@@ -44,7 +66,7 @@ import {
   runtimeMetadata,
   TraceContextMap,
 } from "./trace-context.js";
-import type { TraceContextEntry } from "./trace-context.js";
+import type { NativeChildObservation, TraceContextEntry } from "./trace-context.js";
 import {
   configureTraceLedgerStore,
   TRACE_LEDGER_MAX_ENTRIES,
@@ -97,7 +119,6 @@ export type BeforeMessageWriteEvent = {
 
 // Result type deliberately uses `any` for message to match the upstream
 // AgentMessage union without importing it (not exported from plugin SDK).
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
 export type BeforeMessageWriteResult = {
   block?: boolean;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -405,7 +426,7 @@ function trackDiagnosticTask(task: Promise<void>, event: unknown): void {
   const settledTask = task.catch(() => undefined);
   const current = previous ? previous.catch(() => undefined).then(() => settledTask) : settledTask;
   diagnosticTaskTails.set(key, current);
-  trackRuntimeTask(current);
+  void trackRuntimeTask(current);
   void current.finally(() => {
     if (diagnosticTaskTails.get(key) === current) {
       diagnosticTaskTails.delete(key);
@@ -1104,7 +1125,7 @@ async function finalizeTraceDeliveryWithinReplyBudget(
   );
   void trackRuntimeTask(
     deliveryTask
-      .catch((error) => {
+      .catch((error: unknown) => {
         serviceLogger?.warn?.(
           `Langfuse: background delivery failed in ${source} (traceId=${entry.traceId}) — ${String(error)}`,
         );
@@ -1149,12 +1170,399 @@ export function createLangfuseService(
     object,
     { traceId: string; genId?: string; toolCallId?: string }
   >();
+  // A fast sequence of completed turns can share one millisecond. Keep the
+  // deterministic session/timestamp id scheme, but never reuse a trace id for
+  // two turns handled by this service instance.
+  let lastRootTraceTimestamp = 0;
 
   const redactEnabled = config.tracing?.redact !== false;
   const tracingEnabled = config.tracing?.enabled !== false;
+  const langfuseTraceBaseUrl = resolveCredentials(config).baseUrl.replace(/\/+$/, "");
 
   function getEntry(agentId?: string, sessionKey?: string): TraceContextEntry | undefined {
     return contextMap?.get(TraceContextMap.key(agentId, sessionKey));
+  }
+
+  function nativeChildLedgerIdentity(
+    entry: TraceContextEntry,
+    hints?: { agentId?: string; sessionId?: string },
+  ): { agentId: string; sessionId: string } {
+    const metadata = entry.traceMetadata ?? {};
+    return {
+      agentId:
+        hints?.agentId ?? (typeof metadata.agentId === "string" ? metadata.agentId : "unknown"),
+      sessionId:
+        hints?.sessionId ??
+        entry.sessionId ??
+        (typeof metadata.sessionId === "string" ? metadata.sessionId : ""),
+    };
+  }
+
+  function ensureNativeChildObservation(params: {
+    entry: TraceContextEntry;
+    childThreadId: string;
+    childTurnId?: string;
+    timestamp: number;
+    metadata: Record<string, unknown>;
+    source: string;
+    agentId?: string;
+    sessionId?: string;
+  }): NativeChildObservation | undefined {
+    const { entry, childThreadId } = params;
+    const state = nativeChildLineage(entry);
+    state.support = "supported";
+    state.status = "partial";
+    const parentToolCallId =
+      typeof params.metadata.triggeringToolCallId === "string"
+        ? params.metadata.triggeringToolCallId
+        : undefined;
+    const role =
+      typeof params.metadata.role === "string"
+        ? params.metadata.role
+        : parentToolCallId
+          ? state.spawnAgentRoles.get(parentToolCallId)
+          : undefined;
+    const metadata = role ? { ...params.metadata, role } : params.metadata;
+    const childTurnId =
+      params.childTurnId ??
+      (typeof metadata.childTurnId === "string" ? metadata.childTurnId : undefined) ??
+      state.currentChildTurnIds.get(childThreadId);
+    if (!childTurnId) {
+      markNativeChildPending(entry, childThreadId);
+      return undefined;
+    }
+    state.currentChildTurnIds.set(childThreadId, childTurnId);
+    const existingObservation = findNativeChildObservation(entry, childThreadId, childTurnId);
+    if (existingObservation) {
+      if (role && existingObservation.role !== role) {
+        const childEntry = existingObservation.traceEntry;
+        const parentAgentId = nativeChildLedgerIdentity(entry).agentId;
+        const nextMetadata = { ...childEntry.traceMetadata, role };
+        if (
+          beginSdkEnqueue(
+            childEntry,
+            existingObservation.id,
+            "trace-create",
+            "codex native-child role enrichment",
+          )
+        ) {
+          childEntry.traceMetadata = nextMetadata;
+          childEntry.trace.update({
+            name: nativeChildTraceName(
+              parentAgentId !== "unknown" ? parentAgentId : undefined,
+              role,
+            ),
+            metadata: nextMetadata,
+          });
+          existingObservation.role = role;
+        } else {
+          noteNativeChildPartial(entry, "child_delivery_rejected");
+        }
+      }
+      if (typeof metadata.model === "string") {
+        existingObservation.model = metadata.model;
+      }
+      return existingObservation;
+    }
+    if (!parentToolCallId) {
+      markNativeChildPending(entry, childThreadId);
+      noteNativeChildPartial(entry, "child_observation_pending_spawn_ownership");
+      return undefined;
+    }
+    rememberNativeChildTriggeringTool(entry, childThreadId, parentToolCallId);
+    const parentToolSpan =
+      entry.pendingSpans.get(parentToolCallId) ?? entry.completedSpans?.get(parentToolCallId);
+    if (!parentToolSpan) {
+      markNativeChildPending(entry, childThreadId);
+      noteNativeChildPartial(entry, "child_observation_pending_spawn_tool");
+      return undefined;
+    }
+    clearNativeChildPending(entry, childThreadId);
+    const childTraceId = nativeChildTraceId(entry.traceId, childThreadId, childTurnId);
+    const spawnObservationId = generateObservationId(entry.traceId, "span", parentToolCallId);
+    const identity = nativeChildLedgerIdentity(entry, params);
+    return ensureNativeChildObservationState(entry, childThreadId, childTurnId, () => {
+      if (
+        !writeTraceMarker(
+          serviceStateDir,
+          identity.agentId,
+          identity.sessionId,
+          "start",
+          childTraceId,
+          serviceLogger,
+          {
+            correlationKey: `native-child:${entry.traceId}:${childThreadId}:${childTurnId}`,
+            startedAt: params.timestamp,
+            traceKind: "native-child",
+            sessionKey:
+              typeof entry.traceMetadata?.sessionKey === "string"
+                ? entry.traceMetadata.sessionKey
+                : undefined,
+            parentTraceId: entry.traceId,
+            spawnObservationId,
+            childThreadId,
+            childTurnId,
+          },
+        )
+      ) {
+        noteNativeChildPartial(entry, "child_ledger_start_failed");
+        return undefined;
+      }
+      const childTraceMetadata: Record<string, unknown> = {
+        source: params.source,
+        actorKind: "native-child",
+        sessionId: identity.sessionId,
+        sessionKey: entry.traceMetadata?.sessionKey,
+        agentId: identity.agentId,
+        parentTraceId: entry.traceId,
+        parentTraceUrl: `${langfuseTraceBaseUrl}/trace/${entry.traceId}`,
+        spawnObservationId,
+        childTraceId,
+        childThreadId,
+        childTurnId,
+        ...metadata,
+      };
+      if (!beginRootTraceSdkEnqueue(childTraceId, `${params.source} child trace`)) {
+        noteNativeChildPartial(entry, "child_delivery_rejected");
+        return undefined;
+      }
+      const childTrace = langfuse?.trace({
+        id: childTraceId,
+        name: nativeChildTraceName(
+          identity.agentId !== "unknown" ? identity.agentId : undefined,
+          role,
+        ),
+        sessionId:
+          typeof entry.traceMetadata?.sessionKey === "string"
+            ? entry.traceMetadata.sessionKey
+            : identity.sessionId,
+        input: {
+          actorKind: "native-child",
+          ...(identity.agentId !== "unknown" ? { agentId: identity.agentId } : {}),
+          ...(role ? { role } : {}),
+          childThreadId,
+          childTurnId,
+        },
+        metadata: childTraceMetadata,
+      });
+      if (!childTrace) {
+        noteNativeChildPartial(entry, "child_trace_unavailable");
+        return undefined;
+      }
+      const childEntry: TraceContextEntry = {
+        trace: childTrace,
+        traceId: childTraceId,
+        actorKind: "native-child",
+        traceMetadata: childTraceMetadata,
+        llmCallCount: 0,
+        toolCallCount: 0,
+        pendingGenerations: new Map(),
+        pendingGenIds: new Map(),
+        completedGenerations: new Map(),
+        pendingSpans: new Map(),
+        completedSpanToolCallIds: new Set(),
+        createdAt: params.timestamp,
+        timestamp: params.timestamp,
+        sessionId: identity.sessionId,
+        lastRuntime: entry.lastRuntime,
+        lastRuntimeEngine: entry.lastRuntimeEngine,
+        lastRuntimeTransport: entry.lastRuntimeTransport,
+      };
+      if (
+        beginSdkEnqueue(entry, spawnObservationId, "span-update", `${params.source} spawn link`)
+      ) {
+        parentToolSpan.update({
+          metadata: {
+            source: params.source,
+            parentTraceId: entry.traceId,
+            spawnObservationId,
+            childTraceId,
+            childTraceUrl: `${langfuseTraceBaseUrl}/trace/${childTraceId}`,
+            childThreadId,
+            childTurnId,
+          },
+        });
+      } else {
+        noteNativeChildPartial(entry, "spawn_link_delivery_rejected");
+      }
+      return {
+        id: childTraceId,
+        traceEntry: childEntry,
+        spawnObservationId,
+        childThreadId,
+        childTurnId,
+        ended: false,
+        ...(role ? { role } : {}),
+        ...(typeof metadata.model === "string" ? { model: metadata.model } : {}),
+      };
+    });
+  }
+
+  function updateNativeChildObservation(
+    entry: TraceContextEntry,
+    observation: NativeChildObservation,
+    event: CodexNativeChildLifecycleDiagnostic,
+  ): void {
+    const metadata = nativeChildLifecycleMetadata(event);
+    if (event.role) {
+      observation.role = event.role;
+    }
+    if (event.model) {
+      observation.model = event.model;
+      observation.traceEntry.lastModel = event.model;
+    }
+    const terminal = event.lifecycle === "turn_completed" || event.lifecycle === "ended";
+    if (observation.ended && !terminal) {
+      noteNativeChildPartial(entry, "activity_after_terminal");
+      noteNativeChildProducerUnhealthy(entry);
+      return;
+    }
+    const childEntry = observation.traceEntry;
+    if (
+      !beginSdkEnqueue(
+        childEntry,
+        observation.id,
+        "trace-create",
+        "codex native-child diagnostic trace update",
+      )
+    ) {
+      noteNativeChildPartial(entry, "child_delivery_rejected");
+      return;
+    }
+    const childMetadata = {
+      ...childEntry.traceMetadata,
+      source: "codex_native_child_diagnostic",
+      ...metadata,
+    };
+    const publishTerminalFallback = terminal && !observation.traceOutputPublished;
+    childEntry.traceMetadata = childMetadata;
+    childEntry.trace.update({
+      metadata: childMetadata,
+      ...(publishTerminalFallback ? { output: { outcome: event.outcome ?? "completed" } } : {}),
+      ...(event.outcome && event.outcome !== "completed"
+        ? {
+            level: "ERROR" as const,
+            statusMessage: `native_child_${event.outcome}`,
+          }
+        : {}),
+    });
+    if (publishTerminalFallback) {
+      observation.traceOutputPublished = true;
+    }
+    if (terminal && !observation.ended) {
+      observation.ended = true;
+      const identity = nativeChildLedgerIdentity(entry, event);
+      observation.pendingTerminalIdentity = identity;
+    }
+  }
+
+  function finalizePendingNativeChildObservations(entry: TraceContextEntry): void {
+    for (const observation of nativeChildLineage(entry).observations.values()) {
+      const identity = observation.pendingTerminalIdentity;
+      const childEntry = observation.traceEntry;
+      if (!identity || childEntry.deliveryFinalized || childEntry.finalizationInProgress) {
+        continue;
+      }
+      observation.pendingTerminalIdentity = undefined;
+      childEntry.finalized = true;
+      childEntry.finalizationInProgress = true;
+      void trackRuntimeTask(
+        finalizeTraceDelivery(
+          childEntry,
+          identity.agentId,
+          identity.sessionId,
+          "native-child terminal",
+        ).finally(() => completeTraceFinalization(childEntry)),
+      );
+    }
+  }
+
+  function handleNativeChildDiagnostic(
+    entry: TraceContextEntry,
+    event: CodexNativeChildLifecycleDiagnostic | CodexNativeChildStatusDiagnostic,
+  ): void {
+    try {
+      if (event.sessionId && !entry.sessionId) {
+        entry.sessionId = event.sessionId;
+      }
+      const state = nativeChildLineage(entry);
+      if (!isSupportedNativeChildDiagnosticVersion(event)) {
+        state.support = "unsupported";
+        state.status = "unsupported";
+        state.droppedEvents += 1;
+        noteNativeChildPartial(entry, "unknown_event_version");
+        noteNativeChildProducerUnhealthy(entry);
+        return;
+      }
+      if (event.type === "codex.native_child.status") {
+        if (entry.deliveryFinalized) {
+          return;
+        }
+        applyNativeChildTurnStatus(entry, event, true);
+        return;
+      }
+      if (event.childTurnId) {
+        state.currentChildTurnIds.set(event.childThreadId, event.childTurnId);
+      }
+      const childTurnId = event.childTurnId ?? state.currentChildTurnIds.get(event.childThreadId);
+      const existingObservation = findNativeChildObservation(
+        entry,
+        event.childThreadId,
+        childTurnId,
+      );
+      const pendingDetachedChildTurn = Boolean(
+        event.childTurnId &&
+        event.triggeringToolCallId &&
+        state.pendingChildThreads.has(event.childThreadId),
+      );
+      if (existingObservation?.traceEntry.deliveryFinalized) {
+        noteNativeChildPostFinalization(entry);
+        noteNativeChildProducerUnhealthy(entry);
+        return;
+      }
+      if (entry.deliveryFinalized && !existingObservation && !pendingDetachedChildTurn) {
+        noteNativeChildPostFinalization(entry);
+        noteNativeChildProducerUnhealthy(entry);
+        return;
+      }
+      if (
+        !admitNativeChildLifecycle(entry, event, {
+          allowAfterRootFinalization:
+            (existingObservation !== undefined &&
+              !existingObservation.traceEntry.deliveryFinalized) ||
+            pendingDetachedChildTurn,
+        })
+      ) {
+        return;
+      }
+      const pendingLifecycleEvents = state.pendingLifecycleEvents.get(event.childThreadId) ?? [];
+      pendingLifecycleEvents.push(event);
+      state.pendingLifecycleEvents.set(event.childThreadId, pendingLifecycleEvents);
+      const metadata = nativeChildLifecycleMetadata(event);
+      const observation = ensureNativeChildObservation({
+        entry,
+        childThreadId: event.childThreadId,
+        childTurnId,
+        timestamp: event.sourceTimestampMs,
+        metadata,
+        source: "codex_native_child_diagnostic",
+        ...(event.agentId ? { agentId: event.agentId } : {}),
+        ...(event.sessionId ? { sessionId: event.sessionId } : {}),
+      });
+      if (observation) {
+        state.pendingLifecycleEvents.delete(event.childThreadId);
+        clearNativeChildPending(entry, event.childThreadId);
+        for (const pendingEvent of pendingLifecycleEvents) {
+          updateNativeChildObservation(
+            entry,
+            observation,
+            pendingEvent as CodexNativeChildLifecycleDiagnostic,
+          );
+        }
+      }
+    } catch (error) {
+      serviceLogger?.warn?.(`Langfuse: Codex native-child tracing failed open — ${String(error)}`);
+    }
   }
 
   function reserveRootTraceIdentity(
@@ -1177,7 +1585,9 @@ export function createLangfuseService(
       ctx.sessionId ?? "",
       runKey,
     );
-    const timestamp = persistedMarker?.timestamp ?? Date.now();
+    const timestamp =
+      persistedMarker?.timestamp ?? Math.max(Date.now(), lastRootTraceTimestamp + 1);
+    lastRootTraceTimestamp = Math.max(lastRootTraceTimestamp, timestamp);
     const traceId =
       persistedMarker?.traceId ?? generateTraceId(ctx.sessionKey ?? "unknown", timestamp);
     const tags = [ctx.agentId, ctx.channelId, ...(config.tracing?.tags ?? [])].filter(
@@ -1495,7 +1905,7 @@ export function createLangfuseService(
       rememberRuntimeIdentity(entry, event);
       const runtimePatch = runtimeMetadata(entry);
       const runtimeChanged = Object.entries(runtimePatch).some(
-        ([key, value]) => entry.traceMetadata?.[key] !== value,
+        ([metadataKey, value]) => entry.traceMetadata?.[metadataKey] !== value,
       );
       if (
         runtimeChanged &&
@@ -1824,7 +2234,7 @@ export function createLangfuseService(
       const resolvedToolCallId =
         toolCallId ?? `${event.toolName}-${Math.max(entry.toolCallCount, 1)}`;
       let span = entry.pendingSpans.get(resolvedToolCallId);
-      let spanId = generateObservationId(entry.traceId, "span", resolvedToolCallId);
+      const spanId = generateObservationId(entry.traceId, "span", resolvedToolCallId);
       if (!span && !entry.completedSpanToolCallIds.has(resolvedToolCallId)) {
         const endMs = Date.now();
         const startTime =
@@ -2269,6 +2679,7 @@ export function createLangfuseService(
             }
           : undefined;
 
+        finalizeNativeChildLineage(entry, true);
         const finalTraceMetadata = replaceTraceMetadata(entry, {
           sessionId,
           sessionKey: ctx.sessionKey,
@@ -2290,6 +2701,7 @@ export function createLangfuseService(
               : undefined,
           ...entry.modelContextMetadata,
           ...runtimeMetadata(entry),
+          nativeChildLineage: nativeChildLineageMetadata(entry),
           prompt: truncatePayload(entry.promptMatch),
           ...(entry.observationReconciliation
             ? { observationReconciliation: entry.observationReconciliation }
@@ -2480,7 +2892,7 @@ export function createLangfuseService(
       return transientTraceId;
     }
     const metadata = metadataRecord(msg.metadata);
-    const langfuseMetadata = metadataRecord(metadata._langfuse);
+    const langfuseMetadata = metadataRecord(metadata["_langfuse"]);
     const traceId = langfuseMetadata.traceId;
     return typeof traceId === "string" && traceId ? traceId : undefined;
   }
@@ -2623,7 +3035,7 @@ export function createLangfuseService(
       messageSeq += 1;
       const persistedEntryId =
         transcriptEntry.id ?? (transcriptEntry as SessionEntry & { entryId?: string }).entryId;
-      const idMatches = !!update.messageId && persistedEntryId === update.messageId;
+      const idMatches = Boolean(update.messageId) && persistedEntryId === update.messageId;
       const seqMatches = update.messageSeq !== undefined && messageSeq === update.messageSeq;
       if (idMatches || seqMatches) {
         return transcriptEntry;
@@ -2661,7 +3073,7 @@ export function createLangfuseService(
 
       const persistedEntryId =
         transcriptEntry.id ?? (transcriptEntry as SessionEntry & { entryId?: string }).entryId;
-      const idMatches = !!update.messageId && persistedEntryId === update.messageId;
+      const idMatches = Boolean(update.messageId) && persistedEntryId === update.messageId;
       const seqMatches = update.messageSeq !== undefined && messageSeq === update.messageSeq;
       if (!idMatches && !seqMatches) {
         continue;
@@ -2766,7 +3178,7 @@ export function createLangfuseService(
       toolName,
       input,
       startTime,
-      redactEnabled,
+      redactEnabled: redactToolPayloads,
       source,
     } = params;
     if (entry.pendingSpans.has(toolCallId) || entry.completedSpanToolCallIds.has(toolCallId)) {
@@ -2800,7 +3212,7 @@ export function createLangfuseService(
       id: spanId,
       name: `tool:${toolName}`,
       startTime,
-      input: redactObject(truncatePayload(input), redactEnabled),
+      input: redactObject(truncatePayload(input), redactToolPayloads),
       metadata: {
         toolName,
         toolCallId,
@@ -2831,7 +3243,7 @@ export function createLangfuseService(
       toolName,
       output,
       endTime,
-      redactEnabled,
+      redactEnabled: redactToolPayloads,
       source,
       isError = false,
     } = params;
@@ -2894,7 +3306,7 @@ export function createLangfuseService(
     }
     span.update({
       endTime,
-      output: redactObject(truncatePayload(output), redactEnabled),
+      output: redactObject(truncatePayload(output), redactToolPayloads),
       metadata: {
         toolName,
         toolCallId,
@@ -3116,7 +3528,7 @@ export function createLangfuseService(
       : entry === activeEntry
         ? "active"
         : "finalized";
-    const isInitiallyLateFinalizedTranscript = !!entry?.finalized && canRepairLateTranscript;
+    const isInitiallyLateFinalizedTranscript = Boolean(entry?.finalized) && canRepairLateTranscript;
     if (
       !entry ||
       entry.deliveryFinalized ||
@@ -3165,7 +3577,7 @@ export function createLangfuseService(
       const stopReason = msg.stopReason as string | undefined;
 
       serviceLogger?.info?.(
-        `Langfuse: transcript assistant msg — model=${model ?? "?"} stopReason=${stopReason ?? "?"} hasUsage=${!!usage}`,
+        `Langfuse: transcript assistant msg — model=${model ?? "?"} stopReason=${stopReason ?? "?"} hasUsage=${Boolean(usage)}`,
       );
 
       // Store usage/output on entry for agent_end trace metadata (mirrors llm_output behavior)
@@ -3183,7 +3595,7 @@ export function createLangfuseService(
         const texts = contentArr
           .filter(
             (b: unknown) =>
-              !!b && typeof b === "object" && (b as Record<string, unknown>).type === "text",
+              Boolean(b) && typeof b === "object" && (b as Record<string, unknown>).type === "text",
           )
           .map((b: unknown) => (b as Record<string, unknown>).text as string);
         if (texts.length > 0) {
@@ -3466,9 +3878,9 @@ export function createLangfuseService(
         publicKey,
         secretKey,
         baseUrl,
-        // The self-hosted ingestion proxy accepts 1 MB requests. Send each bounded
-        // observation separately so multiple valid events cannot overflow one batch.
-        flushAt: 1,
+        // Each event is already bounded below 100 KB. Five-event batches stay below
+        // the self-hosted 1 MB proxy cap, while the delivery wrapper serializes flushes.
+        flushAt: SDK_DELIVERY_BATCH_SIZE,
         flushInterval: 1000,
         requestTimeout: 30000,
         fetchRetryCount: 2,
@@ -3477,6 +3889,9 @@ export function createLangfuseService(
       sdkEventCleanups.push(...bindSdkDeliveryTracker(langfuse, sdkDeliveryTracker, ctx.logger));
       contextMap = new TraceContextMap((entry) => {
         sdkDeliveryTracker.completeTrace(entry.traceId);
+        for (const observation of entry.nativeChildLineage?.observations.values() ?? []) {
+          sdkDeliveryTracker.completeTrace(observation.traceEntry.traceId);
+        }
       });
       contextMap.startSweep();
       activeRuntimeEvents = runtimeEvents;
@@ -3495,7 +3910,7 @@ export function createLangfuseService(
       }
 
       // Fire-and-forget: recover incomplete traces from previous runs
-      trackRuntimeTask(
+      void trackRuntimeTask(
         (async () => {
           try {
             if (!tracingEnabled || !serviceStateDir) {
@@ -3532,6 +3947,7 @@ export function createLangfuseService(
                   traceInfo,
                   {
                     redactEnabled,
+                    baseUrl,
                   },
                   serviceStateDir,
                   serviceLogger,
@@ -3603,9 +4019,61 @@ export function createLangfuseService(
             return beginSdkEnqueue(entry, observationId, eventType, source);
           },
           onDiagnosticTask: trackDiagnosticTask,
+          onNativeChildDiagnostic: handleNativeChildDiagnostic,
+          onNativeChildDiagnosticBatchComplete: finalizePendingNativeChildObservations,
+          onNativeChildPostFinalization: (entry) => {
+            noteNativeChildProducerUnhealthy(entry);
+          },
+          resolveNativeChildParent: (entry, childThreadId, childTurnId, timestamp, source) =>
+            (() => {
+              const state = nativeChildLineage(entry);
+              const observation = ensureNativeChildObservation({
+                entry,
+                childThreadId,
+                childTurnId,
+                timestamp,
+                metadata: {
+                  childThreadId,
+                  childTurnId,
+                  lifecycle: "owned_call_activity",
+                  triggeringToolCallId: state.childTriggeringToolCallIds.get(childThreadId),
+                },
+                source,
+              });
+              if (observation) {
+                const pendingLifecycleEvents =
+                  state.pendingLifecycleEvents.get(childThreadId) ?? [];
+                state.pendingLifecycleEvents.delete(childThreadId);
+                clearNativeChildPending(entry, childThreadId);
+                for (const pendingEvent of pendingLifecycleEvents) {
+                  updateNativeChildObservation(
+                    entry,
+                    observation,
+                    pendingEvent as CodexNativeChildLifecycleDiagnostic,
+                  );
+                }
+              }
+              return observation;
+            })(),
           onTraceFinalized: async (entry, agentId, sessionId) => {
             if (entry.deliveryFinalized || entry.finalizationInProgress) {
               return;
+            }
+            finalizeNativeChildLineage(entry, true);
+            const metadata = {
+              ...entry.traceMetadata,
+              nativeChildLineage: nativeChildLineageMetadata(entry),
+            };
+            entry.traceMetadata = metadata;
+            if (
+              beginSdkEnqueue(
+                entry,
+                entry.traceId,
+                "trace-create",
+                "diagnostic native-child metadata",
+              )
+            ) {
+              entry.trace.update({ metadata });
             }
             entry.finalizationInProgress = true;
             try {

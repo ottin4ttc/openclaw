@@ -11,6 +11,7 @@ import type { PluginLogger } from "openclaw/plugin-sdk/plugin-entry";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { LangfusePluginConfig } from "./config.js";
 import { retryPendingProviderRequestTerminals, subscribeDiagnosticEvents } from "./diagnostics.js";
+import { applyNativeChildTurnStatus, nativeChildLineageMetadata } from "./native-child.js";
 import { TraceContextMap } from "./trace-context.js";
 import type { TraceContextEntry } from "./trace-context.js";
 import {
@@ -1462,6 +1463,17 @@ describe("Langfuse diagnostic subscription", () => {
       durationMs: 10,
       usage: { input: 4, output: 2, total: 6 },
     });
+    emitTrustedDiagnosticEvent({
+      type: "tool.execution.started",
+      runId: base.runId,
+      sessionKey,
+      sessionId: base.sessionId,
+      agentId,
+      toolCallId: "spawn-occupied",
+      toolName: "collaboration.spawn_agent",
+      toolOwner: "codex-rollout-trace",
+      triggeringProviderCallId: base.callId,
+    });
     await waitForDiagnosticEventsDrained();
 
     expect(trace.generation).toHaveBeenCalledWith(expect.objectContaining({ name: "llm-call-2" }));
@@ -1470,6 +1482,7 @@ describe("Langfuse diagnostic subscription", () => {
     expect(contextMap.get(contextKey)?.providerRequestGenerationIndexes?.get("call-occupied")).toBe(
       2,
     );
+    expect(contextMap.get(contextKey)?.toolParentCallIndexes?.get("spawn-occupied")).toBe(2);
 
     unsubscribe?.();
   });
@@ -1522,6 +1535,88 @@ describe("Langfuse diagnostic subscription", () => {
     expect(trace.generation).toHaveBeenCalledWith(
       expect.objectContaining({ id: "trace-finalization-barrier-gen-1" }),
     );
+    unsubscribe?.();
+  });
+
+  it("rejects native-child diagnostics beyond the finalization cursor", async () => {
+    const { langfuse, trace } = createLangfuseMock();
+    const contextMap = new TraceContextMap();
+    const agentId = "openmai-u1";
+    const sessionKey = `agent:${agentId}:openresponses:native-child-finalization-barrier`;
+    const contextKey = TraceContextMap.key(agentId, sessionKey);
+    contextMap.create(contextKey, {
+      trace: trace as never,
+      traceId: "trace-native-child-finalization-barrier",
+      llmCallCount: 0,
+      toolCallCount: 0,
+      pendingGenerations: new Map(),
+      pendingGenIds: new Map(),
+      completedGenerations: new Map(),
+      pendingSpans: new Map(),
+      completedSpanToolCallIds: new Set(),
+      finalizationInProgress: true,
+      diagnosticAdmissionClosed: true,
+      finalizationDiagnosticSequence: 10,
+      createdAt: Date.now(),
+      timestamp: Date.now(),
+    });
+    const entry = contextMap.get(contextKey)!;
+    applyNativeChildTurnStatus(
+      entry,
+      {
+        type: "codex.native_child.status",
+        version: 1,
+        runId: "run-native-child-finalization-barrier",
+        parentTurnId: "turn-native-child-finalization-barrier",
+        parentThreadId: "parent-native-child-finalization-barrier",
+        support: "supported",
+        authoritativeStart: true,
+        authoritativeTerminal: true,
+        providerCallOwnership: true,
+        toolCallOwnership: true,
+        drain: "completed",
+        counts: { admitted: 2, duplicates: 0, dropped: 0, activeChildren: 0 },
+      },
+      true,
+    );
+    const onNativeChildDiagnostic = vi.fn();
+    const onNativeChildPostFinalization = vi.fn();
+    const unsubscribe = await subscribeDiagnosticEvents({
+      langfuse: langfuse as never,
+      contextMap,
+      logger: mockLogger,
+      stateDir: tmpDir,
+      redactEnabled: false,
+      config,
+      promptManager: null,
+      internalDiagnostics,
+      onNativeChildDiagnostic,
+      onNativeChildPostFinalization,
+    });
+
+    diagnosticBus.listener?.({
+      type: "codex.native_child.lifecycle",
+      version: 1,
+      seq: 11,
+      runId: "run-native-child-finalization-barrier",
+      sessionKey,
+      sessionId: "session-native-child-finalization-barrier",
+      agentId,
+      parentTurnId: "turn-native-child-finalization-barrier",
+      parentThreadId: "parent-native-child-finalization-barrier",
+      sourceEventId: "late-native-child-start",
+      childThreadId: "late-native-child",
+      lifecycle: "started",
+      sourceTimestampMs: Date.now(),
+    });
+
+    expect(onNativeChildDiagnostic).not.toHaveBeenCalled();
+    expect(onNativeChildPostFinalization).toHaveBeenCalledWith(entry);
+    expect(nativeChildLineageMetadata(entry)).toMatchObject({
+      status: "partial",
+      droppedEvents: 1,
+      partialReasons: expect.arrayContaining(["post_finalization_event"]),
+    });
     unsubscribe?.();
   });
 

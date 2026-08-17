@@ -445,6 +445,65 @@ export type DiagnosticToolParamsSummary =
 export type DiagnosticToolSource = "channel" | "core" | "mcp" | "plugin";
 export type DiagnosticToolTerminalReason = "failed" | "cancelled" | "timed_out";
 
+export type DiagnosticCodexNativeChildLifecycle =
+  | "started"
+  | "activity"
+  | "turn_started"
+  | "turn_completed"
+  | "ended";
+
+export type DiagnosticCodexNativeChildOutcome =
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "interrupted"
+  | "timed_out";
+
+type DiagnosticCodexNativeChildBaseEvent = DiagnosticBaseEvent & {
+  version: 1;
+  runId: string;
+  sessionKey?: string;
+  sessionId?: string;
+  agentId?: string;
+  parentTurnId: string;
+  parentThreadId: string;
+};
+
+export type DiagnosticCodexNativeChildLifecycleEvent = DiagnosticCodexNativeChildBaseEvent & {
+  type: "codex.native_child.lifecycle";
+  sourceEventId: string;
+  childThreadId: string;
+  /** Native collaboration tool call that created the child, when known. */
+  triggeringToolCallId?: string;
+  /** Canonical Codex V2 path, for example `/root/talent_analyst`. */
+  agentPath?: string;
+  childTurnId?: string;
+  lifecycle: DiagnosticCodexNativeChildLifecycle;
+  sourceTimestampMs: number;
+  role?: string;
+  model?: string;
+  reasoningEffort?: string;
+  depth?: number;
+  outcome?: DiagnosticCodexNativeChildOutcome;
+};
+
+export type DiagnosticCodexNativeChildStatusEvent = DiagnosticCodexNativeChildBaseEvent & {
+  type: "codex.native_child.status";
+  support: "supported" | "unsupported";
+  drain: "completed" | "timed_out" | "not_applicable";
+  authoritativeStart: boolean;
+  authoritativeTerminal: boolean;
+  providerCallOwnership: boolean;
+  toolCallOwnership: boolean;
+  counts: {
+    admitted: number;
+    duplicates: number;
+    dropped: number;
+    activeChildren: number;
+  };
+  partialReasons?: string[];
+};
+
 type DiagnosticToolExecutionBaseEvent = DiagnosticBaseEvent & {
   runId?: string;
   sessionKey?: string;
@@ -457,6 +516,14 @@ type DiagnosticToolExecutionBaseEvent = DiagnosticBaseEvent & {
   toolOwner?: string;
   toolCallId?: string;
   paramsSummary?: DiagnosticToolParamsSummary;
+  /** Stable native-child owner supplied by the runtime boundary. */
+  nativeChildThreadId?: string;
+  /** Exact Codex child turn that owns the tool call. */
+  nativeChildTurnId?: string;
+  /** Active OpenClaw turn that owns the native child. */
+  parentTurnId?: string;
+  /** Stable provider call that triggered the tool, when the runtime proves it. */
+  triggeringProviderCallId?: string;
 };
 
 export type DiagnosticToolExecutionStartedEvent = DiagnosticToolExecutionBaseEvent & {
@@ -595,15 +662,25 @@ type DiagnosticModelCallBaseEvent = DiagnosticBaseEvent & {
   callId: string;
   sessionKey?: string;
   sessionId?: string;
+  agentId?: string;
   provider: string;
   model: string;
   api?: string;
   transport?: string;
+  runtime?: string;
+  runtimeEngine?: string;
+  observationUnit?: "request" | "turn";
   contextTokenBudget?: number;
   contextWindowSource?: "model" | "modelsConfig" | "agentContextTokens" | "default";
   contextWindowReferenceTokens?: number;
   upstreamRequestIdHash?: string;
   promptStats?: DiagnosticModelCallPromptStats;
+  /** Stable native-child owner supplied by the runtime boundary. */
+  nativeChildThreadId?: string;
+  /** Exact Codex child turn that owns the provider request. */
+  nativeChildTurnId?: string;
+  /** Active OpenClaw turn that owns the native child. */
+  parentTurnId?: string;
 };
 
 export type DiagnosticModelCallStartedEvent = DiagnosticModelCallBaseEvent & {
@@ -634,9 +711,13 @@ export type DiagnosticModelCallErrorEvent = DiagnosticModelCallBaseEvent & {
 type DiagnosticModelCallPromptStats = Readonly<{
   inputMessagesCount?: number;
   inputMessagesChars?: number;
+  inputMessagesHash?: string;
+  systemPromptSource?: "instructions" | "input_messages";
   systemPromptChars?: number;
+  systemPromptHash?: string;
   toolDefinitionsCount?: number;
   toolDefinitionsChars?: number;
+  toolDefinitionsHash?: string;
   totalChars?: number;
 }>;
 
@@ -775,6 +856,8 @@ export type DiagnosticEventPayload =
   | DiagnosticLivenessWarningEvent
   | DiagnosticPhaseCompletedEvent
   | DiagnosticToolLoopEvent
+  | DiagnosticCodexNativeChildLifecycleEvent
+  | DiagnosticCodexNativeChildStatusEvent
   | DiagnosticToolExecutionStartedEvent
   | DiagnosticToolExecutionCompletedEvent
   | DiagnosticToolExecutionErrorEvent
@@ -913,6 +996,8 @@ const ASYNC_DIAGNOSTIC_EVENT_TYPES = new Set<DiagnosticEventPayload["type"]>([
   "model.call.started",
   "model.call.completed",
   "model.call.error",
+  "codex.native_child.lifecycle",
+  "codex.native_child.status",
   "run.progress",
   "harness.run.completed",
   "harness.run.error",

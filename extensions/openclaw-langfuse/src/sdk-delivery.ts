@@ -4,6 +4,7 @@ import type { MinimalLogger } from "./types.js";
 import { LANGFUSE_SDK_EVENT_LIMIT_BYTES } from "./utils.js";
 
 export const SDK_DELIVERY_TIMEOUT_MS = 5_000;
+export const SDK_DELIVERY_BATCH_SIZE = 5;
 export const SDK_DELIVERY_MAX_TICKETS_PER_TRACE = 512;
 export const SDK_DELIVERY_MAX_ACTIVE_TRACES = 100;
 export const SDK_DELIVERY_MAX_EVENT_BYTES = LANGFUSE_SDK_EVENT_LIMIT_BYTES;
@@ -113,16 +114,6 @@ export class SdkDeliveryTracker {
 
   noteFlush(payload: unknown, error?: unknown, scope = this.captureFlushScope()): void {
     const flushedObservations = observationsFromSdkFlushPayload(payload);
-    // Production config uses flushAt=1. A multi-item callback comes from an
-    // unsupported batching policy, where public SDK data cannot identify the
-    // privately processed subset, so no observation ticket can settle safely.
-    if (flushedObservations.length !== 1) {
-      for (const unmatchedTicket of scope.tickets) {
-        this.releaseScopedTicket(unmatchedTicket, scope);
-      }
-      scope.tickets.length = 0;
-      return;
-    }
     const observations: Array<{
       traceId?: string;
       id: string;
@@ -210,20 +201,11 @@ export class SdkDeliveryTracker {
     return invocation;
   }
 
-  completeFlushInvocation(
-    invocation: ExplicitFlushInvocation | undefined,
-    error?: unknown,
-    payload?: unknown,
-  ): void {
+  completeFlushInvocation(invocation: ExplicitFlushInvocation | undefined, error?: unknown): void {
     if (!invocation) {
       return;
     }
-    const hasCorrelatableItem = observationsFromSdkFlushPayload(payload).length > 0;
-    invocation.complete(
-      error != null && !hasCorrelatableItem
-        ? { ok: false, reason: "delivery failed" }
-        : { ok: true },
-    );
+    invocation.complete(error != null ? { ok: false, reason: "delivery failed" } : { ok: true });
   }
 
   async awaitTrace(
@@ -429,27 +411,81 @@ export function bindSdkDeliveryTracker(
   langfuse: Langfuse,
   tracker: SdkDeliveryTracker,
   logger?: MinimalLogger | null,
+  batchSize = SDK_DELIVERY_BATCH_SIZE,
 ): Array<() => void> {
   const cleanups: Array<() => void> = [];
   if (typeof langfuse.flush === "function") {
+    // Preserve the exact SDK method for cleanup; every invocation below supplies
+    // the Langfuse receiver explicitly, so the unbound reference never escapes.
+    // eslint-disable-next-line @typescript-eslint/unbound-method
     const originalFlush = langfuse.flush;
-    const trackedFlush: Langfuse["flush"] = function (callback) {
-      const scope = tracker.captureFlushScope();
-      const invocation = tracker.beginFlushInvocation();
-      try {
-        return originalFlush.call(langfuse, (error?: unknown, items?: unknown) => {
-          tracker.noteFlush(items, error, scope);
-          tracker.completeFlushInvocation(invocation, error, items);
-          callback?.(error, items);
-        });
-      } catch (error) {
-        tracker.noteFlush([], error, scope);
-        tracker.completeFlushInvocation(invocation, error);
-        throw error;
+    type PendingFlush = {
+      automatic: boolean;
+      callback?: Parameters<Langfuse["flush"]>[0];
+      invocation?: ExplicitFlushInvocation;
+    };
+    const pendingFlushes: PendingFlush[] = [];
+    let automaticFlushQueued = false;
+    let flushActive = false;
+    let disposed = false;
+
+    const queueAutomaticFlush = (): void => {
+      if (automaticFlushQueued || disposed) {
+        return;
       }
+      automaticFlushQueued = true;
+      pendingFlushes.push({ automatic: true });
+    };
+
+    const drainFlushQueue = (): void => {
+      if (flushActive || disposed) {
+        return;
+      }
+      const pending = pendingFlushes.shift();
+      if (!pending) {
+        return;
+      }
+      if (pending.automatic) {
+        automaticFlushQueued = false;
+      }
+      flushActive = true;
+      const scope = tracker.captureFlushScope();
+      let completed = false;
+      const complete = (error?: unknown, items?: unknown): void => {
+        if (completed) {
+          return;
+        }
+        completed = true;
+        tracker.noteFlush(items, error, scope);
+        tracker.completeFlushInvocation(pending.invocation, error);
+        pending.callback?.(error, items);
+        const flushedItemCount = Array.isArray(items) ? items.length : 0;
+        flushActive = false;
+        if (flushedItemCount >= batchSize) {
+          queueAutomaticFlush();
+        }
+        drainFlushQueue();
+      };
+      try {
+        originalFlush.call(langfuse, complete);
+      } catch (error) {
+        complete(error, []);
+      }
+    };
+
+    const trackedFlush: Langfuse["flush"] = function (callback) {
+      const invocation = tracker.beginFlushInvocation();
+      if (callback || invocation) {
+        pendingFlushes.push({ automatic: false, callback, invocation });
+      } else {
+        queueAutomaticFlush();
+      }
+      drainFlushQueue();
     };
     langfuse.flush = trackedFlush;
     cleanups.push(() => {
+      disposed = true;
+      pendingFlushes.length = 0;
       if (langfuse.flush === trackedFlush) {
         langfuse.flush = originalFlush;
       }

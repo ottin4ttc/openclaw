@@ -103,6 +103,7 @@ async function notifyChildStarted(
   parentThreadId = "parent-thread",
   childThreadId = "child-thread",
   agentPath = childThreadId,
+  agentRole?: string,
 ): Promise<void> {
   await client.notify({
     method: "thread/started",
@@ -115,6 +116,7 @@ async function notifyChildStarted(
               parent_thread_id: parentThreadId,
               depth: 1,
               agent_path: agentPath,
+              ...(agentRole ? { agent_role: agentRole } : {}),
             },
           },
         },
@@ -129,28 +131,24 @@ function nativeCompletionNotification(params: {
   result: string | null;
   parentThreadId?: string;
 }): CodexServerNotification {
-  const statusValue = params.result === null ? "null" : JSON.stringify(params.result);
-  const content =
-    `<subagent_notification>{"agent_path":${JSON.stringify(params.agentPath)},"status":{` +
-    `${JSON.stringify(params.statusLabel)}:${statusValue}}}</subagent_notification>`;
+  const result = params.result ?? "";
+  const payload =
+    params.statusLabel === "errored"
+      ? `Agent errored: ${result}\n\nThis agent's turn failed. If you still need this agent, use the available collaboration tools to give it another task.`
+      : result;
+  const content = `Message Type: FINAL_ANSWER\nTask name: /root\nSender: ${params.agentPath}\nPayload:\n${payload}`;
   return {
     method: "rawResponseItem/completed",
     params: {
       threadId: params.parentThreadId ?? "parent-thread",
       item: {
-        type: "message",
-        role: "assistant",
-        phase: "commentary",
+        type: "agent_message",
+        author: params.agentPath,
+        recipient: "/root",
         content: [
           {
-            type: "output_text",
-            text: JSON.stringify({
-              author: params.agentPath,
-              recipient: "/root",
-              other_recipients: [],
-              content,
-              trigger_turn: false,
-            }),
+            type: "input_text",
+            text: content,
           },
         ],
       },
@@ -202,6 +200,7 @@ describe("CodexNativeSubagentMonitor", () => {
               thread_spawn: {
                 parent_thread_id: "parent-thread",
                 depth: 1,
+                agent_path: "/root/researcher",
                 agent_nickname: "Engineer",
               },
             },
@@ -235,7 +234,11 @@ describe("CodexNativeSubagentMonitor", () => {
 
   it("registers Codex multi-agent V2 children from subagent activity", async () => {
     const client = createClient();
-    const runtime = createRuntime();
+    const emitted: Array<Record<string, unknown>> = [];
+    const runtime = {
+      ...createRuntime(),
+      emitTrustedDiagnosticEvent: vi.fn((event) => emitted.push(event)),
+    };
     const monitor = new CodexNativeSubagentMonitor(client, runtime);
     monitor.registerParent({
       parentThreadId: "parent-thread",
@@ -243,14 +246,36 @@ describe("CodexNativeSubagentMonitor", () => {
       taskRuntimeScope: createTaskScope("agent:main:main"),
       agentId: "main",
     });
+    monitor.beginParentTurnDiagnostics({
+      parentThreadId: "parent-thread",
+      runId: "run-v2",
+      parentTurnId: "turn-v2",
+      sessionKey: "agent:main:main",
+      agentId: "main",
+      traceRoot: "/tmp/rollout-traces",
+      baseFields: { runId: "run-v2", provider: "openai", model: "gpt-5.6-sol" },
+    });
 
+    await client.notify({
+      method: "item/started",
+      params: {
+        threadId: "parent-thread",
+        item: {
+          type: "subAgentActivity",
+          id: "spawn-call-1",
+          kind: "started",
+          agentThreadId: "child-v2",
+          agentPath: "/root/researcher",
+        },
+      },
+    });
     await client.notify({
       method: "item/completed",
       params: {
         threadId: "parent-thread",
         item: {
           type: "subAgentActivity",
-          id: "activity-started",
+          id: "spawn-call-1",
           kind: "started",
           agentThreadId: "child-v2",
           agentPath: "/root/researcher",
@@ -264,6 +289,7 @@ describe("CodexNativeSubagentMonitor", () => {
         result: "child v2 result",
       }),
     );
+    await monitor.finalizeParentTurnDiagnostics("parent-thread");
 
     expect(runtime.createRunningTaskRun).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -278,12 +304,681 @@ describe("CodexNativeSubagentMonitor", () => {
         terminalSummary: "child v2 result",
       }),
     );
-    expect(runtime.deliverAgentHarnessTaskCompletion).toHaveBeenCalledWith(
+    expect(runtime.deliverAgentHarnessTaskCompletion).not.toHaveBeenCalled();
+    const lifecycle = emitted.find((event) => event.type === "codex.native_child.lifecycle");
+    expect(lifecycle).toMatchObject({
+      childThreadId: "child-v2",
+      triggeringToolCallId: "spawn-call-1",
+      lifecycle: "started",
+    });
+    expect(emitted).toContainEqual(
       expect.objectContaining({
-        childSessionId: "child-v2",
-        result: "child v2 result",
+        type: "codex.native_child.status",
+        authoritativeStart: true,
       }),
     );
+    monitor.dispose();
+  });
+
+  it("emits bounded child diagnostics and drains exact child thread turns", async () => {
+    const client = createClient();
+    const emitted: Array<Record<string, unknown>> = [];
+    const finalDrain = vi.fn(async () => ({ emitted: 3, complete: true }));
+    const stop = vi.fn();
+    const startRolloutMonitor = vi.fn(() => ({ finalDrain, stop }));
+    const runtime = {
+      ...createRuntime(),
+      emitTrustedDiagnosticEvent: vi.fn((event) => emitted.push(event)),
+      startCodexRolloutTraceMonitor: startRolloutMonitor,
+    };
+    const monitor = new CodexNativeSubagentMonitor(client, runtime);
+    monitor.registerParent({
+      parentThreadId: "parent-thread",
+      requesterSessionKey: "agent:main:main",
+      taskRuntimeScope: createTaskScope("agent:main:main"),
+      agentId: "main",
+    });
+    monitor.beginParentTurnDiagnostics({
+      parentThreadId: "parent-thread",
+      runId: "run-1",
+      parentTurnId: "parent-turn-1",
+      sessionKey: "agent:main:main",
+      sessionId: "session-1",
+      agentId: "main",
+      traceRoot: "/tmp/rollout-traces",
+      baseFields: {
+        runId: "run-1",
+        sessionKey: "agent:main:main",
+        sessionId: "session-1",
+        agentId: "main",
+        provider: "openai",
+        model: "gpt-5.6-sol",
+      },
+    });
+
+    await notifyChildStarted(
+      client,
+      "parent-thread",
+      "child-thread",
+      "/root/candidate_conclusion",
+      "draft_writer",
+    );
+    await client.notify({
+      method: "turn/started",
+      params: {
+        threadId: "child-thread",
+        turn: { id: "child-turn-1", status: "inProgress", items: [] },
+      },
+    });
+    await client.notify(
+      childTurnCompletedNotification({ status: "completed", turnId: "child-turn-1" }),
+    );
+    await client.notify(
+      nativeCompletionNotification({
+        agentPath: "/root/candidate_conclusion",
+        statusLabel: "completed",
+        result: "done",
+      }),
+    );
+    await monitor.finalizeParentTurnDiagnostics("parent-thread");
+
+    expect(startRolloutMonitor).toHaveBeenCalledWith(
+      expect.objectContaining({
+        threadId: "child-thread",
+        turnId: "child-turn-1",
+        baseFields: expect.objectContaining({
+          nativeChildThreadId: "child-thread",
+          nativeChildTurnId: "child-turn-1",
+          parentTurnId: "parent-turn-1",
+        }),
+      }),
+    );
+    expect(finalDrain).toHaveBeenCalledOnce();
+    expect(emitted).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "codex.native_child.lifecycle",
+          lifecycle: "started",
+          childThreadId: "child-thread",
+          parentTurnId: "parent-turn-1",
+          role: "draft_writer",
+        }),
+        expect.objectContaining({
+          type: "codex.native_child.lifecycle",
+          lifecycle: "turn_started",
+          childTurnId: "child-turn-1",
+        }),
+        expect.objectContaining({
+          type: "codex.native_child.lifecycle",
+          lifecycle: "ended",
+          outcome: "completed",
+        }),
+        expect.objectContaining({
+          type: "codex.native_child.status",
+          support: "supported",
+          drain: "completed",
+          authoritativeStart: true,
+          authoritativeTerminal: true,
+          counts: expect.objectContaining({ activeChildren: 0, dropped: 0 }),
+        }),
+      ]),
+    );
+    const lifecycle = emitted.find((event) => event.type === "codex.native_child.lifecycle");
+    expect(lifecycle).not.toHaveProperty("task");
+    expect(lifecycle).not.toHaveProperty("prompt");
+    expect(lifecycle).not.toHaveProperty("agentPath");
+    monitor.dispose();
+    expect(stop).toHaveBeenCalledOnce();
+  });
+
+  it("isolates concurrent child drains and reports incomplete coverage", async () => {
+    const client = createClient();
+    const emitted: Array<Record<string, unknown>> = [];
+    const finalDrains = new Map<string, ReturnType<typeof vi.fn>>();
+    const startRolloutMonitor = vi.fn((params: { threadId: string; turnId: string }) => {
+      const finalDrain = vi.fn(async () =>
+        params.threadId === "child-b"
+          ? { emitted: 1, complete: false as const, reason: "incomplete_rollout" as const }
+          : { emitted: 2, complete: true as const },
+      );
+      finalDrains.set(`${params.threadId}:${params.turnId}`, finalDrain);
+      return { finalDrain, stop: vi.fn() };
+    });
+    const monitor = new CodexNativeSubagentMonitor(client, {
+      ...createRuntime(),
+      emitTrustedDiagnosticEvent: vi.fn((event) => emitted.push(event)),
+      startCodexRolloutTraceMonitor: startRolloutMonitor,
+    });
+    monitor.registerParent({ parentThreadId: "parent-thread" });
+    monitor.beginParentTurnDiagnostics({
+      parentThreadId: "parent-thread",
+      runId: "run-concurrent",
+      parentTurnId: "parent-turn-concurrent",
+      traceRoot: "/tmp/rollout-traces",
+      baseFields: { runId: "run-concurrent", provider: "openai", model: "gpt-5.6-sol" },
+    });
+
+    for (const child of [
+      { threadId: "child-a", turnId: "turn-a", agentPath: "/root/a" },
+      { threadId: "child-b", turnId: "turn-b", agentPath: "/root/b" },
+    ]) {
+      await notifyChildStarted(client, "parent-thread", child.threadId, child.agentPath);
+      await client.notify({
+        method: "turn/started",
+        params: {
+          threadId: child.threadId,
+          turn: { id: child.turnId, status: "inProgress", items: [] },
+        },
+      });
+      await client.notify({
+        method: "turn/completed",
+        params: {
+          threadId: child.threadId,
+          turn: { id: child.turnId, status: "completed", items: [] },
+        },
+      });
+      await client.notify(
+        nativeCompletionNotification({
+          agentPath: child.agentPath,
+          statusLabel: "completed",
+          result: "done",
+        }),
+      );
+    }
+
+    await monitor.finalizeParentTurnDiagnostics("parent-thread");
+
+    expect(startRolloutMonitor).toHaveBeenCalledTimes(2);
+    expect(finalDrains.get("child-a:turn-a")).toHaveBeenCalledOnce();
+    expect(finalDrains.get("child-b:turn-b")).toHaveBeenCalledOnce();
+    expect(emitted.at(-1)).toMatchObject({
+      type: "codex.native_child.status",
+      support: "supported",
+      drain: "timed_out",
+      authoritativeStart: true,
+      authoritativeTerminal: true,
+      counts: expect.objectContaining({ activeChildren: 0 }),
+      partialReasons: expect.arrayContaining([
+        "child_rollout_drain_incomplete",
+        "child_rollout_incomplete_rollout",
+      ]),
+    });
+    monitor.dispose();
+  });
+
+  it("bounds all child final drains by one parent-level deadline", async () => {
+    vi.useFakeTimers();
+    const client = createClient();
+    const emitted: Array<Record<string, unknown>> = [];
+    const stops: Array<ReturnType<typeof vi.fn>> = [];
+    const startRolloutMonitor = vi.fn(() => {
+      const stop = vi.fn();
+      stops.push(stop);
+      return {
+        finalDrain: vi.fn(() => new Promise<never>(() => undefined)),
+        stop,
+      };
+    });
+    const monitor = new CodexNativeSubagentMonitor(client, {
+      ...createRuntime(),
+      emitTrustedDiagnosticEvent: vi.fn((event) => emitted.push(event)),
+      startCodexRolloutTraceMonitor: startRolloutMonitor,
+    });
+    try {
+      monitor.registerParent({ parentThreadId: "parent-thread" });
+      monitor.beginParentTurnDiagnostics({
+        parentThreadId: "parent-thread",
+        runId: "run-bounded-drain",
+        parentTurnId: "parent-turn-bounded-drain",
+        traceRoot: "/tmp/rollout-traces",
+        baseFields: { runId: "run-bounded-drain", provider: "openai", model: "gpt-5.6-sol" },
+      });
+
+      for (const child of [
+        { threadId: "child-a", turnId: "turn-a", agentPath: "/root/a" },
+        { threadId: "child-b", turnId: "turn-b", agentPath: "/root/b" },
+      ]) {
+        await notifyChildStarted(client, "parent-thread", child.threadId, child.agentPath);
+        await client.notify({
+          method: "turn/started",
+          params: {
+            threadId: child.threadId,
+            turn: { id: child.turnId, status: "inProgress", items: [] },
+          },
+        });
+        await client.notify({
+          method: "turn/completed",
+          params: {
+            threadId: child.threadId,
+            turn: { id: child.turnId, status: "completed", items: [] },
+          },
+        });
+      }
+
+      const finalization = monitor.finalizeParentTurnDiagnostics("parent-thread");
+      await vi.advanceTimersByTimeAsync(500);
+      await expect(finalization).resolves.toBeUndefined();
+
+      expect(startRolloutMonitor).toHaveBeenCalledTimes(2);
+      expect(stops).toHaveLength(2);
+      expect(stops.every((stop) => stop.mock.calls.length === 0)).toBe(true);
+      expect(emitted.at(-1)).toMatchObject({
+        type: "codex.native_child.status",
+        support: "supported",
+        drain: "timed_out",
+        counts: expect.objectContaining({ activeChildren: 0 }),
+        partialReasons: expect.arrayContaining(["child_rollout_parent_drain_timeout"]),
+      });
+      expect(emitted.at(-1)).not.toMatchObject({
+        partialReasons: expect.arrayContaining(["active_children_at_finalize"]),
+      });
+    } finally {
+      monitor.dispose();
+      expect(stops.every((stop) => stop.mock.calls.length === 1)).toBe(true);
+      vi.useRealTimers();
+    }
+  });
+
+  it("admits child lifecycle during the final drain window", async () => {
+    const client = createClient();
+    const emitted: Array<Record<string, unknown>> = [];
+    const stops = new Map<string, ReturnType<typeof vi.fn>>();
+    let resolveInitialDrain: ((result: { emitted: number; complete: true }) => void) | undefined;
+    const startRolloutMonitor = vi.fn((params: { threadId: string }) => {
+      const stop = vi.fn();
+      stops.set(params.threadId, stop);
+      return {
+        finalDrain: vi.fn(() =>
+          params.threadId === "child-a"
+            ? new Promise<{ emitted: number; complete: true }>((resolve) => {
+                resolveInitialDrain = resolve;
+              })
+            : Promise.resolve({ emitted: 1, complete: true as const }),
+        ),
+        stop,
+      };
+    });
+    const monitor = new CodexNativeSubagentMonitor(client, {
+      ...createRuntime(),
+      emitTrustedDiagnosticEvent: vi.fn((event) => emitted.push(event)),
+      startCodexRolloutTraceMonitor: startRolloutMonitor,
+    });
+    monitor.registerParent({ parentThreadId: "parent-thread" });
+    monitor.beginParentTurnDiagnostics({
+      parentThreadId: "parent-thread",
+      runId: "run-drain-window",
+      parentTurnId: "parent-turn-drain-window",
+      traceRoot: "/tmp/rollout-traces",
+      baseFields: { runId: "run-drain-window", provider: "openai", model: "gpt-5.6-sol" },
+    });
+
+    await notifyChildStarted(client, "parent-thread", "child-a", "/root/a");
+    await client.notify({
+      method: "turn/started",
+      params: {
+        threadId: "child-a",
+        turn: { id: "turn-a", status: "inProgress", items: [] },
+      },
+    });
+    await client.notify({
+      method: "turn/completed",
+      params: {
+        threadId: "child-a",
+        turn: { id: "turn-a", status: "completed", items: [] },
+      },
+    });
+    await vi.waitFor(() => expect(resolveInitialDrain).toBeTypeOf("function"));
+    const finalization = monitor.finalizeParentTurnDiagnostics("parent-thread");
+
+    await notifyChildStarted(client, "parent-thread", "child-b", "/root/b");
+    await client.notify({
+      method: "turn/started",
+      params: {
+        threadId: "child-b",
+        turn: { id: "turn-b", status: "inProgress", items: [] },
+      },
+    });
+    resolveInitialDrain?.({ emitted: 1, complete: true });
+    await finalization;
+
+    expect(emitted).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "codex.native_child.lifecycle",
+          childThreadId: "child-b",
+          lifecycle: "started",
+        }),
+        expect.objectContaining({
+          type: "codex.native_child.lifecycle",
+          childThreadId: "child-b",
+          childTurnId: "turn-b",
+          lifecycle: "turn_started",
+        }),
+      ]),
+    );
+    expect(emitted.at(-1)).toMatchObject({
+      type: "codex.native_child.status",
+      support: "supported",
+      counts: expect.objectContaining({ activeChildren: 1 }),
+    });
+    expect(emitted.at(-1)).not.toMatchObject({
+      partialReasons: expect.arrayContaining([
+        "active_children_at_finalize",
+        "child_turn_observed_during_finalization",
+        "post_finalization_event",
+      ]),
+    });
+    expect(stops.get("child-a")).toHaveBeenCalledOnce();
+    expect(stops.get("child-b")).not.toHaveBeenCalled();
+
+    await client.notify({
+      method: "turn/completed",
+      params: {
+        threadId: "child-b",
+        turn: { id: "turn-b", status: "completed", items: [] },
+      },
+    });
+    await vi.waitFor(() => expect(stops.get("child-b")).toHaveBeenCalledOnce());
+    expect(emitted.at(-1)).toMatchObject({
+      type: "codex.native_child.lifecycle",
+      childThreadId: "child-b",
+      childTurnId: "turn-b",
+      lifecycle: "turn_completed",
+    });
+    monitor.dispose();
+  });
+
+  it.each(["start", "finalDrain", "stop"] as const)(
+    "fails open when the child rollout monitor %s phase throws",
+    async (failurePhase) => {
+      const client = createClient();
+      const emitted: Array<Record<string, unknown>> = [];
+      const stop = vi.fn(() => {
+        if (failurePhase === "stop") {
+          throw new Error("stop failed");
+        }
+      });
+      const finalDrain = vi.fn(() => {
+        if (failurePhase === "finalDrain") {
+          throw new Error("final drain failed");
+        }
+        return Promise.resolve({ emitted: 1, complete: true as const });
+      });
+      const startRolloutMonitor = vi.fn(() => {
+        if (failurePhase === "start") {
+          throw new Error("start failed");
+        }
+        return { finalDrain, stop };
+      });
+      const runtime = {
+        ...createRuntime(),
+        emitTrustedDiagnosticEvent: vi.fn((event) => emitted.push(event)),
+        startCodexRolloutTraceMonitor: startRolloutMonitor,
+      };
+      const monitor = new CodexNativeSubagentMonitor(client, runtime);
+      monitor.registerParent({
+        parentThreadId: "parent-thread",
+        requesterSessionKey: "agent:main:main",
+        taskRuntimeScope: createTaskScope("agent:main:main"),
+        agentId: "main",
+      });
+      monitor.beginParentTurnDiagnostics({
+        parentThreadId: "parent-thread",
+        runId: `run-${failurePhase}`,
+        parentTurnId: `parent-turn-${failurePhase}`,
+        traceRoot: "/tmp/rollout-traces",
+        baseFields: {
+          runId: `run-${failurePhase}`,
+          provider: "openai",
+          model: "gpt-5.6-sol",
+        },
+      });
+
+      await expect(
+        notifyChildStarted(client, "parent-thread", "child-thread", "/root/researcher"),
+      ).resolves.toBeUndefined();
+      await expect(
+        client.notify({
+          method: "turn/started",
+          params: {
+            threadId: "child-thread",
+            turn: { id: "child-turn", status: "inProgress", items: [] },
+          },
+        }),
+      ).resolves.toBeUndefined();
+      await expect(
+        client.notify(childTurnCompletedNotification({ status: "completed" })),
+      ).resolves.toBeUndefined();
+      await expect(
+        client.notify(
+          nativeCompletionNotification({
+            agentPath: "/root/researcher",
+            statusLabel: "completed",
+            result: "done",
+          }),
+        ),
+      ).resolves.toBeUndefined();
+      await expect(monitor.finalizeParentTurnDiagnostics("parent-thread")).resolves.toBeUndefined();
+
+      const expectedReason =
+        failurePhase === "start"
+          ? "child_rollout_monitor_start_error"
+          : failurePhase === "stop"
+            ? "child_rollout_monitor_stop_error"
+            : "child_rollout_finalization_error";
+      expect(emitted.at(-1)).toMatchObject({
+        type: "codex.native_child.status",
+        support: "supported",
+        partialReasons: expect.arrayContaining([expectedReason]),
+      });
+      expect(runtime.deliverAgentHarnessTaskCompletion).not.toHaveBeenCalled();
+      monitor.dispose();
+    },
+  );
+
+  it("bounds lifecycle metadata and excludes child task-path details", async () => {
+    const client = createClient();
+    const emitted: Array<Record<string, unknown>> = [];
+    const oversizedIdentity = "界".repeat(20_000);
+    const parentThreadId = `parent-${oversizedIdentity}`;
+    const childThreadId = `child-${"x".repeat(20_000)}`;
+    const monitor = new CodexNativeSubagentMonitor(client, {
+      ...createRuntime(),
+      emitTrustedDiagnosticEvent: vi.fn((event) => emitted.push(event)),
+    });
+    monitor.registerParent({ parentThreadId });
+    monitor.beginParentTurnDiagnostics({
+      parentThreadId,
+      runId: `run-${oversizedIdentity}`,
+      parentTurnId: `turn-${oversizedIdentity}`,
+      sessionKey: `session:${oversizedIdentity}`,
+      sessionId: `session-id:${oversizedIdentity}`,
+      agentId: `agent:${oversizedIdentity}`,
+      baseFields: {
+        runId: `run-${oversizedIdentity}`,
+        provider: "openai",
+        model: "gpt-5.6-sol",
+      },
+    });
+
+    await notifyChildStarted(
+      client,
+      parentThreadId,
+      childThreadId,
+      "/root/PRIVATE_TASK_BODY_CREDENTIAL_ACCOUNT_POLICY",
+      `role-${oversizedIdentity}`,
+    );
+    await client.notify({
+      method: "item/completed",
+      params: {
+        threadId: parentThreadId,
+        item: {
+          type: "subAgentActivity",
+          id: `spawn-${oversizedIdentity}`,
+          kind: "started",
+          agentThreadId: childThreadId,
+          agentPath: "/root/PRIVATE_TASK_BODY_CREDENTIAL_ACCOUNT_POLICY",
+        },
+      },
+    });
+    await monitor.finalizeParentTurnDiagnostics(parentThreadId);
+    await client.notify({
+      method: "turn/started",
+      params: {
+        threadId: childThreadId,
+        turn: { id: "post-root-detached-turn" },
+      },
+    });
+
+    const lifecycle = emitted.find((event) => event.type === "codex.native_child.lifecycle");
+    expect(lifecycle).toBeDefined();
+    expect(emitted).toContainEqual(
+      expect.objectContaining({
+        type: "codex.native_child.lifecycle",
+        childThreadId: lifecycle?.childThreadId,
+        childTurnId: "post-root-detached-turn",
+        lifecycle: "turn_started",
+      }),
+    );
+    const serialized = JSON.stringify(lifecycle);
+    for (const event of emitted.filter(({ type }) =>
+      String(type).startsWith("codex.native_child."),
+    )) {
+      expect(Buffer.byteLength(JSON.stringify(event), "utf8")).toBeLessThanOrEqual(16_384);
+    }
+    expect(serialized).not.toContain("PRIVATE_TASK_BODY");
+    expect(serialized).not.toContain("CREDENTIAL");
+    expect(serialized).not.toContain("ACCOUNT_POLICY");
+    monitor.dispose();
+  });
+
+  it("rebinds a persistent child after parent-scoped activity in a later turn", async () => {
+    const client = createClient();
+    const emitted: Array<Record<string, unknown>> = [];
+    const startCodexRolloutTraceMonitor = vi.fn(() => ({
+      finalDrain: vi.fn(async () => ({ emitted: 0, complete: true })),
+      stop: vi.fn(),
+    }));
+    const monitor = new CodexNativeSubagentMonitor(client, {
+      ...createRuntime(),
+      emitTrustedDiagnosticEvent: vi.fn((event) => emitted.push(event)),
+      startCodexRolloutTraceMonitor,
+    });
+    monitor.registerParent({ parentThreadId: "parent-thread" });
+    monitor.beginParentTurnDiagnostics({
+      parentThreadId: "parent-thread",
+      runId: "run-1",
+      parentTurnId: "parent-turn-1",
+      traceRoot: "/tmp/rollout-traces",
+      baseFields: { runId: "run-1", provider: "openai", model: "gpt-5.6-sol" },
+    });
+    await client.notify({
+      method: "item/completed",
+      params: {
+        threadId: "parent-thread",
+        item: {
+          type: "subAgentActivity",
+          id: "spawn-call-1",
+          kind: "started",
+          agentThreadId: "persistent-child",
+          agentPath: "/root/persistent-child",
+        },
+      },
+    });
+    await monitor.finalizeParentTurnDiagnostics("parent-thread");
+
+    monitor.beginParentTurnDiagnostics({
+      parentThreadId: "parent-thread",
+      runId: "run-2",
+      parentTurnId: "parent-turn-2",
+      traceRoot: "/tmp/rollout-traces",
+      baseFields: { runId: "run-2", provider: "openai", model: "gpt-5.6-sol" },
+    });
+    await client.notify({
+      method: "item/completed",
+      params: {
+        threadId: "parent-thread",
+        item: {
+          type: "subAgentActivity",
+          id: "send-call-2",
+          kind: "interacted",
+          agentThreadId: "persistent-child",
+          agentPath: "/root/persistent-child",
+        },
+      },
+    });
+    await client.notify({
+      method: "turn/started",
+      params: {
+        threadId: "persistent-child",
+        turn: { id: "child-turn-2" },
+      },
+    });
+
+    expect(emitted).toContainEqual(
+      expect.objectContaining({
+        type: "codex.native_child.lifecycle",
+        parentTurnId: "parent-turn-2",
+        childThreadId: "persistent-child",
+        lifecycle: "turn_started",
+        triggeringToolCallId: "send-call-2",
+      }),
+    );
+    expect(emitted).not.toContainEqual(
+      expect.objectContaining({
+        parentTurnId: "parent-turn-2",
+        childThreadId: "persistent-child",
+        triggeringToolCallId: "spawn-call-1",
+      }),
+    );
+    expect(startCodexRolloutTraceMonitor).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        threadId: "persistent-child",
+        turnId: "child-turn-2",
+        baseFields: expect.objectContaining({ parentTurnId: "parent-turn-2" }),
+      }),
+    );
+    monitor.dispose();
+  });
+
+  it("keeps parent-only diagnostics unsupported and reports one bounded late-event status", async () => {
+    const client = createClient();
+    const emitted: Array<Record<string, unknown>> = [];
+    const runtime = {
+      ...createRuntime(),
+      emitTrustedDiagnosticEvent: vi.fn((event) => emitted.push(event)),
+    };
+    const monitor = new CodexNativeSubagentMonitor(client, runtime);
+    monitor.registerParent({ parentThreadId: "parent-thread" });
+    monitor.beginParentTurnDiagnostics({
+      parentThreadId: "parent-thread",
+      runId: "run-parent-only",
+      parentTurnId: "parent-turn-only",
+      baseFields: {
+        runId: "run-parent-only",
+        provider: "openai",
+        model: "gpt-5.6-sol",
+      },
+    });
+
+    await monitor.finalizeParentTurnDiagnostics("parent-thread");
+    expect(emitted).toEqual([
+      expect.objectContaining({
+        type: "codex.native_child.status",
+        support: "unsupported",
+        drain: "not_applicable",
+      }),
+    ]);
+
+    await notifyChildStarted(client);
+    await notifyChildStarted(client);
+    expect(emitted).toHaveLength(2);
+    expect(emitted[1]).toMatchObject({
+      type: "codex.native_child.status",
+      support: "unsupported",
+      counts: expect.objectContaining({ dropped: 1 }),
+      partialReasons: expect.arrayContaining(["post_finalization_event"]),
+    });
     monitor.dispose();
   });
 
@@ -847,6 +1542,247 @@ describe("CodexNativeSubagentMonitor", () => {
     );
   });
 
+  it("does not redeliver a native completion while the owning parent turn is active", async () => {
+    const client = createClient();
+    const runtime = createRuntime();
+    const monitor = new CodexNativeSubagentMonitor(client, runtime);
+    monitor.registerParent({
+      parentThreadId: "parent-thread",
+      requesterSessionKey: "agent:main:main",
+      taskRuntimeScope: createTaskScope("agent:main:main"),
+      agentId: "main",
+    });
+    monitor.beginParentTurnDiagnostics({
+      parentThreadId: "parent-thread",
+      runId: "run-active-parent",
+      parentTurnId: "turn-active-parent",
+      sessionKey: "agent:main:main",
+      agentId: "main",
+      baseFields: {
+        runId: "run-active-parent",
+        provider: "openai",
+        model: "gpt-5.6-sol",
+      },
+    });
+
+    const completion = nativeCompletionNotification({
+      agentPath: "child-thread",
+      statusLabel: "completed",
+      result: "child final result",
+    });
+    await notifyChildStarted(client);
+    await client.notify(completion);
+    await monitor.finalizeParentTurnDiagnostics("parent-thread");
+    await client.notify(completion);
+
+    expect(runtime.finalizeTaskRunByRunId).toHaveBeenCalledWith(
+      expect.objectContaining({
+        runId: "codex-thread:child-thread",
+        status: "succeeded",
+        terminalSummary: "child final result",
+      }),
+    );
+    expect(runtime.deliverAgentHarnessTaskCompletion).not.toHaveBeenCalled();
+    expect(runtime.setDetachedTaskDeliveryStatusByRunId).not.toHaveBeenCalledWith(
+      expect.objectContaining({ deliveryStatus: "pending" }),
+    );
+  });
+
+  it("does not redeliver a mailbox completion that arrives during parent finalization", async () => {
+    const client = createClient();
+    const runtime = createRuntime();
+    let resolveDrain: ((result: { emitted: number; complete: true }) => void) | undefined;
+    runtime.startCodexRolloutTraceMonitor = vi.fn(() => ({
+      finalDrain: vi.fn(
+        () =>
+          new Promise<{ emitted: number; complete: true }>((resolve) => {
+            resolveDrain = resolve;
+          }),
+      ),
+      stop: vi.fn(),
+    }));
+    const monitor = new CodexNativeSubagentMonitor(client, runtime);
+    monitor.registerParent({
+      parentThreadId: "parent-thread",
+      requesterSessionKey: "agent:main:main",
+      taskRuntimeScope: createTaskScope("agent:main:main"),
+      agentId: "main",
+    });
+    monitor.beginParentTurnDiagnostics({
+      parentThreadId: "parent-thread",
+      runId: "run-finalizing-parent",
+      parentTurnId: "turn-finalizing-parent",
+      sessionKey: "agent:main:main",
+      agentId: "main",
+      traceRoot: "/tmp/rollout-traces",
+      baseFields: {
+        runId: "run-finalizing-parent",
+        provider: "openai",
+        model: "gpt-5.6-sol",
+      },
+    });
+
+    await notifyChildStarted(client);
+    await client.notify({
+      method: "turn/started",
+      params: {
+        threadId: "child-thread",
+        turn: { id: "child-turn", status: "inProgress", items: [] },
+      },
+    });
+    const childFinalization = client.notify({
+      method: "turn/completed",
+      params: {
+        threadId: "child-thread",
+        turn: { id: "child-turn", status: "completed", items: [] },
+      },
+    });
+    await vi.waitFor(() => expect(resolveDrain).toBeTypeOf("function"));
+    const parentFinalization = monitor.finalizeParentTurnDiagnostics("parent-thread");
+
+    await client.notify(
+      nativeCompletionNotification({
+        agentPath: "child-thread",
+        statusLabel: "completed",
+        result: "child final result",
+      }),
+    );
+    resolveDrain?.({ emitted: 1, complete: true });
+    await Promise.all([childFinalization, parentFinalization]);
+
+    expect(runtime.deliverAgentHarnessTaskCompletion).not.toHaveBeenCalled();
+    expect(runtime.setDetachedTaskDeliveryStatusByRunId).toHaveBeenLastCalledWith(
+      expect.objectContaining({ deliveryStatus: "delivered" }),
+    );
+  });
+
+  it("delivers a child-thread completion after an active parent turn finalizes", async () => {
+    const client = createClient();
+    const runtime = createRuntime();
+    const monitor = new CodexNativeSubagentMonitor(client, runtime);
+    monitor.registerParent({
+      parentThreadId: "parent-thread",
+      requesterSessionKey: "agent:main:main",
+      taskRuntimeScope: createTaskScope("agent:main:main"),
+      agentId: "main",
+    });
+    monitor.beginParentTurnDiagnostics({
+      parentThreadId: "parent-thread",
+      runId: "run-detached-race",
+      parentTurnId: "turn-detached-race",
+      sessionKey: "agent:main:main",
+      agentId: "main",
+      baseFields: {
+        runId: "run-detached-race",
+        provider: "openai",
+        model: "gpt-5.6-sol",
+      },
+    });
+
+    await notifyChildStarted(client);
+    await client.notify(
+      childTurnCompletedNotification({
+        status: "completed",
+        items: [
+          {
+            id: "detached-final",
+            type: "agentMessage",
+            phase: "final_answer",
+            text: "detached child result",
+          },
+        ],
+      }),
+    );
+
+    expect(runtime.deliverAgentHarnessTaskCompletion).not.toHaveBeenCalled();
+    expect(runtime.setDetachedTaskDeliveryStatusByRunId).toHaveBeenCalledWith(
+      expect.objectContaining({ deliveryStatus: "pending" }),
+    );
+
+    await monitor.finalizeParentTurnDiagnostics("parent-thread");
+    await vi.waitFor(() =>
+      expect(runtime.deliverAgentHarnessTaskCompletion).toHaveBeenCalledOnce(),
+    );
+    expect(runtime.deliverAgentHarnessTaskCompletion).toHaveBeenCalledWith(
+      expect.objectContaining({
+        childSessionId: "child-thread",
+        result: "detached child result",
+      }),
+    );
+  });
+
+  it("does not redeliver a completion consumed from a resumed parent transcript", async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-codex-subagent-"));
+    const codexHome = path.join(tempDir, "codex-home");
+    const transcriptDir = path.join(codexHome, "sessions", "2026", "08", "16");
+    await fs.mkdir(transcriptDir, { recursive: true });
+    const client = createClient();
+    const runtime = createRuntime();
+    const monitor = new CodexNativeSubagentMonitor(client, runtime, { codexHome });
+    monitor.registerParent({
+      parentThreadId: "parent-thread",
+      requesterSessionKey: "agent:main:main",
+      taskRuntimeScope: createTaskScope("agent:main:main"),
+      agentId: "main",
+    });
+    monitor.beginParentTurnDiagnostics({
+      parentThreadId: "parent-thread",
+      runId: "run-resumed-parent",
+      parentTurnId: "turn-resumed-parent",
+      sessionKey: "agent:main:main",
+      agentId: "main",
+      baseFields: {
+        runId: "run-resumed-parent",
+        provider: "openai",
+        model: "gpt-5.6-sol",
+      },
+    });
+
+    await notifyChildStarted(client);
+    await client.notify(
+      childTurnCompletedNotification({
+        status: "completed",
+        items: [
+          {
+            id: "resumed-child-final",
+            type: "agentMessage",
+            phase: "final_answer",
+            text: "resumed child result",
+          },
+        ],
+      }),
+    );
+    await fs.writeFile(
+      path.join(transcriptDir, "rollout-2026-08-16T21-00-00-parent-thread.jsonl"),
+      [
+        JSON.stringify({
+          timestamp: new Date(Date.now() + 1_000).toISOString(),
+          type: "response_item",
+          payload: {
+            type: "agent_message",
+            author: "child-thread",
+            recipient: "/root",
+            content: [
+              {
+                type: "input_text",
+                text: "Message Type: FINAL_ANSWER\nTask name: /root\nSender: child-thread\nPayload:\nresumed child result",
+              },
+            ],
+          },
+        }),
+        "",
+      ].join("\n"),
+    );
+
+    await monitor.finalizeParentTurnDiagnostics("parent-thread");
+    await vi.waitFor(() =>
+      expect(runtime.setDetachedTaskDeliveryStatusByRunId).toHaveBeenLastCalledWith(
+        expect.objectContaining({ deliveryStatus: "delivered" }),
+      ),
+    );
+    expect(runtime.deliverAgentHarnessTaskCompletion).not.toHaveBeenCalled();
+  });
+
   it("runs deferred parent cleanup after native subagent delivery settles", async () => {
     const client = createClient();
     const runtime = createRuntime();
@@ -911,7 +1847,21 @@ describe("CodexNativeSubagentMonitor", () => {
 
   it("runs deferred parent cleanup when a child ends in a system error", async () => {
     const client = createClient();
-    const runtime = createRuntime();
+    const deliveryOrder: string[] = [];
+    const finalDrain = vi.fn(async () => {
+      deliveryOrder.push("child-call-diagnostic");
+      return { emitted: 1, complete: true as const };
+    });
+    const stop = vi.fn();
+    const runtime = {
+      ...createRuntime(),
+      emitTrustedDiagnosticEvent: vi.fn((event) => {
+        if (event.type === "codex.native_child.lifecycle" && event.lifecycle === "ended") {
+          deliveryOrder.push("child-terminal");
+        }
+      }),
+      startCodexRolloutTraceMonitor: vi.fn(() => ({ finalDrain, stop })),
+    };
     const monitor = new CodexNativeSubagentMonitor(client, runtime);
     const cleanup = vi.fn();
     monitor.registerParent({
@@ -920,8 +1870,22 @@ describe("CodexNativeSubagentMonitor", () => {
       taskRuntimeScope: createTaskScope("agent:main:main"),
       agentId: "main",
     });
+    monitor.beginParentTurnDiagnostics({
+      parentThreadId: "parent-thread",
+      runId: "run-system-error",
+      parentTurnId: "parent-turn-system-error",
+      traceRoot: "/tmp/rollout-traces",
+      baseFields: { runId: "run-system-error", provider: "openai", model: "gpt-5.6-sol" },
+    });
 
     await notifyChildStarted(client);
+    await client.notify({
+      method: "turn/started",
+      params: {
+        threadId: "child-thread",
+        turn: { id: "child-turn-system-error", status: "inProgress", items: [] },
+      },
+    });
     monitor.deferUntilParentSettles("parent-thread", cleanup);
     await client.notify({
       method: "thread/status/changed",
@@ -931,6 +1895,9 @@ describe("CodexNativeSubagentMonitor", () => {
       },
     });
 
+    expect(finalDrain).toHaveBeenCalledOnce();
+    expect(stop).toHaveBeenCalledOnce();
+    expect(deliveryOrder).toEqual(["child-call-diagnostic", "child-terminal"]);
     expect(cleanup).toHaveBeenCalledOnce();
     expect(runtime.deliverAgentHarnessTaskCompletion).not.toHaveBeenCalled();
   });

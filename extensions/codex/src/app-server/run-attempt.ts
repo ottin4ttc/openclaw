@@ -3241,6 +3241,17 @@ export async function runCodexAppServerAttempt(
   for (const failure of pendingNativePreToolUseFailures.splice(0)) {
     activeProjector.recordNativeToolPreToolUseFailure(failure);
   }
+  nativeSubagentMonitorRef.current?.beginParentTurnDiagnostics({
+    parentThreadId: thread.threadId,
+    runId: params.runId,
+    parentTurnId: activeTurnId,
+    sessionKey: params.sessionKey,
+    sessionId: params.sessionId,
+    agentId: sessionAgentId,
+    traceRoot: rolloutTraceRoot,
+    baseFields: codexModelCallBaseFields,
+    capture: codexModelContentCapture,
+  });
   // Codex can emit notifications and requests before turn/start returns. The
   // route buffered them while armed; publish the full turn context first, then
   // release them in wire order.
@@ -3365,6 +3376,13 @@ export async function runCodexAppServerAttempt(
       return rolloutTraceFinalizationPromise;
     }
     rolloutTraceFinalizationPromise = (async () => {
+      const childDiagnosticsFinalization = nativeSubagentMonitorRef.current
+        ?.finalizeParentTurnDiagnostics(thread.threadId)
+        .catch((error: unknown) => {
+          embeddedAgentLog.debug("Codex native-child diagnostics finalization failed open", {
+            error: formatErrorMessage(error),
+          });
+        });
       const drain = rolloutTraceMonitor
         ? await rolloutTraceMonitor.finalDrain().finally(() => rolloutTraceMonitor.stop())
         : rolloutTraceRoot
@@ -3377,6 +3395,7 @@ export async function runCodexAppServerAttempt(
               log: embeddedAgentLog,
             })
           : undefined;
+      await childDiagnosticsFinalization;
       activeProjector.resolveSuppressedNativeToolLifecycleDiagnostics(
         new Set(drain?.emittedToolLifecycleKeys ?? []),
       );
@@ -3824,20 +3843,19 @@ export async function runCodexAppServerAttempt(
     if (!timedOut && !runAbortController.signal.aborted) {
       await steeringQueueRef.current?.flushPending();
     }
-    const yieldedOneShotCleanupDeferred =
+    const detachedChildCleanupDeferred =
       !timedOut &&
       params.cleanupBundleMcpOnRunEnd === true &&
-      yieldDetected &&
       nativeSubagentMonitorRef.current?.deferUntilParentSettles(thread.threadId, async () => {
-        // Keep the parent subscription alive until native child delivery;
-        // unsubscribing first drops the completion signal that settles cleanup.
+        // One-shot app-server shutdown interrupts native children. Keep the
+        // parent subscription and client alive until their own turns settle.
         await unsubscribeCodexThreadBestEffort(client, {
           threadId: thread.threadId,
           timeoutMs: CODEX_APP_SERVER_UNSUBSCRIBE_TIMEOUT_MS,
         });
         await releaseSharedClientLeaseAndRetireOneShotClient();
       });
-    if (!timedOut && !yieldedOneShotCleanupDeferred) {
+    if (!timedOut && !detachedChildCleanupDeferred) {
       await unsubscribeCodexThreadBestEffort(client, {
         threadId: thread.threadId,
         timeoutMs: CODEX_APP_SERVER_UNSUBSCRIBE_TIMEOUT_MS,
@@ -3846,7 +3864,7 @@ export async function runCodexAppServerAttempt(
     userInputBridgeRef.current?.cancelPending();
     turnWatches.clearAllTimers();
     releaseCurrentRoute();
-    if (!yieldedOneShotCleanupDeferred) {
+    if (!detachedChildCleanupDeferred) {
       await releaseSharedClientLeaseAndRetireOneShotClient();
     }
     if (nativeHookRelay) {

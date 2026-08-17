@@ -30,9 +30,60 @@ export type ProviderUsageTotals = {
   reasoningTokens?: number;
 };
 
+export type NativeChildLineageStatus = "complete" | "partial" | "unsupported";
+
+export type NativeChildObservation = {
+  id: string;
+  traceEntry: TraceContextEntry;
+  spawnObservationId: string;
+  childThreadId: string;
+  childTurnId: string;
+  ended: boolean;
+  pendingTerminalIdentity?: { agentId: string; sessionId: string };
+  role?: string;
+  model?: string;
+  executionContextCallIds?: Set<string>;
+  firstExecutionContextSummary?: Record<string, unknown>;
+  latestExecutionContextSummary?: Record<string, unknown>;
+  traceOutputPublished?: boolean;
+};
+
+export type NativeChildLineageState = {
+  /** Producer failures are scoped to this turn; one bad diagnostic must not quarantine later traces. */
+  producerHealthy: boolean;
+  support: "supported" | "unsupported" | "unknown";
+  status: NativeChildLineageStatus;
+  capability?: {
+    eventVersions: number[];
+    authoritativeStart: boolean;
+    authoritativeTerminal: boolean;
+    providerCallOwnership: boolean;
+    toolCallOwnership: boolean;
+  };
+  observations: Map<string, NativeChildObservation>;
+  currentChildTurnIds: Map<string, string>;
+  /** Child lifecycle may precede the spawn activity item that owns it. */
+  pendingChildThreads: Set<string>;
+  childTriggeringToolCallIds: Map<string, string>;
+  spawnAgentRoles: Map<string, string>; // triggering spawn tool call id -> exact agent_type
+  pendingLifecycleEvents: Map<string, unknown[]>;
+  sourceEventIds: Set<string>;
+  providerCallOwners: Map<string, string>;
+  mutations: number;
+  pendingJoins: number;
+  admittedEvents: number;
+  duplicateEvents: number;
+  droppedEvents: number;
+  activeChildrenAtRootFinalization: number;
+  partialReasons: Set<string>;
+  drain: "pending" | "not_applicable" | "completed" | "timed_out";
+  finalized: boolean;
+};
+
 export type TraceContextEntry = {
   trace: LangfuseTraceClient;
   traceId: string; // deterministic trace ID, used for deterministic observation IDs
+  actorKind?: "root" | "native-child";
   traceMetadata?: Record<string, unknown>; // last full trace metadata payload; Langfuse update replaces metadata
   llmCallCount: number;
   toolCallCount: number;
@@ -49,6 +100,7 @@ export type TraceContextEntry = {
   pendingSpans: Map<string, LangfuseSpanClient>; // keyed by toolCallId
   completedSpanToolCallIds: Set<string>; // toolCallIds completed by afterToolCall
   completedSpans?: Map<string, LangfuseSpanClient>; // completed clients retained for authoritative late correction
+  toolParentCallIndexes?: Map<string, number>; // toolCallId -> allocated parent generation display index
   diagnosticCorrectedSpanToolCallIds?: Set<string>; // toolCallIds already corrected from Codex rollout data
   createdAt: number;
   timestamp: number; // agent turn start timestamp
@@ -123,6 +175,14 @@ export type TraceContextEntry = {
     required: boolean;
     reasons: Array<{ reason: string; source: string; count: number }>;
   };
+  nativeChildLineage?: NativeChildLineageState;
+  pendingNativeChildDiagnostics?: Array<{
+    event: unknown;
+    metadata: unknown;
+    privateData: unknown;
+    childThreadId: string;
+    childTurnId?: string;
+  }>;
   lastUpdatedAt?: number;
 };
 
@@ -372,7 +432,12 @@ export class TraceContextMap {
 
   hasActiveEntries(): boolean {
     for (const entry of this.map.values()) {
-      if (!entry.finalized) {
+      if (
+        !entry.finalized ||
+        [...(entry.nativeChildLineage?.observations.values() ?? [])].some(
+          (observation) => !observation.traceEntry.finalized,
+        )
+      ) {
         return true;
       }
     }
@@ -448,6 +513,15 @@ export class TraceContextMap {
   }
 
   private isExpired(entry: TraceContextEntry, now: number): boolean {
+    const activeChildEntries = [...(entry.nativeChildLineage?.observations.values() ?? [])]
+      .map((observation) => observation.traceEntry)
+      .filter((childEntry) => !childEntry.finalized);
+    if (activeChildEntries.length > 0) {
+      const oldestChildStart = Math.min(
+        ...activeChildEntries.map((childEntry) => childEntry.createdAt),
+      );
+      return now - oldestChildStart > ACTIVE_ORPHAN_TTL_MS;
+    }
     if (!entry.finalized) {
       return now - entry.createdAt > ACTIVE_ORPHAN_TTL_MS;
     }

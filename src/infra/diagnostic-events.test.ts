@@ -219,6 +219,128 @@ describe("diagnostic-events", () => {
     expect(isInternalDiagnosticEventMetadata({ trusted: false })).toBe(false);
   });
 
+  it("delivers trusted Codex native-child lifecycle and status diagnostics", async () => {
+    const events: Array<{
+      event: DiagnosticEventPayload;
+      trusted: boolean;
+    }> = [];
+    onInternalDiagnosticEvent((event, metadata) => {
+      if (event.type.startsWith("codex.native_child.")) {
+        events.push({ event, trusted: metadata.trusted });
+      }
+    });
+
+    emitTrustedDiagnosticEvent({
+      type: "codex.native_child.lifecycle",
+      version: 1,
+      runId: "run-1",
+      parentTurnId: "turn-1",
+      parentThreadId: "parent-thread",
+      sourceEventId: "child-start-1",
+      childThreadId: "child-thread",
+      lifecycle: "started",
+      sourceTimestampMs: 1_000,
+    });
+    emitTrustedDiagnosticEvent({
+      type: "codex.native_child.status",
+      version: 1,
+      runId: "run-1",
+      parentTurnId: "turn-1",
+      parentThreadId: "parent-thread",
+      support: "supported",
+      drain: "completed",
+      authoritativeStart: true,
+      authoritativeTerminal: true,
+      providerCallOwnership: true,
+      toolCallOwnership: true,
+      counts: { admitted: 1, duplicates: 0, dropped: 0, activeChildren: 0 },
+    });
+
+    expect(events).toEqual([]);
+    await waitForDiagnosticEventsDrained();
+    expect(events).toEqual([
+      {
+        trusted: true,
+        event: expect.objectContaining({
+          type: "codex.native_child.lifecycle",
+          version: 1,
+          sourceEventId: "child-start-1",
+          childThreadId: "child-thread",
+        }),
+      },
+      {
+        trusted: true,
+        event: expect.objectContaining({
+          type: "codex.native_child.status",
+          version: 1,
+          support: "supported",
+          drain: "completed",
+        }),
+      },
+    ]);
+    expect(JSON.stringify(events)).not.toMatch(/prompt|credential|account|rawPath/u);
+  });
+
+  it("orders native-child status after queued child call diagnostics", async () => {
+    const events: string[] = [];
+    onInternalDiagnosticEvent((event) => {
+      events.push(event.type);
+    });
+
+    emitTrustedDiagnosticEvent({
+      type: "codex.native_child.lifecycle",
+      version: 1,
+      runId: "run-order",
+      parentTurnId: "turn-order",
+      parentThreadId: "parent-order",
+      sourceEventId: "child-start-order",
+      childThreadId: "child-order",
+      lifecycle: "started",
+      sourceTimestampMs: 1_000,
+    });
+    emitTrustedDiagnosticEvent({
+      type: "model.call.started",
+      runId: "run-order",
+      callId: "provider-order",
+      provider: "openai",
+      model: "gpt-5.6-sol",
+      nativeChildThreadId: "child-order",
+      parentTurnId: "turn-order",
+    });
+    emitTrustedDiagnosticEvent({
+      type: "tool.execution.started",
+      runId: "run-order",
+      toolName: "exec",
+      toolCallId: "tool-order",
+      nativeChildThreadId: "child-order",
+      parentTurnId: "turn-order",
+      triggeringProviderCallId: "provider-order",
+    });
+    emitTrustedDiagnosticEvent({
+      type: "codex.native_child.status",
+      version: 1,
+      runId: "run-order",
+      parentTurnId: "turn-order",
+      parentThreadId: "parent-order",
+      support: "supported",
+      drain: "completed",
+      authoritativeStart: true,
+      authoritativeTerminal: true,
+      providerCallOwnership: true,
+      toolCallOwnership: true,
+      counts: { admitted: 1, duplicates: 0, dropped: 0, activeChildren: 0 },
+    });
+
+    expect(events).toEqual([]);
+    await waitForDiagnosticEventsDrained();
+    expect(events).toEqual([
+      "codex.native_child.lifecycle",
+      "model.call.started",
+      "tool.execution.started",
+      "codex.native_child.status",
+    ]);
+  });
+
   it("formats traceparent for propagation only from dispatcher-trusted metadata", () => {
     const trace = createDiagnosticTraceContext({
       traceId: "4bf92f3577b34da6a3ce929d0e0e4736",
