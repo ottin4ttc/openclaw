@@ -100,6 +100,28 @@ The runtime SHALL expose available engine, runtime, channel/transport, session, 
 - **WHEN** a field is not available at the public boundary
 - **THEN** the runtime omits that field or marks it unknown rather than fabricating a value or failing the turn
 
+### Requirement: Native compaction ownership
+
+The runtime SHALL determine Codex native compaction ownership from the active
+turn's harness provenance before falling back to persisted session metadata.
+OpenClaw transcript/context-engine compaction SHALL NOT replace Codex app-server
+automatic compaction when the active Codex runtime owns the turn. This decision
+is per-turn and SHALL NOT persist a temporary harness marker into session state.
+Unknown or non-native runtimes SHALL retain their existing compaction behavior.
+
+#### Scenario: Active Codex runtime has no persisted harness marker
+
+- **WHEN** a Codex app-server turn completes in a session whose persisted entry has no `agentHarnessId`
+- **THEN** the compaction lifecycle uses the turn result's Codex harness provenance
+- **AND** it defers automatic compaction ownership to Codex
+- **AND** it does not invoke OpenClaw transcript/context-engine compaction solely because the session marker is absent
+
+#### Scenario: Non-Codex runtime has stale session metadata
+
+- **WHEN** the active turn identifies a non-Codex runtime while the persisted session retains an older native harness id
+- **THEN** the active turn's provenance takes precedence
+- **AND** the runtime does not route that turn through Codex native compaction
+
 ### Requirement: Minimal seam policy
 
 The runtime SHALL use existing public hooks for all observable events and SHALL add a core or SDK seam only when a required event cannot be reached otherwise; any seam MUST be additive, narrowly scoped, documented, and covered by focused tests.

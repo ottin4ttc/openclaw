@@ -2547,6 +2547,7 @@ async function agentCommandInternal(
               agentDir,
               provider: result.meta.agentMeta?.provider ?? provider,
               model: result.meta.agentMeta?.model ?? model,
+              agentHarnessId: result.meta.agentMeta?.agentHarnessId,
               skillsSnapshot,
               messageChannel,
               agentAccountId: runContext.accountId,

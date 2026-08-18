@@ -181,8 +181,10 @@ function resolveSessionTokenSnapshot(sessionEntry: SessionEntry | undefined): nu
 function isNativeHarnessCompactionSession(
   sessionEntry: SessionEntry | undefined,
   provider: string,
-): sessionEntry is SessionEntry {
-  const harnessId = sessionEntry?.agentHarnessId?.trim().toLowerCase();
+  runtimeHarnessId?: string,
+): boolean {
+  const harnessId =
+    runtimeHarnessId?.trim().toLowerCase() || sessionEntry?.agentHarnessId?.trim().toLowerCase();
   if (!harnessId || normalizeOptionalAgentRuntimeId(harnessId) === OPENCLAW_AGENT_RUNTIME_ID) {
     return false;
   }
@@ -383,6 +385,7 @@ async function compactNativeHarnessCliTranscript(params: {
   agentDir: string;
   provider: string;
   model: string;
+  agentHarnessId?: string;
   contextTokenBudget: number;
   currentTokenCount: number;
   contextEngine?: ContextEngine;
@@ -396,7 +399,8 @@ async function compactNativeHarnessCliTranscript(params: {
   let result: EmbeddedAgentCompactResult | undefined;
   try {
     const sessionAgentId = readAgentIdFromSessionKey(params.sessionKey);
-    const nativeHarnessId = params.sessionEntry.agentHarnessId?.trim();
+    const nativeHarnessId =
+      params.agentHarnessId?.trim() || params.sessionEntry.agentHarnessId?.trim();
     const authProfileId = params.sessionEntry.authProfileOverride?.trim() || undefined;
     await cliCompactionDeps.ensureSelectedAgentHarnessPlugin({
       provider: params.provider,
@@ -520,6 +524,8 @@ export async function runCliTurnCompactionLifecycle(params: {
   agentDir: string;
   provider: string;
   model: string;
+  /** Harness selected by the current run; session state may intentionally preserve older metadata. */
+  agentHarnessId?: string;
   skillsSnapshot?: SkillSnapshot;
   messageChannel?: string;
   agentAccountId?: string;
@@ -527,9 +533,10 @@ export async function runCliTurnCompactionLifecycle(params: {
   thinkLevel?: Parameters<typeof buildEmbeddedCompactionRuntimeContext>[0]["thinkLevel"];
   extraSystemPrompt?: string;
 }): Promise<SessionEntry | undefined> {
-  const sessionFile = params.sessionEntry?.sessionFile;
-  const contextTokenBudget = resolvePositiveInteger(params.sessionEntry?.contextTokens);
-  if (!sessionFile || !contextTokenBudget) {
+  const sessionEntry = params.sessionEntry;
+  const sessionFile = sessionEntry?.sessionFile;
+  const contextTokenBudget = resolvePositiveInteger(sessionEntry?.contextTokens);
+  if (!sessionEntry || !sessionFile || !contextTokenBudget) {
     return params.sessionEntry;
   }
 
@@ -567,7 +574,7 @@ export async function runCliTurnCompactionLifecycle(params: {
   const resolvedBackend = cliCompactionDeps.resolveCliBackendConfig(params.provider, params.cfg);
   if (
     resolvedBackend?.ownsNativeCompaction &&
-    !isNativeHarnessCompactionSession(params.sessionEntry, params.provider)
+    !isNativeHarnessCompactionSession(params.sessionEntry, params.provider, params.agentHarnessId)
   ) {
     log.info(`CLI backend "${params.provider}" owns native compaction — deferring to backend`);
     return params.sessionEntry;
@@ -595,7 +602,9 @@ export async function runCliTurnCompactionLifecycle(params: {
     });
   };
 
-  if (isNativeHarnessCompactionSession(params.sessionEntry, params.provider)) {
+  if (
+    isNativeHarnessCompactionSession(params.sessionEntry, params.provider, params.agentHarnessId)
+  ) {
     cliCompactionDeps.ensureContextEnginesInitialized();
     resolvedContextEngine = await cliCompactionDeps.resolveContextEngine(params.cfg);
     await applyAutoCompactionGuard(resolvedContextEngine);
@@ -604,12 +613,13 @@ export async function runCliTurnCompactionLifecycle(params: {
       sessionId: params.sessionId,
       sessionKey: params.sessionKey,
       sessionFile,
-      sessionEntry: params.sessionEntry,
+      sessionEntry,
       workspaceDir: params.workspaceDir,
       cwd: params.cwd,
       agentDir: params.agentDir,
       provider: params.provider,
       model: params.model,
+      agentHarnessId: params.agentHarnessId,
       contextTokenBudget,
       currentTokenCount,
       contextEngine: resolvedContextEngine,
