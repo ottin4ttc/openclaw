@@ -324,6 +324,40 @@ describe("runWithModelFallback + runEmbeddedPiAgent overload policy", () => {
     });
   });
 
+  it("falls back across providers when the primary streams an OpenAI server_error", async () => {
+    await withAgentWorkspace(async ({ agentDir, workspaceDir }) => {
+      await writeAuthStore(agentDir);
+      // Exact production shape: pi-ai wraps streamed OpenAI Responses `error`
+      // events as "Error Code ${code}: ${message}" with no HTTP status prefix.
+      mockPrimaryErrorThenFallbackSuccess(
+        "Error Code server_error: An error occurred while processing your request. You can retry your request, or contact us through our help center at help.openai.com if the error persists. Please include the request ID 6d365904-f89e-4984-8360-00197fa9e45c in your message.",
+      );
+
+      const result = await runEmbeddedFallback({
+        agentDir,
+        workspaceDir,
+        sessionKey: "agent:test:server-error-cross-provider",
+        runId: "run:server-error-cross-provider",
+      });
+
+      expect(result.provider).toBe("groq");
+      expect(result.model).toBe("mock-2");
+      expect(result.attempts[0]?.reason).toBe("timeout");
+      expect(result.result.payloads?.[0]?.text ?? "").toContain("fallback ok");
+
+      // server_error is transport-transient: the failing profile must not be
+      // cooldown-poisoned (a cooldown would block sibling models on the provider).
+      const usageStats = await readUsageStats(agentDir);
+      expect(usageStats["openai:p1"]?.cooldownUntil).toBeUndefined();
+      expect(usageStats["openai:p1"]?.failureCounts).toBeUndefined();
+
+      expectOpenAiThenGroqAttemptOrder();
+      // No overload backoff for server_error failovers.
+      expect(computeBackoffMock).not.toHaveBeenCalled();
+      expect(sleepWithAbortMock).not.toHaveBeenCalled();
+    });
+  });
+
   it("surfaces a bounded overloaded summary when every fallback candidate is overloaded", async () => {
     await withAgentWorkspace(async ({ agentDir, workspaceDir }) => {
       await writeAuthStore(agentDir);

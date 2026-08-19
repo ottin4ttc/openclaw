@@ -25,6 +25,29 @@ const ERROR_PATTERNS = {
     /service[_ ]unavailable.*(?:overload|capacity|high[_ ]demand)|(?:overload|capacity|high[_ ]demand).*service[_ ]unavailable/i,
     "high demand",
   ],
+  // Transient provider-side 5xx/internal failures. Streamed OpenAI-compatible
+  // errors arrive as pi-ai text like "Error Code server_error: ..." (no HTTP
+  // status prefix), so plain markers are matched in addition to JSON payloads.
+  serverError: [
+    "server_error",
+    "upstream_error",
+    "internal_error",
+    "internal server error",
+    "service temporarily unavailable",
+    "service_unavailable",
+    "bad gateway",
+    "gateway timeout",
+    "upstream error",
+    "upstream connect error",
+    "connection reset",
+    // Chinese provider server error messages
+    "内部错误",
+    "服务器错误",
+    "服务器内部错误",
+    "系统错误",
+    "系统繁忙",
+    "系统异常",
+  ],
   timeout: [
     "timeout",
     "timed out",
@@ -159,4 +182,23 @@ export function isAuthErrorMessage(raw: string): boolean {
 
 export function isOverloadedErrorMessage(raw: string): boolean {
   return matchesErrorPatterns(raw, ERROR_PATTERNS.overloaded);
+}
+
+// OpenAI's generic 5xx sentence carries no stable error marker; require the
+// support-channel corroboration (help center URL or request id) so arbitrary
+// prose mentioning "an error occurred" is not classified as transient.
+const GENERIC_PROVIDER_INTERNAL_ERROR_RE = /an error occurred while processing your request/i;
+const SUPPORT_REQUEST_ID_RE = /(?:request[\s_-]*id)\s*[:#]?\s*([a-z0-9][a-z0-9_-]{6,}[a-z0-9])/i;
+
+export function isServerErrorMessage(raw: string): boolean {
+  if (!raw) {
+    return false;
+  }
+  if (matchesErrorPatterns(raw, ERROR_PATTERNS.serverError)) {
+    return true;
+  }
+  return (
+    GENERIC_PROVIDER_INTERNAL_ERROR_RE.test(raw) &&
+    (/help\.openai\.com/i.test(raw) || SUPPORT_REQUEST_ID_RE.test(raw))
+  );
 }
