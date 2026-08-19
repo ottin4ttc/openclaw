@@ -10,6 +10,7 @@ import {
   isOverloadedErrorMessage,
   isPeriodicUsageLimitErrorMessage,
   isRateLimitErrorMessage,
+  isServerErrorMessage,
   isTimeoutErrorMessage,
   matchesFormatErrorPattern,
 } from "./failover-matches.js";
@@ -21,6 +22,7 @@ export {
   isBillingErrorMessage,
   isOverloadedErrorMessage,
   isRateLimitErrorMessage,
+  isServerErrorMessage,
   isTimeoutErrorMessage,
 } from "./failover-matches.js";
 
@@ -970,6 +972,18 @@ export function classifyFailoverReason(raw: string): FailoverReason | null {
   }
   if (isOverloadedErrorMessage(raw)) {
     return "overloaded";
+  }
+  if (
+    isServerErrorMessage(raw) &&
+    !isBillingErrorMessage(raw) &&
+    !isAuthPermanentErrorMessage(raw) &&
+    !isAuthErrorMessage(raw)
+  ) {
+    // Provider-side 5xx/internal failures (e.g. streamed "Error Code
+    // server_error: ..." from OpenAI-compatible upstreams) are transient:
+    // classify like retryable transport errors so auth-profile rotation and
+    // model fallback engage instead of surfacing the raw error to the user.
+    return "timeout";
   }
   if (isTransientHttpError(raw)) {
     // 529 is always overloaded, even without explicit overload keywords in the body.
