@@ -3624,6 +3624,38 @@ export function createLangfuseService(
             : undefined;
 
       if (entry.hasProviderRequestGenerations || entry.providerRequestAugmentedHookGenerations) {
+        const providerGenerationIndex =
+          transcriptTiming.assistantCallIndex ??
+          (entry.completedGenerations.size === 1
+            ? entry.completedGenerations.keys().next().value
+            : undefined);
+        const providerGeneration =
+          providerGenerationIndex !== undefined
+            ? entry.completedGenerations.get(providerGenerationIndex)
+            : undefined;
+        // Provider diagnostics own call identity and timing. Only transports whose terminal
+        // omitted response content may repair that payload from the persisted transcript.
+        if (
+          providerGeneration &&
+          providerGenerationIndex !== undefined &&
+          generationOutput !== undefined &&
+          entry.providerRequestGenerationOutputMissing?.has(providerGenerationIndex)
+        ) {
+          const genId =
+            entry.completedGenerationIds?.get(providerGenerationIndex) ??
+            generateObservationId(entry.traceId, "gen", providerGenerationIndex);
+          if (
+            beginSdkEnqueue(
+              entry,
+              genId,
+              "generation-update",
+              "transcript provider generation output update",
+            )
+          ) {
+            providerGeneration.update({ output: generationOutput });
+            entry.providerRequestGenerationOutputMissing.delete(providerGenerationIndex);
+          }
+        }
         patchFinalizedTraceFromTranscript(entry, _redactEnabled);
         return;
       }

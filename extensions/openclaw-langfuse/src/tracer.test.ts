@@ -5755,6 +5755,11 @@ describe("LangfuseService tracer", () => {
           usageDetails: expect.objectContaining({ input: 3335, output: 240, total: 26871 }),
         }),
       );
+      await vi.waitFor(() =>
+        expect(providerGenerationClient.update).toHaveBeenCalledWith(
+          expect.objectContaining({ output: "done" }),
+        ),
+      );
       expect(providerGenerationClient.update).not.toHaveBeenCalledWith(
         expect.objectContaining({
           metadata: expect.objectContaining({ source: "transcript-output-repair" }),
@@ -5763,6 +5768,170 @@ describe("LangfuseService tracer", () => {
     } finally {
       await service.stop?.(makeServiceCtx());
       fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not replace provider-request output with transcript content", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-02T09:10:00.000Z"));
+    let transcriptListener: TranscriptListener | undefined;
+    const runtime: Parameters<typeof createLangfuseService>[2] = {
+      events: {
+        onSessionTranscriptUpdate: (listener: TranscriptListener) => {
+          transcriptListener = listener;
+          return vi.fn();
+        },
+      },
+    };
+    const service = await startService(config, runtime);
+    try {
+      const { beforeAgentRun } = service.getHookHandlers();
+      const ctx = {
+        ...agentCtx,
+        sessionKey: "agent:agent-1:openresponses:provider-output",
+        sessionId: "session-id-provider-output",
+      };
+      beforeAgentRun({ prompt: "hello", messages: [] }, ctx);
+
+      diagnosticRuntime.listener?.({
+        type: "model.call.started",
+        runId: "run-provider-output",
+        callId: "call-provider-output",
+        scope: "provider-request",
+        sessionKey: ctx.sessionKey,
+        sessionId: ctx.sessionId,
+        provider: "codex",
+        model: "aliyun/qwen3.7-plus",
+        ts: Date.parse("2026-07-02T09:10:01.000Z"),
+      });
+      diagnosticRuntime.listener?.(
+        {
+          type: "model.call.completed",
+          runId: "run-provider-output",
+          callId: "call-provider-output",
+          scope: "provider-request",
+          sessionKey: ctx.sessionKey,
+          sessionId: ctx.sessionId,
+          provider: "codex",
+          model: "aliyun/qwen3.7-plus",
+          durationMs: 1000,
+          usageSource: "provider",
+          usage: { input: 10, output: 2, total: 12 },
+          ts: Date.parse("2026-07-02T09:10:02.000Z"),
+        },
+        { modelContent: { outputMessages: [{ role: "assistant", content: "canonical" }] } },
+      );
+      const providerGenerationClient = mockTrace.generation.mock.results[0]?.value;
+      await vi.waitFor(() =>
+        expect(providerGenerationClient.update).toHaveBeenCalledWith(
+          expect.objectContaining({
+            output: [{ role: "assistant", content: "canonical" }],
+          }),
+        ),
+      );
+      providerGenerationClient.update.mockClear();
+
+      const assistantMessage = {
+        role: "assistant",
+        content: [{ type: "text", text: "transcript" }],
+        provider: "codex",
+        model: "aliyun/qwen3.7-plus",
+        timestamp: Date.parse("2026-07-02T09:10:02.000Z"),
+      };
+      transcriptListener?.({
+        target: transcriptTarget(ctx),
+        sessionKey: ctx.sessionKey,
+        agentId: ctx.agentId,
+        sessionId: ctx.sessionId,
+        messageId: "a1",
+        message: assistantMessage,
+      });
+      await Promise.resolve();
+
+      expect(providerGenerationClient.update).not.toHaveBeenCalledWith(
+        expect.objectContaining({ output: "transcript" }),
+      );
+    } finally {
+      await service.stop?.(makeServiceCtx());
+    }
+  });
+
+  it("does not guess a provider generation when transcript correlation is ambiguous", async () => {
+    let transcriptListener: TranscriptListener | undefined;
+    const runtime: Parameters<typeof createLangfuseService>[2] = {
+      events: {
+        onSessionTranscriptUpdate: (listener: TranscriptListener) => {
+          transcriptListener = listener;
+          return vi.fn();
+        },
+      },
+    };
+    const service = await startService(config, runtime);
+    try {
+      const { beforeAgentRun } = service.getHookHandlers();
+      const ctx = {
+        ...agentCtx,
+        sessionKey: "agent:agent-1:openresponses:provider-ambiguous",
+        sessionId: "session-id-provider-ambiguous",
+      };
+      beforeAgentRun({ prompt: "hello", messages: [] }, ctx);
+
+      for (const callIndex of [1, 2]) {
+        diagnosticRuntime.listener?.({
+          type: "model.call.started",
+          runId: `run-provider-${callIndex}`,
+          callId: `call-provider-${callIndex}`,
+          providerRequestIndex: callIndex,
+          scope: "provider-request",
+          sessionKey: ctx.sessionKey,
+          sessionId: ctx.sessionId,
+          provider: "codex",
+          model: "aliyun/qwen3.7-plus",
+          ts: 1_000 + callIndex,
+        });
+        diagnosticRuntime.listener?.({
+          type: "model.call.completed",
+          runId: `run-provider-${callIndex}`,
+          callId: `call-provider-${callIndex}`,
+          providerRequestIndex: callIndex,
+          scope: "provider-request",
+          sessionKey: ctx.sessionKey,
+          sessionId: ctx.sessionId,
+          provider: "codex",
+          model: "aliyun/qwen3.7-plus",
+          durationMs: 100,
+          usageSource: "provider",
+          usage: { input: 10, output: 2, total: 12 },
+          ts: 1_100 + callIndex,
+        });
+      }
+      expect(mockTrace.generation).toHaveBeenCalledTimes(2);
+      const generations = mockTrace.generation.mock.results.map((result) => result.value);
+      for (const generation of generations) {
+        generation.update.mockClear();
+      }
+
+      transcriptListener?.({
+        target: transcriptTarget(ctx),
+        sessionKey: ctx.sessionKey,
+        agentId: ctx.agentId,
+        sessionId: ctx.sessionId,
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "uncorrelated" }],
+          provider: "codex",
+          model: "aliyun/qwen3.7-plus",
+        },
+      });
+      await Promise.resolve();
+
+      for (const generation of generations) {
+        expect(generation.update).not.toHaveBeenCalledWith(
+          expect.objectContaining({ output: "uncorrelated" }),
+        );
+      }
+    } finally {
+      await service.stop?.(makeServiceCtx());
     }
   });
 

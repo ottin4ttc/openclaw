@@ -161,6 +161,7 @@ export type TraceContextEntry = {
   providerRequestCallCount?: number; // stable per-call model diagnostics seen for this trace
   providerRequestCallIndexes?: Map<string, number>; // diagnostic callId -> stable LLM call index
   providerRequestGenerationIndexes?: Map<string, number>; // diagnostic callId -> allocated generation slot
+  providerRequestGenerationOutputMissing?: Set<number>; // generation slots whose provider terminal omitted response content
   providerRequestResponseIdHashes?: Map<number, string>; // generation slot -> hashed Responses response id
   providerRequestCompletedCallIds?: Set<string>; // terminal per-call diagnostics seen by callId
   providerRequestUsages?: Map<string, Record<string, number>>; // authoritative per-call usage keyed by callId

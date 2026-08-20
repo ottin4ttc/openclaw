@@ -2494,6 +2494,14 @@ function noteInputProjectionUnavailable(entry, callId) {
 function generationOutputFromModelContent(modelContent, redactEnabled) {
 	return modelContent?.outputMessages !== void 0 ? truncatePayload(redactObject(modelContent.outputMessages, redactEnabled)) : void 0;
 }
+function recordProviderRequestOutputAvailability(entry, generationIndex, output) {
+	const missingOutputs = entry.providerRequestGenerationOutputMissing ??= /* @__PURE__ */ new Set();
+	if (output === void 0) {
+		missingOutputs.add(generationIndex);
+		return;
+	}
+	missingOutputs.delete(generationIndex);
+}
 function eventDate(evt, timeField = "endTimeMs") {
 	const explicitTime = evt[timeField];
 	if (typeof explicitTime === "number") return new Date(explicitTime);
@@ -2688,6 +2696,7 @@ function deferProviderRequestCompletion(entry, providerRequestIndex, diagEvt, in
 	const explicitStartTime = typeof diagEvt.startTimeMs === "number" ? eventDate(diagEvt, "startTimeMs") : void 0;
 	const usageDetails = usageDetailsFromUsage(usage);
 	const output = generationOutputFromModelContent(modelContent, redactEnabled);
+	recordProviderRequestOutputAvailability(entry, providerRequestIndex, output);
 	const baseMetadata = {
 		durationMs,
 		...diagnosticRuntimeMetadata(diagEvt),
@@ -3220,6 +3229,7 @@ async function subscribeDiagnosticEvents(opts) {
 				});
 				if (generationOutput !== void 0) publishNativeChildTraceOutput(rootEntry, nativeChildParent, generationOutput);
 				const genIndex = providerRequestGenerationIndex(entry, callId, providerRequestIndex);
+				recordProviderRequestOutputAvailability(entry, genIndex, generationOutput);
 				entry.completedGenerations.set(genIndex, gen);
 				if (genId) (entry.completedGenerationIds ??= /* @__PURE__ */ new Map()).set(genIndex, genId);
 				removePendingGenerationAliases(entry, gen, genId);
@@ -6492,6 +6502,14 @@ function createLangfuseService(config, logger, pluginRuntime) {
 			const completedGenIndex = transcriptTiming.assistantCallIndex ?? entry.llmCallCount;
 			const completedGen = transcriptTiming.assistantCallIndex !== void 0 ? entry.completedGenerations.get(transcriptTiming.assistantCallIndex) : entry.completedGenerations.size >= entry.llmCallCount && entry.llmCallCount > 0 ? entry.completedGenerations.get(entry.llmCallCount) ?? [...entry.completedGenerations.values()].at(-1) : void 0;
 			if (entry.hasProviderRequestGenerations || entry.providerRequestAugmentedHookGenerations) {
+				const providerGenerationIndex = transcriptTiming.assistantCallIndex ?? (entry.completedGenerations.size === 1 ? entry.completedGenerations.keys().next().value : void 0);
+				const providerGeneration = providerGenerationIndex !== void 0 ? entry.completedGenerations.get(providerGenerationIndex) : void 0;
+				if (providerGeneration && providerGenerationIndex !== void 0 && generationOutput !== void 0 && entry.providerRequestGenerationOutputMissing?.has(providerGenerationIndex)) {
+					if (beginSdkEnqueue(entry, entry.completedGenerationIds?.get(providerGenerationIndex) ?? generateObservationId(entry.traceId, "gen", providerGenerationIndex), "generation-update", "transcript provider generation output update")) {
+						providerGeneration.update({ output: generationOutput });
+						entry.providerRequestGenerationOutputMissing.delete(providerGenerationIndex);
+					}
+				}
 				patchFinalizedTraceFromTranscript(entry, _redactEnabled);
 				return;
 			}

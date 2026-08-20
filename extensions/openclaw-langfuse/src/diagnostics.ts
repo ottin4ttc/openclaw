@@ -1064,6 +1064,19 @@ function generationOutputFromModelContent(
     : undefined;
 }
 
+function recordProviderRequestOutputAvailability(
+  entry: TraceContextEntry,
+  generationIndex: number,
+  output: unknown | undefined,
+): void {
+  const missingOutputs = (entry.providerRequestGenerationOutputMissing ??= new Set());
+  if (output === undefined) {
+    missingOutputs.add(generationIndex);
+    return;
+  }
+  missingOutputs.delete(generationIndex);
+}
+
 function eventDate(
   evt: DiagnosticRecord,
   timeField: "startTimeMs" | "endTimeMs" = "endTimeMs",
@@ -1424,6 +1437,7 @@ function deferProviderRequestCompletion(
     typeof diagEvt.startTimeMs === "number" ? eventDate(diagEvt, "startTimeMs") : undefined;
   const usageDetails = usageDetailsFromUsage(usage);
   const output = generationOutputFromModelContent(modelContent, redactEnabled);
+  recordProviderRequestOutputAvailability(entry, providerRequestIndex, output);
   const baseMetadata = {
     durationMs,
     ...diagnosticRuntimeMetadata(diagEvt),
@@ -2436,6 +2450,7 @@ export async function subscribeDiagnosticEvents(
           publishNativeChildTraceOutput(rootEntry, nativeChildParent, generationOutput);
         }
         const genIndex = providerRequestGenerationIndex(entry, callId, providerRequestIndex);
+        recordProviderRequestOutputAvailability(entry, genIndex, generationOutput);
         entry.completedGenerations.set(genIndex, gen);
         if (genId) {
           (entry.completedGenerationIds ??= new Map()).set(genIndex, genId);
