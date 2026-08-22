@@ -208,6 +208,40 @@ describe("entry compile cache", () => {
     ).toBeUndefined();
   });
 
+  it("does not respawn when the caller disables OpenClaw respawn", async () => {
+    const root = makeTempDir(tempDirs, "openclaw-compile-cache-no-respawn-");
+    await fs.mkdir(path.join(root, "src"), { recursive: true });
+    await fs.writeFile(path.join(root, "src", "entry.ts"), "export {};\n", "utf8");
+
+    expect(
+      buildOpenClawCompileCacheRespawnPlan({
+        currentFile: path.join(root, "dist", "entry.js"),
+        env: {
+          NODE_COMPILE_CACHE: "/tmp/openclaw-cache",
+          OPENCLAW_NO_RESPAWN: "1",
+        },
+        installRoot: root,
+      }),
+    ).toBeUndefined();
+  });
+
+  it("keeps the existing respawn behavior for a false no-respawn value", async () => {
+    const root = makeTempDir(tempDirs, "openclaw-compile-cache-no-respawn-false-");
+    await fs.mkdir(path.join(root, "src"), { recursive: true });
+    await fs.writeFile(path.join(root, "src", "entry.ts"), "export {};\n", "utf8");
+
+    expect(
+      buildOpenClawCompileCacheRespawnPlan({
+        currentFile: path.join(root, "dist", "entry.js"),
+        env: {
+          NODE_COMPILE_CACHE: "/tmp/openclaw-cache",
+          OPENCLAW_NO_RESPAWN: "0",
+        },
+        installRoot: root,
+      }),
+    ).toMatchObject({ command: process.execPath });
+  });
+
   it("runs compile-cache respawn plans with the child-process bridge", () => {
     const child = new EventEmitter() as ChildProcess;
     const spawn = vi.fn(() => child);
@@ -236,8 +270,7 @@ describe("entry compile cache", () => {
       {
         stdio: "inherit",
         env: { NODE_DISABLE_COMPILE_CACHE: "1" },
-        detached:
-          process.platform !== "win32" && !(process.stdin.isTTY || process.stdout.isTTY),
+        detached: process.platform !== "win32" && !(process.stdin.isTTY || process.stdout.isTTY),
       },
     );
     const [bridgeChild, bridgeOptions] = requireFirstMockCall(

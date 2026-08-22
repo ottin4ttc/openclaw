@@ -77,17 +77,19 @@ export class SandboxFsPathGuard {
   }
 
   async assertPathSafety(target: SandboxResolvedFsPath, options: PathSafetyOptions) {
+    let effectiveOptions = options;
     let guarded = await this.openBoundaryWithinRequiredMount(target, options.action, {
       aliasPolicy: options.aliasPolicy,
       allowedType: options.allowedType,
     });
     if (!guarded.ok && options.allowDirectory) {
+      effectiveOptions = { ...options, allowedType: "directory" };
       guarded = await this.openBoundaryWithinRequiredMount(target, options.action, {
         aliasPolicy: options.aliasPolicy,
         allowedType: "directory",
       });
     }
-    await this.assertGuardedPathSafety(target, options, guarded);
+    await this.assertGuardedPathSafety(target, effectiveOptions, guarded);
   }
 
   async openReadableFile(

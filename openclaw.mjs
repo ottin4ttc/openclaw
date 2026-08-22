@@ -79,6 +79,12 @@ const isSourceCheckoutLauncher = () =>
   existsSync(new URL("./.git", import.meta.url)) ||
   existsSync(new URL("./src/entry.ts", import.meta.url));
 
+const isTruthyEnvValue = (value) =>
+  ["1", "on", "true", "yes"].includes(
+    String(value ?? "")
+      .trim()
+      .toLowerCase(),
+  );
 const isNodeCompileCacheDisabled = () => process.env.NODE_DISABLE_COMPILE_CACHE !== undefined;
 const isNodeCompileCacheRequested = () =>
   Boolean(process.env.NODE_COMPILE_CACHE) && !isNodeCompileCacheDisabled();
@@ -224,6 +230,9 @@ const runRespawnedChild = (command, args, env) => {
 };
 
 const respawnWithoutCompileCacheIfNeeded = () => {
+  if (isTruthyEnvValue(process.env.OPENCLAW_NO_RESPAWN)) {
+    return false;
+  }
   if (!isSourceCheckoutLauncher()) {
     return false;
   }
@@ -247,7 +256,11 @@ const respawnWithoutCompileCacheIfNeeded = () => {
 };
 
 const respawnWithPackagedCompileCacheIfNeeded = () => {
-  if (isSourceCheckoutLauncher() || isNodeCompileCacheDisabled()) {
+  if (
+    isTruthyEnvValue(process.env.OPENCLAW_NO_RESPAWN) ||
+    isSourceCheckoutLauncher() ||
+    isNodeCompileCacheDisabled()
+  ) {
     return false;
   }
   if (process.env.OPENCLAW_PACKAGED_COMPILE_CACHE_RESPAWNED === "1") {

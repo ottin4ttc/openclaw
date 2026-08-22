@@ -15,6 +15,7 @@ import {
   getDockerScript,
   installFsBridgeTestHarness,
   mockedExecDockerRaw,
+  mockedOpenRootFile,
   withTempDir,
 } from "./fs-bridge.test-helpers.js";
 
@@ -249,6 +250,41 @@ describe("sandbox fs bridge anchored ops", () => {
       await expect(bridge.stat({ filePath: "memory" })).resolves.toMatchObject({
         type: "directory",
       });
+    });
+  });
+
+  it("preserves directory type when stat falls back after an open error", async () => {
+    await withTempDir("openclaw-fs-bridge-contract-stat-dir-fallback-", async (stateDir) => {
+      const workspaceDir = path.join(stateDir, "workspace");
+      await fs.mkdir(path.join(workspaceDir, "memory"), { recursive: true });
+      const ioFailure = {
+        ok: false as const,
+        reason: "io" as const,
+        error: Object.assign(new Error("EISDIR"), { code: "EISDIR" }),
+      };
+      mockedOpenRootFile.mockImplementation(async () => ioFailure);
+      mockedExecDockerRaw.mockImplementation(async (args) => {
+        const script = getDockerScript(args);
+        if (script.includes('readlink -f -- "$cursor"')) {
+          return dockerExecResult(`${getDockerArg(args, 1)}\n`);
+        }
+        if (script.includes('stat -c "%F|%s|%y"')) {
+          return dockerExecResult("directory|0|2\n");
+        }
+        return dockerExecResult("");
+      });
+
+      const bridge = createSandboxFsBridge({
+        sandbox: createSandbox({ workspaceDir, agentWorkspaceDir: workspaceDir }),
+      });
+
+      await expect(bridge.stat({ filePath: "memory" })).resolves.toMatchObject({
+        type: "directory",
+      });
+      expect(mockedOpenRootFile.mock.calls.map(([params]) => params.allowedType)).toEqual([
+        undefined,
+        "directory",
+      ]);
     });
   });
 

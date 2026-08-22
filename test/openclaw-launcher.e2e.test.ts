@@ -811,6 +811,24 @@ describe("openclaw launcher", () => {
     expect(result.stdout).toBe("cache:disabled;respawn:1");
   });
 
+  it("does not respawn source-checkout launchers when explicitly disabled", async () => {
+    const fixtureRoot = await makeLauncherFixture(fixtureRoots);
+    await addGitMarker(fixtureRoot);
+    await addCompileCacheProbe(fixtureRoot);
+
+    const result = spawnSync(process.execPath, [path.join(fixtureRoot, "openclaw.mjs")], {
+      cwd: fixtureRoot,
+      env: launcherEnv({
+        NODE_COMPILE_CACHE: path.join(fixtureRoot, ".node-compile-cache"),
+        OPENCLAW_NO_RESPAWN: "1",
+      }),
+      encoding: "utf8",
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe("cache:enabled;respawn:0");
+  });
+
   it.runIf(process.platform !== "win32")(
     "forwards SIGTERM to source-checkout compile-cache respawn children",
     async () => {

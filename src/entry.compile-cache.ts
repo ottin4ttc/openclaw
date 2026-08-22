@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { isTerminalInteractiveRespawnArgv } from "./cli/respawn-policy.js";
+import { isTruthyEnvValue } from "./infra/env.js";
 import { attachChildProcessBridge } from "./process/child-process-bridge.js";
 import {
   runRespawnChildWithSignalBridge,
@@ -151,6 +152,9 @@ export function buildOpenClawCompileCacheRespawnPlan(params: {
     ((params.platform ?? process.platform) === "win32" &&
       isNodeVersionAffectedByCompileCacheDeadlock(params.nodeVersion ?? process.versions.node));
   if (!needsDisabledCompileCacheRespawn) {
+    return undefined;
+  }
+  if (isTruthyEnvValue(env.OPENCLAW_NO_RESPAWN)) {
     return undefined;
   }
   if (env[COMPILE_CACHE_DISABLED_RESPAWNED_ENV] === "1") {

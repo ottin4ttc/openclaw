@@ -82,7 +82,9 @@ controls; they are not exposed as OpenClaw plugin hooks in the v1 contract.
 
 Set `appServer.nativeHookRelay.enabled: false` to stop injecting only the
 OpenClaw compatibility relay. This does not disable Codex's hook engine or
-remove user- or plugin-owned Codex hooks.
+remove user- or plugin-owned Codex hooks. Restart the Gateway after changing
+this setting; behavior before restart is not guaranteed for an already-running
+thread.
 
 For OpenClaw dynamic tools, OpenClaw executes the tool after Codex asks for
 the call, so plugin and middleware behavior runs in the harness adapter. For

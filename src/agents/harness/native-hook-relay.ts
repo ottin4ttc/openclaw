@@ -582,7 +582,7 @@ export function buildNativeHookRelayCommand(params: {
   const nicePrefix = resolveNativeHookRelayNicePrefix(params.nice);
   return shellQuoteArgs([
     // Replace Codex's hook shell and prevent OpenClaw from detaching a respawned child.
-    // This keeps the relay inside Codex's process-group cleanup boundary on timeout.
+    // On Unix this keeps the relay as Codex's direct child for timeout cleanup.
     ...(process.platform === "win32" ? [] : ["exec", "env", "OPENCLAW_NO_RESPAWN=1"]),
     ...nicePrefix,
     ...argv,
