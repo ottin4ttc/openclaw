@@ -223,6 +223,35 @@ describe("sandbox fs bridge anchored ops", () => {
     });
   });
 
+  it("stats existing directories within the sandbox boundary", async () => {
+    await withTempDir("openclaw-fs-bridge-contract-stat-dir-", async (stateDir) => {
+      const workspaceDir = path.join(stateDir, "workspace");
+      await fs.mkdir(path.join(workspaceDir, "memory"), { recursive: true });
+
+      mockedExecDockerRaw.mockImplementation(async (args) => {
+        const script = getDockerScript(args);
+        if (script.includes('readlink -f -- "$cursor"')) {
+          return dockerExecResult(`${getDockerArg(args, 1)}\n`);
+        }
+        if (script.includes('stat -c "%F|%s|%y"')) {
+          return dockerExecResult("directory|0|2\n");
+        }
+        return dockerExecResult("");
+      });
+
+      const bridge = createSandboxFsBridge({
+        sandbox: createSandbox({
+          workspaceDir,
+          agentWorkspaceDir: workspaceDir,
+        }),
+      });
+
+      await expect(bridge.stat({ filePath: "memory" })).resolves.toMatchObject({
+        type: "directory",
+      });
+    });
+  });
+
   it("saturates unsafe stat size output", async () => {
     await withTempDir("openclaw-fs-bridge-stat-parse-", async (stateDir) => {
       const workspaceDir = path.join(stateDir, "workspace");

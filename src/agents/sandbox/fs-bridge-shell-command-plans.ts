@@ -21,7 +21,7 @@ export function buildStatPlan(
   anchoredTarget: AnchoredSandboxEntry,
 ): SandboxFsCommandPlan {
   return {
-    checks: [{ target, options: { action: "stat files" } }],
+    checks: [{ target, options: { action: "stat files", allowDirectory: true } }],
     script: 'set -eu\ncd -- "$1"\nstat -c "%F|%s|%y" -- "$2"',
     args: [anchoredTarget.canonicalParentPath, anchoredTarget.basename],
     allowFailure: true,

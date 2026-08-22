@@ -22,6 +22,7 @@ type PathSafetyOptions = {
   aliasPolicy?: PathAliasPolicy;
   requireWritable?: boolean;
   allowedType?: BoundaryAllowedType;
+  allowDirectory?: boolean;
 };
 
 /** Path plus operation constraints to validate before execution. */
@@ -76,10 +77,16 @@ export class SandboxFsPathGuard {
   }
 
   async assertPathSafety(target: SandboxResolvedFsPath, options: PathSafetyOptions) {
-    const guarded = await this.openBoundaryWithinRequiredMount(target, options.action, {
+    let guarded = await this.openBoundaryWithinRequiredMount(target, options.action, {
       aliasPolicy: options.aliasPolicy,
       allowedType: options.allowedType,
     });
+    if (!guarded.ok && options.allowDirectory) {
+      guarded = await this.openBoundaryWithinRequiredMount(target, options.action, {
+        aliasPolicy: options.aliasPolicy,
+        allowedType: "directory",
+      });
+    }
     await this.assertGuardedPathSafety(target, options, guarded);
   }
 
