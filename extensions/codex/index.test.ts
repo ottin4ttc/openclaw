@@ -434,6 +434,25 @@ describe("codex plugin", () => {
     );
   });
 
+  it("disables native hook relay from live Codex plugin config", async () => {
+    const harness = createCodexAppServerAgentHarness({
+      pluginConfig: { appServer: { nativeHookRelay: { enabled: false } } },
+      bindingStore: testCodexAppServerBindingStore,
+    });
+    runCodexAppServerAttemptMock.mockResolvedValueOnce({ success: true });
+
+    await harness.runAttempt({ prompt: "hello" } as never);
+
+    expect(runCodexAppServerAttemptMock).toHaveBeenCalledWith(
+      { prompt: "hello" },
+      {
+        bindingStore: testCodexAppServerBindingStore,
+        pluginConfig: { appServer: { nativeHookRelay: { enabled: false } } },
+        nativeHookRelay: { enabled: false },
+      },
+    );
+  });
+
   it("enables the native hook relay for public Codex side questions", async () => {
     const harness = createCodexAppServerAgentHarness({
       pluginConfig: { appServer: {} },

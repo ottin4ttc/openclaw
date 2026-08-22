@@ -116,6 +116,10 @@ export type CodexAppServerExperimentalConfig = {
   sandboxExecServer?: boolean;
 };
 
+export type CodexNativeHookRelayConfig = {
+  enabled?: boolean;
+};
+
 export type CodexAppServerNetworkProxyDomainPermission = "allow" | "deny";
 export type CodexAppServerNetworkProxyUnixSocketPermission = "allow" | "none";
 export type CodexAppServerNetworkProxyBaseProfile = "read-only" | "workspace";
@@ -233,6 +237,7 @@ export type CodexPluginConfig = {
     serviceTier?: CodexServiceTier | null;
     networkProxy?: CodexAppServerNetworkProxyConfig;
     defaultWorkspaceDir?: string;
+    nativeHookRelay?: CodexNativeHookRelayConfig;
     experimental?: CodexAppServerExperimentalConfig;
   };
 };
@@ -268,6 +273,7 @@ export const CODEX_APP_SERVER_CONFIG_KEYS = [
   "serviceTier",
   "networkProxy",
   "defaultWorkspaceDir",
+  "nativeHookRelay",
   "experimental",
 ] as const;
 
@@ -330,6 +336,11 @@ const codexAppServerServiceTierSchema = z
 const codexAppServerExperimentalSchema = z
   .object({
     sandboxExecServer: z.boolean().optional(),
+  })
+  .strict();
+const codexNativeHookRelaySchema = z
+  .object({
+    enabled: z.boolean().optional(),
   })
   .strict();
 const codexAppServerRemoteWorkspaceRootSchema = z.string().trim().min(1);
@@ -421,6 +432,7 @@ const codexPluginConfigSchema = z
         serviceTier: codexAppServerServiceTierSchema,
         networkProxy: codexAppServerNetworkProxySchema.optional(),
         defaultWorkspaceDir: z.string().optional(),
+        nativeHookRelay: codexNativeHookRelaySchema.optional(),
         experimental: codexAppServerExperimentalSchema.optional(),
       })
       .strict()
@@ -443,6 +455,11 @@ export function readCodexPluginConfig(value: unknown): CodexPluginConfig {
 
 export function isCodexSandboxExecServerEnabled(pluginConfig?: unknown): boolean {
   return readCodexPluginConfig(pluginConfig).appServer?.experimental?.sandboxExecServer === true;
+}
+
+/** Native hooks remain enabled unless an operator explicitly disables the relay. */
+export function isCodexNativeHookRelayEnabled(pluginConfig?: unknown): boolean {
+  return readCodexPluginConfig(pluginConfig).appServer?.nativeHookRelay?.enabled !== false;
 }
 
 function assertCodexAppServerCommandHasNoInlineArgs(params: {

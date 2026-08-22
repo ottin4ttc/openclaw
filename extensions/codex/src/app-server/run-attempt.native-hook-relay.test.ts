@@ -702,7 +702,7 @@ describe("runCodexAppServerAttempt native hook relay", () => {
     expect(testing.resolveCodexNativeHookRelayUnregisterGraceMs(60)).toBe(65_000);
   });
 
-  it("sends clearing Codex native hook config when the relay is disabled", async () => {
+  it("leaves Codex-owned hooks unchanged when the OpenClaw relay is disabled", async () => {
     const sessionFile = path.join(tempDir, "session.jsonl");
     const workspaceDir = path.join(tempDir, "workspace");
     const harness = createStartedThreadHarness();
@@ -717,11 +717,11 @@ describe("runCodexAppServerAttempt native hook relay", () => {
     const startRequest = harness.requests.find((request) => request.method === "thread/start");
     const startConfig = (startRequest?.params as { config?: Record<string, unknown> } | undefined)
       ?.config;
-    expect(startConfig?.["features.hooks"]).toBe(false);
-    expect(startConfig?.["hooks.PreToolUse"]).toEqual([]);
-    expect(startConfig?.["hooks.PostToolUse"]).toEqual([]);
-    expect(startConfig?.["hooks.PermissionRequest"]).toEqual([]);
-    expect(startConfig?.["hooks.Stop"]).toEqual([]);
+    expect(startConfig).not.toHaveProperty("features.hooks");
+    expect(startConfig).not.toHaveProperty("hooks.PreToolUse");
+    expect(startConfig).not.toHaveProperty("hooks.PostToolUse");
+    expect(startConfig).not.toHaveProperty("hooks.PermissionRequest");
+    expect(startConfig).not.toHaveProperty("hooks.Stop");
   });
 
   it("cleans up native hook relay state when turn/start fails", async () => {

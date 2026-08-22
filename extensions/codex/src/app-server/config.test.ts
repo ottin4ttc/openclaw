@@ -13,6 +13,7 @@ import {
   canUseCodexModelBackedApprovalsReviewerForModel,
   codexAppServerStartOptionsKey,
   fingerprintCodexAppServerNetworkProxyConfigPatch,
+  isCodexNativeHookRelayEnabled,
   readCodexPluginConfig,
   resolveCodexAppServerRuntimeOptions,
   resolveCodexAppServerUserHomeDir,
@@ -87,6 +88,14 @@ function expectUiHintLabel(manifest: { uiHints: Record<string, unknown> }, key: 
 }
 
 describe("Codex app-server config", () => {
+  it("keeps native hook relay enabled unless explicitly disabled", () => {
+    expect(isCodexNativeHookRelayEnabled()).toBe(true);
+    expect(isCodexNativeHookRelayEnabled({ appServer: {} })).toBe(true);
+    expect(
+      isCodexNativeHookRelayEnabled({ appServer: { nativeHookRelay: { enabled: false } } }),
+    ).toBe(false);
+  });
+
   it("only auto-approves app-server approvals for full yolo runtime policy", () => {
     expect(
       shouldAutoApproveCodexAppServerApprovals({

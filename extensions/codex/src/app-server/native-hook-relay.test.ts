@@ -9,7 +9,6 @@ import { MAX_TIMER_TIMEOUT_MS } from "openclaw/plugin-sdk/number-runtime";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   buildCodexNativeHookRelayConfig,
-  buildCodexNativeHookRelayDisabledConfig,
   emitCodexNativePreToolUseFailureDiagnostic,
   resolveCodexNativeHookRelayCommandTimeoutMs,
   resolveCodexNativeHookRelayUnregisterGraceMs,
@@ -299,16 +298,6 @@ describe("Codex native hook relay config", () => {
     expect((config["hooks.PostToolUse"] as Array<{ matcher?: unknown }>)[0]).not.toHaveProperty(
       "matcher",
     );
-  });
-
-  it("builds deterministic clearing config when the relay is disabled", () => {
-    expect(buildCodexNativeHookRelayDisabledConfig()).toEqual({
-      "features.hooks": false,
-      "hooks.PreToolUse": [],
-      "hooks.PostToolUse": [],
-      "hooks.PermissionRequest": [],
-      "hooks.Stop": [],
-    });
   });
 
   it("caps oversized native hook cleanup grace before scheduling", () => {

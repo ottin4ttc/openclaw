@@ -80,6 +80,10 @@ escalations after review. Add `permission_request` to
 hooks such as `SessionStart` and `UserPromptSubmit` remain Codex-level
 controls; they are not exposed as OpenClaw plugin hooks in the v1 contract.
 
+Set `appServer.nativeHookRelay.enabled: false` to stop injecting only the
+OpenClaw compatibility relay. This does not disable Codex's hook engine or
+remove user- or plugin-owned Codex hooks.
+
 For OpenClaw dynamic tools, OpenClaw executes the tool after Codex asks for
 the call, so plugin and middleware behavior runs in the harness adapter. For
 Codex-native tools, Codex owns the canonical tool record; OpenClaw can mirror

@@ -192,7 +192,6 @@ import {
   shouldEmitTranscriptToolProgress,
 } from "./event-projector.js";
 import {
-  buildCodexNativeHookRelayDisabledConfig,
   buildCodexNativeHookRelayConfig,
   buildCodexNativeHookRelayId,
   clearPendingCodexNativeHookRelayUnregistersForTests,
@@ -1645,9 +1644,7 @@ export async function runCodexAppServerAttempt(
             events: nativeHookRelayEvents,
             hookTimeoutSec: options.nativeHookRelay?.hookTimeoutSec,
           })
-        : options.nativeHookRelay?.enabled === false
-          ? buildCodexNativeHookRelayDisabledConfig()
-          : undefined,
+        : undefined,
       nativeHookRelayGeneration: nativeHookRelay?.generation,
     };
   };

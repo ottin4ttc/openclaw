@@ -8,6 +8,7 @@ import type {
   ContextEngineHostCapability,
 } from "openclaw/plugin-sdk/agent-harness-runtime";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+import { isCodexNativeHookRelayEnabled } from "./src/app-server/config.js";
 import type {
   CodexAppServerListModelsOptions,
   CodexAppServerModel,
@@ -74,18 +75,20 @@ export function createCodexAppServerAgentHarness(options: {
       // Keep app-server runtime code behind lazy imports so plugin discovery and
       // cold provider catalog reads do not pull in the whole Codex runtime.
       const { runCodexAppServerAttempt } = await import("./src/app-server/run-attempt.js");
+      const pluginConfig = options?.resolvePluginConfig?.() ?? options?.pluginConfig;
       return runCodexAppServerAttempt(params, {
         bindingStore: options.bindingStore,
-        pluginConfig: options?.resolvePluginConfig?.() ?? options?.pluginConfig,
-        nativeHookRelay: { enabled: true },
+        pluginConfig,
+        nativeHookRelay: { enabled: isCodexNativeHookRelayEnabled(pluginConfig) },
       });
     },
     runSideQuestion: async (params) => {
       const { runCodexAppServerSideQuestion } = await import("./src/app-server/side-question.js");
+      const pluginConfig = options?.resolvePluginConfig?.() ?? options?.pluginConfig;
       return runCodexAppServerSideQuestion(params, {
         bindingStore: options.bindingStore,
-        pluginConfig: options?.resolvePluginConfig?.() ?? options?.pluginConfig,
-        nativeHookRelay: { enabled: true },
+        pluginConfig,
+        nativeHookRelay: { enabled: isCodexNativeHookRelayEnabled(pluginConfig) },
       });
     },
     compact: async (params) => {

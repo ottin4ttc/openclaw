@@ -1237,7 +1237,7 @@ describe("runCodexAppServerSideQuestion", () => {
     expect(codexHookStateForEvent(hookState, "stop")).toEqual({ enabled: false });
   });
 
-  it("sends clearing native hook config when side-thread relay is disabled", async () => {
+  it("leaves Codex-owned hooks unchanged when the side-thread relay is disabled", async () => {
     const client = createFakeClient();
     getSharedCodexAppServerClientMock.mockResolvedValue(client);
 
@@ -1248,15 +1248,15 @@ describe("runCodexAppServerSideQuestion", () => {
     const forkParams = mockCall(client.request)[1] as Record<string, unknown> | undefined;
     const config = forkParams?.config as Record<string, unknown> | undefined;
     expect(config).toMatchObject({
-      "features.hooks": false,
       "features.code_mode": true,
       "features.code_mode_only": false,
       "features.apply_patch_streaming_events": true,
-      "hooks.PreToolUse": [],
-      "hooks.PostToolUse": [],
-      "hooks.PermissionRequest": [],
-      "hooks.Stop": [],
     });
+    expect(config).not.toHaveProperty("features.hooks");
+    expect(config).not.toHaveProperty("hooks.PreToolUse");
+    expect(config).not.toHaveProperty("hooks.PostToolUse");
+    expect(config).not.toHaveProperty("hooks.PermissionRequest");
+    expect(config).not.toHaveProperty("hooks.Stop");
     expect(config).not.toHaveProperty("hooks.state");
   });
 

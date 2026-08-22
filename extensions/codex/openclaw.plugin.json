@@ -250,6 +250,16 @@
           "defaultWorkspaceDir": {
             "type": "string"
           },
+          "nativeHookRelay": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "enabled": {
+                "type": "boolean",
+                "default": true
+              }
+            }
+          },
           "experimental": {
             "type": "object",
             "additionalProperties": false,
@@ -541,6 +551,16 @@
     "appServer.defaultWorkspaceDir": {
       "label": "Default Workspace",
       "help": "Workspace used by /codex bind when --cwd is omitted.",
+      "advanced": true
+    },
+    "appServer.nativeHookRelay": {
+      "label": "Native Hook Relay",
+      "help": "Relay Codex-native tool hooks into OpenClaw policy and lifecycle hooks.",
+      "advanced": true
+    },
+    "appServer.nativeHookRelay.enabled": {
+      "label": "Enable Native Hook Relay",
+      "help": "Disable only the OpenClaw compatibility relay for Codex-native tools. Codex-owned user and plugin hooks remain enabled.",
       "advanced": true
     },
     "appServer.experimental": {

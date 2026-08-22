@@ -56,7 +56,6 @@ import { handleCodexAppServerElicitationRequest } from "./elicitation-bridge.js"
 import { CodexNativeToolLifecycleProjector } from "./event-projector.js";
 import {
   buildCodexNativeHookRelayConfig,
-  buildCodexNativeHookRelayDisabledConfig,
   CODEX_NATIVE_HOOK_RELAY_EVENTS,
   emitCodexNativePreToolUseFailureDiagnostic,
   type CodexNativePreToolUseFailure,
@@ -502,9 +501,7 @@ export async function runCodexAppServerSideQuestion(
           hookTimeoutSec: options.nativeHookRelay?.hookTimeoutSec,
           clearOmittedEvents: true,
         })
-      : options.nativeHookRelay?.enabled === false
-        ? buildCodexNativeHookRelayDisabledConfig()
-        : undefined;
+      : undefined;
     const runtimeThreadConfig = buildCodexRuntimeThreadConfig(webSearchPlan.threadConfig, {
       nativeCodeModeEnabled: nativeToolSurfaceEnabled,
       nativeCodeModeOnlyEnabled: appServer.codeModeOnly,

@@ -347,17 +347,6 @@ export function buildCodexNativeHookRelayConfig(params: {
   return config;
 }
 
-/** Builds a Codex config overlay that disables native hooks and clears hook arrays. */
-export function buildCodexNativeHookRelayDisabledConfig(): JsonObject {
-  return {
-    "features.hooks": false,
-    "hooks.PreToolUse": [],
-    "hooks.PostToolUse": [],
-    "hooks.PermissionRequest": [],
-    "hooks.Stop": [],
-  };
-}
-
 function normalizeHookTimeoutSec(value: number | undefined): number {
   return typeof value === "number" && Number.isFinite(value) && value > 0
     ? Math.ceil(value)
