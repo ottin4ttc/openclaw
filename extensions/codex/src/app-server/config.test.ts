@@ -16,6 +16,7 @@ import {
   isCodexNativeHookRelayEnabled,
   readCodexPluginConfig,
   resolveCodexAppServerRuntimeOptions,
+  resolveCodexSharedClientIdleTimeoutMs,
   resolveCodexAppServerUserHomeDir,
   resolveCodexComputerUseConfig,
   resolveCodexModelBackedReviewerPolicyContext,
@@ -146,6 +147,7 @@ describe("Codex app-server config", () => {
           serviceTier: "flex",
           codeModeOnly: true,
           turnCompletionIdleTimeoutMs: 120_000,
+          sharedClientIdleTimeoutMs: 45_000,
           postToolRawAssistantCompletionIdleTimeoutMs: 180_000,
         },
       },
@@ -163,6 +165,7 @@ describe("Codex app-server config", () => {
       serviceTier: "flex",
       codeModeOnly: true,
       turnCompletionIdleTimeoutMs: 120_000,
+      sharedClientIdleTimeoutMs: 45_000,
       postToolRawAssistantCompletionIdleTimeoutMs: 180_000,
     });
     expectFields(runtime.start, "runtime start", {
@@ -284,6 +287,31 @@ describe("Codex app-server config", () => {
       turnCompletionIdleTimeoutMs: MAX_TIMER_TIMEOUT_MS,
       postToolRawAssistantCompletionIdleTimeoutMs: MAX_TIMER_TIMEOUT_MS,
     });
+  });
+
+  it("keeps shared-client idle cleanup disabled by default", () => {
+    expect(resolveCodexSharedClientIdleTimeoutMs()).toBe(0);
+    expect(resolveRuntimeForTest().sharedClientIdleTimeoutMs).toBe(0);
+    expect(
+      resolveRuntimeForTest({ pluginConfig: { appServer: { sharedClientIdleTimeoutMs: 0 } } })
+        .sharedClientIdleTimeoutMs,
+    ).toBe(0);
+  });
+
+  it("rejects invalid shared-client idle timeout values before runtime normalization", () => {
+    for (const value of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, "1000"]) {
+      expect(() =>
+        resolveCodexSharedClientIdleTimeoutMs({ appServer: { sharedClientIdleTimeoutMs: value } }),
+      ).toThrow("sharedClientIdleTimeoutMs must be a non-negative integer");
+    }
+  });
+
+  it("clamps oversized shared-client idle timeout values to the Node-safe timer range", () => {
+    expect(
+      resolveRuntimeForTest({
+        pluginConfig: { appServer: { sharedClientIdleTimeoutMs: Number.MAX_SAFE_INTEGER } },
+      }).sharedClientIdleTimeoutMs,
+    ).toBe(MAX_TIMER_TIMEOUT_MS);
   });
 
   it("falls back for non-positive app-server timer config", () => {

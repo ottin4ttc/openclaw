@@ -134,9 +134,9 @@ export function createCodexAppServerAgentHarness(options: {
       }
     },
     dispose: async () => {
-      const { clearSharedCodexAppServerClientAndWait } =
+      const { shutdownSharedCodexAppServerClients } =
         await import("./src/app-server/shared-client.js");
-      await clearSharedCodexAppServerClientAndWait();
+      await shutdownSharedCodexAppServerClients();
     },
   };
   return harness;

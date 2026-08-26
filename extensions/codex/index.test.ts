@@ -58,6 +58,7 @@ describe("codex plugin", () => {
     const registerMediaUnderstandingProvider = vi.fn();
     const registerMigrationProvider = vi.fn();
     const registerProvider = vi.fn();
+    const registerService = vi.fn();
     const registerTool = vi.fn();
     const registerToolMetadata = vi.fn();
     const registerWebSearchProvider = vi.fn();
@@ -77,6 +78,7 @@ describe("codex plugin", () => {
         registerMediaUnderstandingProvider,
         registerMigrationProvider,
         registerProvider,
+        registerService,
         registerTool,
         registerToolMetadata,
         registerWebSearchProvider,
@@ -96,6 +98,10 @@ describe("codex plugin", () => {
       | undefined;
 
     expect(providerRegistration.id).toBe("codex");
+    const lifecycleService = mockCallArg(registerService) as Record<string, unknown>;
+    expect(lifecycleService.id).toBe("codex-shared-client-lifecycle");
+    expect(typeof lifecycleService.start).toBe("function");
+    expect(typeof lifecycleService.stop).toBe("function");
     expect(providerRegistration.label).toBe("Codex");
     expect(agentHarnessRegistration.id).toBe("codex");
     expect(agentHarnessRegistration.label).toBe("Codex agent harness");
@@ -154,6 +160,42 @@ describe("codex plugin", () => {
     plugin.register(api);
     expect(registerProvider).toHaveBeenCalledTimes(1);
     expect((mockCallArg(registerProvider) as { id?: string } | undefined)?.id).toBe("codex");
+  });
+
+  it("installs the shared-client idle policy only when Gateway services start", async () => {
+    const registerService = vi.fn();
+    plugin.register(
+      createTestPluginApi({
+        id: "codex",
+        name: "Codex",
+        source: "test",
+        config: {},
+        pluginConfig: { appServer: { sharedClientIdleTimeoutMs: 90_000 } },
+        runtime: createCodexTestRuntime(),
+        registerAgentHarness: vi.fn(),
+        registerCommand: vi.fn(),
+        registerMediaUnderstandingProvider: vi.fn(),
+        registerMigrationProvider: vi.fn(),
+        registerProvider: vi.fn(),
+        registerService,
+        on: vi.fn(),
+      }),
+    );
+    const service = mockCallArg(registerService) as
+      | { start?: () => Promise<void>; stop?: () => Promise<void> }
+      | undefined;
+    if (!service?.start || !service.stop) {
+      throw new Error("missing shared-client lifecycle service");
+    }
+    const sharedClientModule = await import("./src/app-server/shared-client.js");
+    const configure = vi.spyOn(sharedClientModule, "configureSharedCodexAppServerIdleTimeout");
+    const shutdown = vi.spyOn(sharedClientModule, "shutdownSharedCodexAppServerClients");
+
+    expect(configure).not.toHaveBeenCalled();
+    await service.start();
+    expect(configure).toHaveBeenCalledWith(90_000);
+    await service.stop();
+    expect(shutdown).toHaveBeenCalledOnce();
   });
 
   it("claims the Codex routing providers by default", () => {

@@ -1,5 +1,5 @@
 // Codex tests cover shared client plugin behavior.
-import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { WebSocketServer, type RawData } from "ws";
 import { CodexAppServerClient, MIN_CODEX_APP_SERVER_VERSION } from "./client.js";
 import { createClientHarness } from "./test-support.js";
@@ -52,14 +52,18 @@ let listCodexAppServerModels: typeof import("./models.js").listCodexAppServerMod
 let clearSharedCodexAppServerClient: typeof import("./shared-client.js").clearSharedCodexAppServerClient;
 let clearSharedCodexAppServerClientIfCurrent: typeof import("./shared-client.js").clearSharedCodexAppServerClientIfCurrent;
 let clearSharedCodexAppServerClientIfCurrentAndWait: typeof import("./shared-client.js").clearSharedCodexAppServerClientIfCurrentAndWait;
+let configureSharedCodexAppServerIdleTimeout: typeof import("./shared-client.js").configureSharedCodexAppServerIdleTimeout;
 let createIsolatedCodexAppServerClient: typeof import("./shared-client.js").createIsolatedCodexAppServerClient;
 let detachSharedCodexAppServerClientIfCurrent: typeof import("./shared-client.js").detachSharedCodexAppServerClientIfCurrent;
 let getLeasedSharedCodexAppServerClient: typeof import("./shared-client.js").getLeasedSharedCodexAppServerClient;
 let getSharedCodexAppServerClient: typeof import("./shared-client.js").getSharedCodexAppServerClient;
 let retainSharedCodexAppServerClientIfCurrent: typeof import("./shared-client.js").retainSharedCodexAppServerClientIfCurrent;
+let retainSharedCodexAppServerClientActivityHoldIfCurrent: typeof import("./shared-client.js").retainSharedCodexAppServerClientActivityHoldIfCurrent;
 let releaseLeasedSharedCodexAppServerClient: typeof import("./shared-client.js").releaseLeasedSharedCodexAppServerClient;
 let retireSharedCodexAppServerClientIfCurrent: typeof import("./shared-client.js").retireSharedCodexAppServerClientIfCurrent;
 let resetSharedCodexAppServerClientForTests: typeof import("./shared-client.js").resetSharedCodexAppServerClientForTests;
+let shutdownSharedCodexAppServerClients: typeof import("./shared-client.js").shutdownSharedCodexAppServerClients;
+let fakeMonotonicNowMs = 0;
 
 async function sendInitializeResult(
   harness: ReturnType<typeof createClientHarness>,
@@ -74,6 +78,11 @@ async function sendEmptyModelList(harness: ReturnType<typeof createClientHarness
   await vi.waitFor(() => expect(harness.writes.length).toBeGreaterThanOrEqual(3));
   const modelList = JSON.parse(harness.writes[2] ?? "{}") as { id?: number };
   harness.send({ id: modelList.id, result: { data: [] } });
+}
+
+async function advanceIdleTimer(ms: number): Promise<void> {
+  fakeMonotonicNowMs += ms;
+  await vi.advanceTimersByTimeAsync(ms);
 }
 
 function firstMockArg(mock: unknown, label: string): unknown {
@@ -127,20 +136,28 @@ function clientStartCall(startSpy: unknown) {
 }
 
 describe("shared Codex app-server client", () => {
+  beforeEach(() => {
+    fakeMonotonicNowMs = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => fakeMonotonicNowMs);
+  });
+
   beforeAll(async () => {
     ({ listCodexAppServerModels } = await import("./models.js"));
     ({
       clearSharedCodexAppServerClient,
       clearSharedCodexAppServerClientIfCurrent,
       clearSharedCodexAppServerClientIfCurrentAndWait,
+      configureSharedCodexAppServerIdleTimeout,
       createIsolatedCodexAppServerClient,
       detachSharedCodexAppServerClientIfCurrent,
       getLeasedSharedCodexAppServerClient,
       getSharedCodexAppServerClient,
       retainSharedCodexAppServerClientIfCurrent,
+      retainSharedCodexAppServerClientActivityHoldIfCurrent,
       releaseLeasedSharedCodexAppServerClient,
       retireSharedCodexAppServerClientIfCurrent,
       resetSharedCodexAppServerClientForTests,
+      shutdownSharedCodexAppServerClients,
     } = await import("./shared-client.js"));
   });
 
@@ -801,6 +818,132 @@ describe("shared Codex app-server client", () => {
     expect(secondCloseAndWait).not.toHaveBeenCalled();
     expect(first.process.stdin.destroyed).toBe(true);
     expect(second.process.stdin.destroyed).toBe(false);
+  });
+
+  it("reclaims an idle shared client after the configured timeout", async () => {
+    vi.useFakeTimers();
+    const first = createClientHarness();
+    const second = createClientHarness();
+    vi.spyOn(CodexAppServerClient, "start")
+      .mockReturnValueOnce(first.client)
+      .mockReturnValueOnce(second.client);
+    const firstCloseAndWait = vi.spyOn(first.client, "closeAndWait").mockResolvedValue(true);
+    configureSharedCodexAppServerIdleTimeout(1_000);
+
+    const firstList = listCodexAppServerModels({ timeoutMs: 1_000 });
+    await sendInitializeResult(first, "openclaw/0.143.0 (macOS; test)");
+    await sendEmptyModelList(first);
+    await expect(firstList).resolves.toEqual({ models: [] });
+    await advanceIdleTimer(2_000);
+    expect(firstCloseAndWait).toHaveBeenCalledWith({ exitTimeoutMs: 2_000, forceKillDelayMs: 250 });
+
+    const secondList = listCodexAppServerModels({ timeoutMs: 1_000 });
+    await sendInitializeResult(second, "openclaw/0.143.0 (macOS; test)");
+    await sendEmptyModelList(second);
+    await expect(secondList).resolves.toEqual({ models: [] });
+  });
+
+  it("does not reclaim an active lease or a native-child activity hold", async () => {
+    vi.useFakeTimers();
+    const harness = createClientHarness();
+    vi.spyOn(CodexAppServerClient, "start").mockReturnValue(harness.client);
+    const closeAndWait = vi.spyOn(harness.client, "closeAndWait").mockResolvedValue(true);
+    configureSharedCodexAppServerIdleTimeout(1_000);
+
+    const leasePromise = getLeasedSharedCodexAppServerClient({ timeoutMs: 1_000 });
+    await sendInitializeResult(harness, "openclaw/0.143.0 (macOS; test)");
+    await expect(leasePromise).resolves.toBe(harness.client);
+    const holdRelease = retainSharedCodexAppServerClientActivityHoldIfCurrent(harness.client);
+    expect(holdRelease).toBeTypeOf("function");
+
+    await advanceIdleTimer(2_000);
+    expect(closeAndWait).not.toHaveBeenCalled();
+    expect(releaseLeasedSharedCodexAppServerClient(harness.client)).toBe(true);
+    await advanceIdleTimer(2_000);
+    expect(closeAndWait).not.toHaveBeenCalled();
+
+    holdRelease?.();
+    await advanceIdleTimer(2_000);
+    expect(closeAndWait).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not reclaim a client while its first acquisition is pending", async () => {
+    vi.useFakeTimers();
+    const harness = createClientHarness();
+    vi.spyOn(CodexAppServerClient, "start").mockReturnValue(harness.client);
+    const closeAndWait = vi.spyOn(harness.client, "closeAndWait").mockResolvedValue(true);
+    configureSharedCodexAppServerIdleTimeout(1_000);
+
+    const leasePromise = getLeasedSharedCodexAppServerClient({ timeoutMs: 5_000 });
+    await vi.waitFor(() => expect(harness.writes.length).toBeGreaterThanOrEqual(1));
+    await advanceIdleTimer(2_000);
+    expect(closeAndWait).not.toHaveBeenCalled();
+
+    await sendInitializeResult(harness, "openclaw/0.143.0 (macOS; test)");
+    await expect(leasePromise).resolves.toBe(harness.client);
+    expect(releaseLeasedSharedCodexAppServerClient(harness.client)).toBe(true);
+    await advanceIdleTimer(2_000);
+    expect(closeAndWait).toHaveBeenCalledOnce();
+  });
+
+  it("resets the idle window when a client is acquired again", async () => {
+    vi.useFakeTimers();
+    const harness = createClientHarness();
+    vi.spyOn(CodexAppServerClient, "start").mockReturnValue(harness.client);
+    const closeAndWait = vi.spyOn(harness.client, "closeAndWait").mockResolvedValue(true);
+    configureSharedCodexAppServerIdleTimeout(1_000);
+
+    const firstLease = getLeasedSharedCodexAppServerClient({ timeoutMs: 1_000 });
+    await sendInitializeResult(harness, "openclaw/0.143.0 (macOS; test)");
+    await expect(firstLease).resolves.toBe(harness.client);
+    expect(releaseLeasedSharedCodexAppServerClient(harness.client)).toBe(true);
+
+    await advanceIdleTimer(500);
+    await expect(getLeasedSharedCodexAppServerClient({ timeoutMs: 1_000 })).resolves.toBe(
+      harness.client,
+    );
+    expect(releaseLeasedSharedCodexAppServerClient(harness.client)).toBe(true);
+    await advanceIdleTimer(500);
+    expect(closeAndWait).not.toHaveBeenCalled();
+    await advanceIdleTimer(1_000);
+    expect(closeAndWait).toHaveBeenCalledOnce();
+  });
+
+  it("isolates rejected idle close promises and keeps the reaper alive", async () => {
+    vi.useFakeTimers();
+    const first = createClientHarness();
+    const second = createClientHarness();
+    vi.spyOn(CodexAppServerClient, "start")
+      .mockReturnValueOnce(first.client)
+      .mockReturnValueOnce(second.client);
+    vi.spyOn(first.client, "closeAndWait").mockRejectedValue(new Error("close failed"));
+    configureSharedCodexAppServerIdleTimeout(1_000);
+
+    const firstList = listCodexAppServerModels({ timeoutMs: 1_000 });
+    await sendInitializeResult(first, "openclaw/0.143.0 (macOS; test)");
+    await sendEmptyModelList(first);
+    await expect(firstList).resolves.toEqual({ models: [] });
+    await advanceIdleTimer(2_000);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(mocks.embeddedAgentLog.warn).toHaveBeenCalledWith(
+      "codex shared app-server idle close failed",
+      expect.objectContaining({ error: expect.any(Error) }),
+    );
+    const secondList = listCodexAppServerModels({ timeoutMs: 1_000 });
+    await sendInitializeResult(second, "openclaw/0.143.0 (macOS; test)");
+    await sendEmptyModelList(second);
+    await expect(secondList).resolves.toEqual({ models: [] });
+  });
+
+  it("stops the idle reaper during shared-client shutdown", async () => {
+    vi.useFakeTimers();
+    configureSharedCodexAppServerIdleTimeout(1_000);
+    const shutdown = shutdownSharedCodexAppServerClients();
+    await vi.runAllTimersAsync();
+    await shutdown;
+    configureSharedCodexAppServerIdleTimeout(0);
   });
 
   it("uses a fresh websocket Authorization header after shared-client token rotation", async () => {

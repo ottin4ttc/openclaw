@@ -11,7 +11,10 @@ import {
   resolveExecApprovalsFromFile,
   type ExecApprovalsFile,
 } from "openclaw/plugin-sdk/exec-approvals-runtime";
-import { resolvePositiveTimerTimeoutMs } from "openclaw/plugin-sdk/number-runtime";
+import {
+  MAX_TIMER_TIMEOUT_MS,
+  resolvePositiveTimerTimeoutMs,
+} from "openclaw/plugin-sdk/number-runtime";
 import { normalizeAgentId } from "openclaw/plugin-sdk/routing";
 import {
   buildSecretInputSchema,
@@ -188,6 +191,7 @@ export type CodexAppServerRuntimeOptions = {
   codeModeOnly: boolean;
   requestTimeoutMs: number;
   turnCompletionIdleTimeoutMs: number;
+  sharedClientIdleTimeoutMs?: number;
   postToolRawAssistantCompletionIdleTimeoutMs?: number;
   approvalPolicy: CodexAppServerEffectiveApprovalPolicy;
   approvalPolicySource?: CodexAppServerApprovalPolicySource;
@@ -230,6 +234,7 @@ export type CodexPluginConfig = {
     codeModeOnly?: boolean;
     requestTimeoutMs?: number;
     turnCompletionIdleTimeoutMs?: number;
+    sharedClientIdleTimeoutMs?: number;
     postToolRawAssistantCompletionIdleTimeoutMs?: number;
     approvalPolicy?: CodexAppServerApprovalPolicy;
     sandbox?: CodexAppServerSandboxMode;
@@ -266,6 +271,7 @@ export const CODEX_APP_SERVER_CONFIG_KEYS = [
   "codeModeOnly",
   "requestTimeoutMs",
   "turnCompletionIdleTimeoutMs",
+  "sharedClientIdleTimeoutMs",
   "postToolRawAssistantCompletionIdleTimeoutMs",
   "approvalPolicy",
   "sandbox",
@@ -425,6 +431,7 @@ const codexPluginConfigSchema = z
         codeModeOnly: z.boolean().optional(),
         requestTimeoutMs: z.number().positive().optional(),
         turnCompletionIdleTimeoutMs: z.number().positive().optional(),
+        sharedClientIdleTimeoutMs: z.number().int().nonnegative().optional(),
         postToolRawAssistantCompletionIdleTimeoutMs: z.number().positive().optional(),
         approvalPolicy: codexAppServerApprovalPolicySchema.optional(),
         sandbox: codexAppServerSandboxSchema.optional(),
@@ -451,6 +458,26 @@ export function readCodexPluginConfig(value: unknown): CodexPluginConfig {
     return config;
   }
   return { ...config, ...(plugins.data ? { codexPlugins: plugins.data } : {}) };
+}
+
+/** Resolves the process-wide shared-client idle policy without fail-open parsing. */
+export function resolveCodexSharedClientIdleTimeoutMs(pluginConfig?: unknown): number {
+  const appServer = readRecord(readRecord(pluginConfig)?.appServer);
+  const value = appServer?.sharedClientIdleTimeoutMs;
+  if (value === undefined) {
+    return 0;
+  }
+  if (
+    typeof value !== "number" ||
+    !Number.isFinite(value) ||
+    !Number.isInteger(value) ||
+    value < 0
+  ) {
+    throw new Error(
+      "plugins.entries.codex.config.appServer.sharedClientIdleTimeoutMs must be a non-negative integer",
+    );
+  }
+  return Math.min(value, MAX_TIMER_TIMEOUT_MS);
 }
 
 export function isCodexSandboxExecServerEnabled(pluginConfig?: unknown): boolean {
@@ -718,6 +745,7 @@ export function resolveCodexAppServerRuntimeOptions(
       config.turnCompletionIdleTimeoutMs,
       60_000,
     ),
+    sharedClientIdleTimeoutMs: resolveCodexSharedClientIdleTimeoutMs(params.pluginConfig),
     ...(config.postToolRawAssistantCompletionIdleTimeoutMs !== undefined
       ? {
           postToolRawAssistantCompletionIdleTimeoutMs: normalizePositiveNumber(

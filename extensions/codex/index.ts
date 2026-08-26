@@ -45,6 +45,27 @@ export default definePluginEntry({
   name: "Codex",
   description: "Codex app-server harness and Codex-managed GPT model catalog.",
   register(api) {
+    const startupPluginConfig = api.pluginConfig;
+    api.registerService({
+      id: "codex-shared-client-lifecycle",
+      start: async () => {
+        const [
+          { resolveCodexSharedClientIdleTimeoutMs },
+          { configureSharedCodexAppServerIdleTimeout },
+        ] = await Promise.all([
+          import("./src/app-server/config.js"),
+          import("./src/app-server/shared-client.js"),
+        ]);
+        configureSharedCodexAppServerIdleTimeout(
+          resolveCodexSharedClientIdleTimeoutMs(startupPluginConfig),
+        );
+      },
+      stop: async () => {
+        const { shutdownSharedCodexAppServerClients } =
+          await import("./src/app-server/shared-client.js");
+        await shutdownSharedCodexAppServerClients();
+      },
+    });
     const resolveCurrentConfig = () =>
       api.runtime.config?.current ? (api.runtime.config.current() as OpenClawConfig) : undefined;
     const resolveCurrentPluginConfig = () =>

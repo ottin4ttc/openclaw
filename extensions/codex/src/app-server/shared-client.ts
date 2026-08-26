@@ -2,7 +2,10 @@
  * Owns shared and isolated Codex app-server client startup, auth application,
  * lease tracking, and teardown.
  */
+import { createHash } from "node:crypto";
+import { embeddedAgentLog } from "openclaw/plugin-sdk/agent-harness-runtime";
 import { resolveDefaultAgentDir, type AuthProfileStore } from "openclaw/plugin-sdk/agent-runtime";
+import { MAX_TIMER_TIMEOUT_MS } from "openclaw/plugin-sdk/number-runtime";
 import {
   applyCodexAppServerAuthProfile,
   bridgeCodexAppServerStartOptions,
@@ -25,13 +28,23 @@ type SharedCodexAppServerClientEntry = {
   promise?: Promise<CodexAppServerClient>;
   activeLeases: number;
   pendingAcquires: number;
+  nativeChildActivityHolds: number;
+  lastIdleAt?: number;
   closeWhenIdle: boolean;
+  closePromise?: Promise<void>;
 };
 
 type SharedCodexAppServerClientState = {
   clients: Map<string, SharedCodexAppServerClientEntry>;
   leasedReleases: WeakMap<CodexAppServerClient, Array<() => void>>;
+  idleTimeoutMs: number;
+  idlePolicyConfigured: boolean;
+  reaperTimer?: ReturnType<typeof setInterval>;
+  closingPromises: Set<Promise<void>>;
 };
+
+const SHARED_CLIENT_IDLE_SWEEP_INTERVAL_MS = 1_000;
+const SHARED_CLIENT_CLOSE_OPTIONS = { exitTimeoutMs: 2_000, forceKillDelayMs: 250 } as const;
 
 // Symbol.for shares one client table across duplicate module copies (dist +
 // src bundles in one process). Plugin updates restart the gateway, so every
@@ -45,6 +58,9 @@ function getSharedCodexAppServerClientState(): SharedCodexAppServerClientState {
   globalState[SHARED_CODEX_APP_SERVER_CLIENT_STATE] ??= {
     clients: new Map(),
     leasedReleases: new WeakMap(),
+    idleTimeoutMs: 0,
+    idlePolicyConfigured: false,
+    closingPromises: new Set(),
   };
   return globalState[SHARED_CODEX_APP_SERVER_CLIENT_STATE];
 }
@@ -63,6 +79,43 @@ export type CodexAppServerClientOptions = {
 export type CodexAppServerClientFactory = (
   options?: CodexAppServerClientOptions,
 ) => Promise<CodexAppServerClient>;
+
+/** Installs the process-wide idle policy once during full Codex plugin startup. */
+export function configureSharedCodexAppServerIdleTimeout(timeoutMs: number): void {
+  if (!Number.isFinite(timeoutMs) || !Number.isInteger(timeoutMs) || timeoutMs < 0) {
+    throw new Error("shared Codex app-server idle timeout must be a non-negative integer");
+  }
+  const state = getSharedCodexAppServerClientState();
+  const normalizedTimeoutMs = Math.min(timeoutMs, MAX_TIMER_TIMEOUT_MS);
+  if (state.idlePolicyConfigured) {
+    if (state.idleTimeoutMs !== normalizedTimeoutMs) {
+      throw new Error("shared Codex app-server idle timeout requires a Gateway restart");
+    }
+    return;
+  }
+  state.idlePolicyConfigured = true;
+  state.idleTimeoutMs = normalizedTimeoutMs;
+  const now = monotonicNowMs();
+  for (const entry of state.clients.values()) {
+    markSharedClientIdleIfEligible(entry, now);
+  }
+  if (normalizedTimeoutMs > 0) {
+    state.reaperTimer = setInterval(() => {
+      sweepIdleSharedCodexAppServerClients();
+    }, SHARED_CLIENT_IDLE_SWEEP_INTERVAL_MS);
+    unrefTimer(state.reaperTimer);
+  }
+}
+
+/** Stops the idle policy and closes all shared clients during Gateway teardown. */
+export async function shutdownSharedCodexAppServerClients(): Promise<void> {
+  const state = getSharedCodexAppServerClientState();
+  stopSharedClientReaper(state);
+  state.idlePolicyConfigured = false;
+  state.idleTimeoutMs = 0;
+  await clearSharedCodexAppServerClientAndWait();
+  await Promise.all([...state.closingPromises]);
+}
 
 type IsolatedCodexAppServerClientOptions = CodexAppServerClientOptions & {
   authProfileStore?: AuthProfileStore;
@@ -339,6 +392,9 @@ function shouldTryManagedFallbackStartOption(
 /** Clears and closes all shared clients for deterministic tests. */
 export function resetSharedCodexAppServerClientForTests(): void {
   const state = getSharedCodexAppServerClientState();
+  stopSharedClientReaper(state);
+  state.idlePolicyConfigured = false;
+  state.idleTimeoutMs = 0;
   const clients = collectSharedClients(state);
   state.clients.clear();
   state.leasedReleases = new WeakMap();
@@ -408,6 +464,22 @@ export function retainSharedCodexAppServerClientIfCurrent(
   return undefined;
 }
 
+/** Retains a shared client while a native child can still use its app-server. */
+export function retainSharedCodexAppServerClientActivityHoldIfCurrent(
+  client: CodexAppServerClient | undefined,
+): (() => void) | undefined {
+  if (!client) {
+    return undefined;
+  }
+  const state = getSharedCodexAppServerClientState();
+  for (const entry of state.clients.values()) {
+    if (entry.client === client) {
+      return retainSharedClientActivityHold(entry);
+    }
+  }
+  return undefined;
+}
+
 /** Marks a matching shared client to close after active leases/acquires drain. */
 export function retireSharedCodexAppServerClientIfCurrent(
   client: CodexAppServerClient | undefined,
@@ -470,7 +542,12 @@ function getOrCreateSharedClientEntry(
 ): SharedCodexAppServerClientEntry {
   let entry = state.clients.get(key);
   if (!entry) {
-    entry = { activeLeases: 0, pendingAcquires: 0, closeWhenIdle: false };
+    entry = {
+      activeLeases: 0,
+      pendingAcquires: 0,
+      nativeChildActivityHolds: 0,
+      closeWhenIdle: false,
+    };
     state.clients.set(key, entry);
   }
   return entry;
@@ -517,12 +594,14 @@ export function clearSharedCodexAppServerClientIfCurrentAndUnclaimed(
 function retainPendingSharedClientAcquire(entry: SharedCodexAppServerClientEntry): () => void {
   let released = false;
   entry.pendingAcquires += 1;
+  entry.lastIdleAt = undefined;
   return () => {
     if (released) {
       return;
     }
     released = true;
     entry.pendingAcquires = Math.max(0, entry.pendingAcquires - 1);
+    markSharedClientIdleIfEligible(entry);
     closeRetiredSharedClientEntryIfIdle(entry);
   };
 }
@@ -530,12 +609,29 @@ function retainPendingSharedClientAcquire(entry: SharedCodexAppServerClientEntry
 function retainSharedClientEntry(entry: SharedCodexAppServerClientEntry): () => void {
   let released = false;
   entry.activeLeases += 1;
+  entry.lastIdleAt = undefined;
   return () => {
     if (released) {
       return;
     }
     released = true;
     entry.activeLeases = Math.max(0, entry.activeLeases - 1);
+    markSharedClientIdleIfEligible(entry);
+    closeRetiredSharedClientEntryIfIdle(entry);
+  };
+}
+
+function retainSharedClientActivityHold(entry: SharedCodexAppServerClientEntry): () => void {
+  let released = false;
+  entry.nativeChildActivityHolds += 1;
+  entry.lastIdleAt = undefined;
+  return () => {
+    if (released) {
+      return;
+    }
+    released = true;
+    entry.nativeChildActivityHolds = Math.max(0, entry.nativeChildActivityHolds - 1);
+    markSharedClientIdleIfEligible(entry);
     closeRetiredSharedClientEntryIfIdle(entry);
   };
 }
@@ -545,6 +641,7 @@ function closeRetiredSharedClientEntryIfIdle(entry: SharedCodexAppServerClientEn
     !entry.closeWhenIdle ||
     entry.activeLeases > 0 ||
     entry.pendingAcquires > 0 ||
+    entry.nativeChildActivityHolds > 0 ||
     !entry.client
   ) {
     return false;
@@ -560,7 +657,7 @@ function closeSharedClientEntryIfUnclaimed(
   key: string,
   entry: SharedCodexAppServerClientEntry,
 ): boolean {
-  if (entry.activeLeases > 0 || entry.pendingAcquires > 0) {
+  if (entry.activeLeases > 0 || entry.pendingAcquires > 0 || entry.nativeChildActivityHolds > 0) {
     return false;
   }
   const state = getSharedCodexAppServerClientState();
@@ -580,4 +677,102 @@ function collectSharedClients(state: SharedCodexAppServerClientState): CodexAppS
         .filter((client): client is CodexAppServerClient => Boolean(client)),
     ),
   ];
+}
+
+function markSharedClientIdleIfEligible(
+  entry: SharedCodexAppServerClientEntry,
+  nowMs = monotonicNowMs(),
+): void {
+  if (
+    entry.client &&
+    entry.activeLeases === 0 &&
+    entry.pendingAcquires === 0 &&
+    entry.nativeChildActivityHolds === 0
+  ) {
+    entry.lastIdleAt ??= nowMs;
+  }
+}
+
+function sweepIdleSharedCodexAppServerClients(): void {
+  const state = getSharedCodexAppServerClientState();
+  const timeoutMs = state.idleTimeoutMs;
+  if (!state.idlePolicyConfigured || timeoutMs <= 0) {
+    return;
+  }
+  const nowMs = monotonicNowMs();
+  for (const [key, entry] of state.clients) {
+    if (
+      !entry.client ||
+      entry.activeLeases > 0 ||
+      entry.pendingAcquires > 0 ||
+      entry.nativeChildActivityHolds > 0 ||
+      entry.closeWhenIdle ||
+      entry.closePromise
+    ) {
+      continue;
+    }
+    markSharedClientIdleIfEligible(entry, nowMs);
+    if (entry.lastIdleAt === undefined || nowMs - entry.lastIdleAt < timeoutMs) {
+      continue;
+    }
+    if (state.clients.get(key) !== entry) {
+      continue;
+    }
+    state.clients.delete(key);
+    const client = entry.client;
+    entry.closeWhenIdle = true;
+    embeddedAgentLog.debug("codex shared app-server client idle retirement", {
+      cacheKey: sharedClientCacheIdentity(key),
+      idleTimeoutMs: timeoutMs,
+    });
+    closeSharedClientEntryAndWait(state, entry, client, key);
+  }
+}
+
+function closeSharedClientEntryAndWait(
+  state: SharedCodexAppServerClientState,
+  entry: SharedCodexAppServerClientEntry,
+  client: CodexAppServerClient,
+  key: string,
+): void {
+  if (entry.closePromise) {
+    return;
+  }
+  entry.closeWhenIdle = false;
+  const closePromise = Promise.resolve()
+    .then(() => client.closeAndWait(SHARED_CLIENT_CLOSE_OPTIONS))
+    .then(() => undefined)
+    .catch((error: unknown) => {
+      embeddedAgentLog.warn("codex shared app-server idle close failed", {
+        cacheKey: sharedClientCacheIdentity(key),
+        error,
+      });
+    })
+    .finally(() => {
+      entry.closePromise = undefined;
+      entry.client = undefined;
+      state.closingPromises.delete(closePromise);
+    });
+  entry.closePromise = closePromise;
+  state.closingPromises.add(closePromise);
+}
+
+function sharedClientCacheIdentity(key: string): string {
+  return createHash("sha256").update(key).digest("hex").slice(0, 16);
+}
+
+function monotonicNowMs(): number {
+  return performance.now();
+}
+
+function stopSharedClientReaper(state: SharedCodexAppServerClientState): void {
+  if (state.reaperTimer) {
+    clearInterval(state.reaperTimer);
+    state.reaperTimer = undefined;
+  }
+}
+
+function unrefTimer(timer: ReturnType<typeof setInterval>): void {
+  const candidate = timer as ReturnType<typeof setInterval> & { unref?: () => void };
+  candidate.unref?.();
 }

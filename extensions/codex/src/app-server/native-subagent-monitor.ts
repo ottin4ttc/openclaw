@@ -40,6 +40,7 @@ import {
   type RolloutTraceContentCapture,
   type RolloutTraceModelBaseFields,
 } from "./rollout-trace-diagnostics.js";
+import { retainSharedCodexAppServerClientActivityHoldIfCurrent } from "./shared-client.js";
 
 type TrustedDiagnosticEventInput = Parameters<typeof emitTrustedDiagnosticEvent>[0];
 
@@ -119,6 +120,7 @@ type ChildState = {
   completionObservedInParentMailbox: boolean;
   diagnostics?: ParentTurnDiagnostics;
   diagnosticTurns: Map<string, ChildTurnDiagnostics>;
+  activityHold?: () => void;
 };
 
 type ChildAssistantMessages = {
@@ -211,7 +213,10 @@ export class CodexNativeSubagentMonitor {
   private taskRowReconcileTimer?: ReturnType<typeof setInterval>;
 
   constructor(
-    client: Pick<CodexAppServerClient, "addNotificationHandler" | "addCloseHandler">,
+    private readonly client: Pick<
+      CodexAppServerClient,
+      "addNotificationHandler" | "addCloseHandler"
+    >,
     private readonly runtime: NativeSubagentMonitorRuntime = defaultRuntime,
     options: MonitorOptions = {},
   ) {
@@ -229,6 +234,9 @@ export class CodexNativeSubagentMonitor {
 
   dispose(): void {
     this.clearTimers();
+    for (const childState of this.childStates.values()) {
+      this.releaseChildActivityHold(childState);
+    }
     this.parentStates.clear();
     this.childThreadParents.clear();
     this.childStates.clear();
@@ -497,6 +505,14 @@ export class CodexNativeSubagentMonitor {
     const rawChildThreadId = params.childThreadId.trim();
     const childThreadId = boundedDiagnosticId(rawChildThreadId);
     const childState = this.childStates.get(rawChildThreadId);
+    const activatesChild =
+      params.lifecycle === "started" ||
+      params.lifecycle === "activity" ||
+      params.lifecycle === "turn_started";
+    const terminalLifecycle = params.lifecycle === "turn_completed" || params.lifecycle === "ended";
+    if (terminalLifecycle) {
+      this.releaseChildActivityHold(childState);
+    }
     const turnDiagnostics = params.childTurnId
       ? [...(childState?.diagnosticTurns.values() ?? [])].find(
           (turn) => turn.childTurnId === params.childTurnId,
@@ -556,16 +572,19 @@ export class CodexNativeSubagentMonitor {
       return;
     }
     const alreadyActive = diagnostics.activeChildThreadIds.has(childThreadId);
-    const activatesChild =
-      params.lifecycle === "started" ||
-      params.lifecycle === "activity" ||
-      params.lifecycle === "turn_started";
     if (!alreadyActive && activatesChild) {
       if (diagnostics.activeChildThreadIds.size >= MAX_NATIVE_CHILDREN_PER_TURN) {
         diagnostics.dropped += 1;
         diagnostics.partialReasons.add("active_child_limit");
         return;
       }
+    }
+    if (activatesChild && childState && !childState.activityHold) {
+      childState.activityHold = retainSharedCodexAppServerClientActivityHoldIfCurrent(
+        this.clientForActivityHold(),
+      );
+    }
+    if (!alreadyActive && activatesChild) {
       diagnostics.activeChildThreadIds.add(childThreadId);
       diagnostics.observedChildThreadIds.add(childThreadId);
     }
@@ -575,7 +594,6 @@ export class CodexNativeSubagentMonitor {
     if (params.lifecycle === "started") {
       diagnostics.startFactChildThreadIds.add(childThreadId);
     }
-    const terminalLifecycle = params.lifecycle === "turn_completed" || params.lifecycle === "ended";
     if (terminalLifecycle) {
       if (alreadyActive) {
         diagnostics.activeChildThreadIds.delete(childThreadId);
@@ -1525,6 +1543,9 @@ export class CodexNativeSubagentMonitor {
         diagnosticTurns: new Map<string, ChildTurnDiagnostics>(),
       };
       this.childStates.set(normalizedChildThreadId, childState);
+    } else if (childState.parentThreadId !== normalizedParentThreadId) {
+      this.releaseChildActivityHold(childState);
+      childState.parentThreadId = normalizedParentThreadId;
     }
     if (agentPath) {
       childState.agentPath = agentPath;
@@ -1538,6 +1559,19 @@ export class CodexNativeSubagentMonitor {
     if (options.scheduleTranscriptPoll !== false) {
       this.scheduleTranscriptPoll(childState);
     }
+  }
+
+  private releaseChildActivityHold(childState: ChildState | undefined): void {
+    const release = childState?.activityHold;
+    if (!release) {
+      return;
+    }
+    childState.activityHold = undefined;
+    release();
+  }
+
+  private clientForActivityHold(): CodexAppServerClient {
+    return this.client as CodexAppServerClient;
   }
 
   private ensureChildState(parentThreadId: string, childThreadId: string): ChildState {

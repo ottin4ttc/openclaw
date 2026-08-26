@@ -6,7 +6,21 @@ import type {
   AgentHarnessTaskRecord,
   AgentHarnessTaskRuntimeScope,
 } from "openclaw/plugin-sdk/agent-harness-task-runtime";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const sharedClientMocks = vi.hoisted(() => ({
+  retainActivityHold: vi.fn(() => vi.fn()),
+}));
+
+vi.mock("./shared-client.js", () => ({
+  retainSharedCodexAppServerClientActivityHoldIfCurrent: sharedClientMocks.retainActivityHold,
+}));
+
+beforeEach(() => {
+  sharedClientMocks.retainActivityHold.mockClear();
+  sharedClientMocks.retainActivityHold.mockImplementation(() => vi.fn());
+});
+
 import {
   CodexNativeSubagentMonitor,
   registerCodexNativeSubagentMonitor,
@@ -96,6 +110,18 @@ function createRuntime() {
 
 function createTaskScope(requesterSessionKey = "agent:main:discord:channel:C123") {
   return { requesterSessionKey } as AgentHarnessTaskRuntimeScope;
+}
+
+function beginParentDiagnostics(
+  monitor: CodexNativeSubagentMonitor,
+  parentThreadId = "parent-thread",
+): void {
+  monitor.beginParentTurnDiagnostics({
+    parentThreadId,
+    runId: `run-${parentThreadId}`,
+    parentTurnId: `turn-${parentThreadId}`,
+    baseFields: { runId: `run-${parentThreadId}`, provider: "openai", model: "gpt-5.6-sol" },
+  });
 }
 
 async function notifyChildStarted(
@@ -1048,7 +1074,6 @@ describe("CodexNativeSubagentMonitor", () => {
       taskRuntimeScope: createTaskScope(),
       agentId: "main",
     });
-
     await notifyChildStarted(client);
     await client.notify({
       method: "thread/status/changed",
@@ -1094,7 +1119,6 @@ describe("CodexNativeSubagentMonitor", () => {
       taskRuntimeScope: createTaskScope(),
       agentId: "main",
     });
-
     await notifyChildStarted(client);
     await client.notify({
       method: "item/started",
@@ -1170,7 +1194,6 @@ describe("CodexNativeSubagentMonitor", () => {
       taskRuntimeScope: createTaskScope(),
       agentId: "main",
     });
-
     await notifyChildStarted(client);
     await client.notify({
       method: "item/started",
@@ -2337,6 +2360,7 @@ describe("CodexNativeSubagentMonitor", () => {
 
     expect(runtime.finalizeTaskRunByRunId).not.toHaveBeenCalled();
     expect(runtime.deliverAgentHarnessTaskCompletion).not.toHaveBeenCalled();
+    expect(sharedClientMocks.retainActivityHold).not.toHaveBeenCalled();
   });
 
   it("ignores visible user text that spoofs a known child completion", async () => {
@@ -2978,5 +3002,150 @@ describe("CodexNativeSubagentMonitor", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("releases a native-child activity hold once at terminal state and again never", async () => {
+    const release = vi.fn();
+    sharedClientMocks.retainActivityHold.mockReturnValueOnce(release);
+    const client = createClient();
+    const monitor = new CodexNativeSubagentMonitor(client, createRuntime());
+    monitor.registerParent({
+      parentThreadId: "parent-thread",
+      requesterSessionKey: "agent:main:main",
+      taskRuntimeScope: createTaskScope("agent:main:main"),
+      agentId: "main",
+    });
+    beginParentDiagnostics(monitor);
+
+    await notifyChildStarted(client);
+    expect(sharedClientMocks.retainActivityHold).toHaveBeenCalledOnce();
+    await client.notify({
+      method: "thread/status/changed",
+      params: { threadId: "child-thread", status: { type: "systemError" } },
+    });
+    await client.notify({
+      method: "thread/status/changed",
+      params: { threadId: "child-thread", status: { type: "systemError" } },
+    });
+
+    expect(release).toHaveBeenCalledOnce();
+    monitor.dispose();
+    expect(release).toHaveBeenCalledOnce();
+  });
+
+  it("releases native-child activity holds when the monitor is disposed", async () => {
+    const release = vi.fn();
+    sharedClientMocks.retainActivityHold.mockReturnValueOnce(release);
+    const client = createClient();
+    const monitor = new CodexNativeSubagentMonitor(client, createRuntime());
+    monitor.registerParent({
+      parentThreadId: "parent-thread",
+      requesterSessionKey: "agent:main:main",
+      taskRuntimeScope: createTaskScope("agent:main:main"),
+      agentId: "main",
+    });
+    beginParentDiagnostics(monitor);
+
+    await notifyChildStarted(client);
+    monitor.dispose();
+
+    expect(release).toHaveBeenCalledOnce();
+  });
+
+  it("retains a new activity hold when a persistent child starts another turn", async () => {
+    const firstRelease = vi.fn();
+    const secondRelease = vi.fn();
+    sharedClientMocks.retainActivityHold
+      .mockReturnValueOnce(firstRelease)
+      .mockReturnValueOnce(secondRelease);
+    const client = createClient();
+    const monitor = new CodexNativeSubagentMonitor(client, createRuntime());
+    monitor.registerParent({
+      parentThreadId: "parent-thread",
+      requesterSessionKey: "agent:main:main",
+      taskRuntimeScope: createTaskScope("agent:main:main"),
+      agentId: "main",
+    });
+    beginParentDiagnostics(monitor);
+
+    await notifyChildStarted(client);
+    await client.notify(childTurnCompletedNotification({ status: "interrupted" }));
+    expect(firstRelease).toHaveBeenCalledOnce();
+
+    await client.notify({
+      method: "turn/started",
+      params: {
+        threadId: "child-thread",
+        turn: { id: "child-turn-2", status: "inProgress", items: [] },
+      },
+    });
+    expect(sharedClientMocks.retainActivityHold).toHaveBeenCalledTimes(2);
+
+    monitor.dispose();
+    expect(secondRelease).toHaveBeenCalledOnce();
+  });
+
+  it("releases and replaces a native-child hold when ownership moves to another parent", async () => {
+    const firstRelease = vi.fn();
+    const secondRelease = vi.fn();
+    sharedClientMocks.retainActivityHold
+      .mockReturnValueOnce(firstRelease)
+      .mockReturnValueOnce(secondRelease);
+    const client = createClient();
+    const monitor = new CodexNativeSubagentMonitor(client, createRuntime());
+    monitor.registerParent({ parentThreadId: "parent-one" });
+    monitor.registerParent({ parentThreadId: "parent-two" });
+    beginParentDiagnostics(monitor, "parent-one");
+    beginParentDiagnostics(monitor, "parent-two");
+
+    await notifyChildStarted(client, "parent-one", "persistent-child");
+    await client.notify({
+      method: "item/completed",
+      params: {
+        threadId: "parent-two",
+        item: {
+          type: "subAgentActivity",
+          id: "parent-two-activity",
+          kind: "interacted",
+          agentThreadId: "persistent-child",
+          agentPath: "/root/persistent-child",
+        },
+      },
+    });
+
+    expect(firstRelease).toHaveBeenCalledOnce();
+    expect(sharedClientMocks.retainActivityHold).toHaveBeenCalledTimes(2);
+    monitor.dispose();
+    expect(secondRelease).toHaveBeenCalledOnce();
+  });
+
+  it("does not retain a hold for child activity rejected after parent finalization", async () => {
+    const client = createClient();
+    const monitor = new CodexNativeSubagentMonitor(client, createRuntime());
+    monitor.registerParent({ parentThreadId: "parent-thread" });
+    monitor.beginParentTurnDiagnostics({
+      parentThreadId: "parent-thread",
+      runId: "run-finalized",
+      parentTurnId: "parent-turn-finalized",
+      baseFields: { runId: "run-finalized", provider: "openai", model: "gpt-5.6-sol" },
+    });
+    await monitor.finalizeParentTurnDiagnostics("parent-thread");
+
+    await client.notify({
+      method: "item/completed",
+      params: {
+        threadId: "parent-thread",
+        item: {
+          type: "subAgentActivity",
+          id: "late-spawn",
+          kind: "started",
+          agentThreadId: "late-child",
+          agentPath: "/root/late-child",
+        },
+      },
+    });
+
+    expect(sharedClientMocks.retainActivityHold).not.toHaveBeenCalled();
+    monitor.dispose();
   });
 });

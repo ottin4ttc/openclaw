@@ -188,6 +188,11 @@
             "minimum": 1,
             "default": 60000
           },
+          "sharedClientIdleTimeoutMs": {
+            "type": "integer",
+            "minimum": 0,
+            "default": 0
+          },
           "postToolRawAssistantCompletionIdleTimeoutMs": {
             "type": "number",
             "minimum": 1,
@@ -446,6 +451,11 @@
     "appServer.turnCompletionIdleTimeoutMs": {
       "label": "Turn Completion Idle Timeout",
       "help": "Maximum quiet time after Codex accepts a turn or after a turn-scoped app-server request before OpenClaw interrupts the turn while waiting for turn/completed.",
+      "advanced": true
+    },
+    "appServer.sharedClientIdleTimeoutMs": {
+      "label": "Shared Client Idle Timeout",
+      "help": "Close idle shared Codex app-server clients after this many milliseconds. Use 0 to keep warm clients indefinitely; changes require a Gateway restart.",
       "advanced": true
     },
     "appServer.postToolRawAssistantCompletionIdleTimeoutMs": {
